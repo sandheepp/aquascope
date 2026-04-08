@@ -1,15 +1,15 @@
 #!/bin/bash
 # ============================================================
 #  AquaScope — Jetson Orin Nano Setup Script
-#  Prerequisites: JetPack 5.x or 6.x installed on Orin Nano
+#  Tested on: JetPack 6.1 (L4T R36.5), CUDA 12.6, Python 3.10
 # ============================================================
 
 set -e
 echo "╔══════════════════════════════════════════════════╗"
-echo "║   AquaScope — Jetson Setup           ║"
+echo "║   AquaScope — Jetson Setup                       ║"
 echo "╚══════════════════════════════════════════════════╝"
 
-# ── 1. System packages ──
+# ── 1. System packages ────────────────────────────────────
 echo ""
 echo "▸ [1/6] Installing system packages..."
 sudo apt-get update
@@ -23,16 +23,26 @@ sudo apt-get install -y \
     gstreamer1.0-tools \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
-    nvidia-l4t-core \
-    cuda-toolkit-12-6 \
     libcudnn9-cuda-12 \
     nvidia-tensorrt \
     tensorrt \
     tensorrt-libs \
-    nvidia-jetpack-runtime
+    git
 
 echo ""
-echo "▸ [1.1/6] Verifying Jetson runtime stack..."
+echo "▸ [1.1/6] Installing cuSPARSELt (required by torch 2.5.0)..."
+# cuSPARSELt is not bundled in JetPack — must be installed from CUDA repo
+if ! dpkg -l libcusparselt0 &>/dev/null; then
+    wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/arm64/cuda-keyring_1.1-1_all.deb
+    sudo dpkg -i cuda-keyring_1.1-1_all.deb
+    sudo apt-get update
+    rm -f cuda-keyring_1.1-1_all.deb
+fi
+sudo apt-get install -y libcusparselt0 libcusparselt-dev
+echo "  ✓ cuSPARSELt installed"
+
+echo ""
+echo "▸ [1.2/6] Verifying Jetson runtime stack..."
 if command -v nvcc >/dev/null 2>&1; then
     nvcc --version | head -n 2
 else
@@ -43,68 +53,77 @@ if command -v trtexec >/dev/null 2>&1; then
 else
     echo "  ⚠ trtexec not found"
 fi
+echo "  L4T version: $(cat /etc/nv_tegra_release | grep -oP 'R\d+ \(release\), REVISION: [\d.]+')"
+echo "  cuDNN: $(dpkg -l | grep libcudnn9-cuda | awk '{print $3}' || echo 'not found')"
 
-echo ""
-echo "▸ [1.2/6] Verifying JetPack package..."
-dpkg -l | grep -E 'nvidia-jetpack|nvidia-jetpack-runtime' || echo "  ⚠ nvidia-jetpack package not installed"
-
-# ── 2. Set Jetson to max performance ──
+# ── 2. Set Jetson to max performance ─────────────────────
 echo ""
 echo "▸ [2/6] Setting Jetson to max performance mode..."
-sudo nvpmodel -m 0          # MAX power mode
-sudo jetson_clocks           # Lock clocks to max frequency
+sudo nvpmodel -m 0
+sudo jetson_clocks
 echo "  ✓ Performance mode set (15W, clocks maxed)"
 
-# ── 3. Python packages ──
+# ── 3. Python packages ────────────────────────────────────
 echo ""
 echo "▸ [3/6] Installing Python packages..."
-# The apt python3-torch is a CPU-only legacy build — remove it if present
+
+# Remove any CPU-only apt/pip torch builds that shadow the Jetson wheel
 sudo apt-get remove -y python3-torch python3-torchvision python3-torchaudio 2>/dev/null || true
-python3 -m pip uninstall -y torch torchvision torchaudio 2>/dev/null || true
+pip3 uninstall -y torch torchvision torchaudio 2>/dev/null || true
 
 pip3 install --upgrade pip
 
-# Install NVIDIA's CUDA-enabled PyTorch for Jetson
-# pip indexes serve CPU-only aarch64 wheels — Jetson needs cuDNN-linked wheels
-# from the NVIDIA forum: https://forums.developer.nvidia.com/t/pytorch-for-jetson/72048
-#
-# cuDNN version must match the wheel:
-#   JetPack 6.1 (L4T R36.4+): cuDNN 9 → PyTorch 2.5.0 wheel
-#   JetPack 6.0 (L4T R36.3):  cuDNN 8 → PyTorch 2.3.0 wheel
-#   JetPack 5.x (L4T R35.x):  cuDNN 8 → PyTorch 2.1.0 wheel
-#
-# Check your revision: grep REVISION /etc/nv_tegra_release
-echo ""
-echo "  ⚠ PyTorch for Jetson must be installed manually from the NVIDIA forum."
-echo "  The pip indexes serve CPU-only wheels that will not work with CUDA."
-echo ""
-echo "  1. Go to: https://forums.developer.nvidia.com/t/pytorch-for-jetson/72048"
-echo "  2. Download the wheel matching your JetPack version and Python 3.10"
-echo "  3. Run: pip3 install <downloaded-wheel>.whl"
-echo ""
-echo "  Then re-run this script to continue setup."
-echo ""
-echo "  Current L4T version:"
-cat /etc/nv_tegra_release | grep -E "^# R"
-echo "  Current cuDNN:"
-dpkg -l | grep libcudnn | awk '{print $2, $3}' || echo "  (none installed)"
-echo ""
-read -p "  Press Enter once PyTorch is installed, or Ctrl+C to exit..." _dummy
+# ── PyTorch: exact Jetson wheel (JetPack 6.1 / CUDA 12.6 / cuDNN 9 / Python 3.10) ──
+TORCH_WHEEL="https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl"
+echo "  Installing torch 2.5.0 Jetson wheel..."
+pip3 install --no-cache "$TORCH_WHEEL"
 
-# Verify CUDA is available before continuing
+# ── torchvision: pip install (jetson_compat.py patches the NMS ops at runtime) ──
+echo "  Installing torchvision 0.26.0..."
+pip3 install torchvision==0.26.0 --no-deps
+
+# ── Verify CUDA is available ──
 python3 -c "
 import torch, sys
+print(f'  torch: {torch.__version__}')
+print(f'  CUDA available: {torch.cuda.is_available()}')
 if not torch.cuda.is_available():
-    print('ERROR: torch.cuda.is_available() is False.')
-    print('Install the correct Jetson PyTorch wheel before continuing.')
-    sys.exit(1)
-print(f'  ✓ PyTorch {torch.__version__} with CUDA {torch.version.cuda}')
+    print('  ⚠ CUDA not available — check driver and cuSPARSELt installation')
+else:
+    print(f'  GPU: {torch.cuda.get_device_name(0)}')
 "
 
-pip3 install "numpy<2"                 # Must stay below 2.0 for Jetson PyTorch ABI compatibility
-pip3 install --no-deps ultralytics
+# ── pip-installable packages from requirements.txt ──
+echo "  Installing requirements.txt packages..."
+pip3 install \
+    numpy==1.26.4 \
+    ultralytics==8.3.0 \
+    sympy==1.13.1 \
+    filelock==3.25.2 \
+    fsspec==2026.3.0 \
+    "Jinja2==3.1.6" \
+    "MarkupSafe==2.0.1" \
+    mpmath==1.3.0 \
+    networkx==3.4.2 \
+    "typing_extensions==4.15.0" \
+    "lap==0.5.13" \
+    "Pillow==9.0.1" \
+    "PyYAML==5.4.1" \
+    "requests==2.25.1" \
+    "tqdm==4.67.3" \
+    "matplotlib==3.5.1" \
+    "pandas==1.3.5" \
+    "seaborn==0.13.2" \
+    "psutil==7.2.2" \
+    "scipy==1.10.1" \
+    "py-cpuinfo==9.0.0" \
+    "ultralytics-thop==2.0.18" \
+    "pyngrok==8.0.0" \
+    "jetson-stats==4.3.2"
 
-# ── 4. Verify camera ──
+echo "  ✓ Python packages installed"
+
+# ── 4. Verify camera ──────────────────────────────────────
 echo ""
 echo "▸ [4/6] Checking Logitech C920 camera..."
 if v4l2-ctl --list-devices 2>/dev/null | grep -i "logitech\|C920\|video0"; then
@@ -115,38 +134,43 @@ else
     echo "    Run: v4l2-ctl --list-devices"
 fi
 
-# ── 5. Download YOLOv8 model and export to TensorRT ──
+# ── 5. Download YOLOv8n model and export to TensorRT ──────
 echo ""
-echo "▸ [5/6] Downloading YOLOv8n model..."
+echo "▸ [5/6] Downloading YOLOv8n model and exporting to TensorRT..."
 cd "$(dirname "$0")"
 
 python3 -c "
+import os
 from ultralytics import YOLO
-print('Downloading YOLOv8n...')
+
 model = YOLO('yolov8n.pt')
-print('✓ Model downloaded')
-print()
-print('Exporting to TensorRT (FP16)...')
-print('This will take several minutes on first run.')
-model.export(format='engine', device=0, half=True, imgsz=640)
-print('✓ TensorRT engine created: yolov8n.engine')
+print('✓ Model downloaded: yolov8n.pt')
+
+engine = 'yolov8n.engine'
+if os.path.exists(engine):
+    print(f'✓ TensorRT engine already exists: {engine}')
+else:
+    print('Exporting to TensorRT FP16 (this takes several minutes)...')
+    model.export(format='engine', device=0, half=True, imgsz=416)
+    print(f'✓ TensorRT engine created: {engine}')
 "
 
-# ── 6. Create output directory ──
+# ── 6. Create output directory ────────────────────────────
 echo ""
 echo "▸ [6/6] Creating output directories..."
 mkdir -p fish_logs
+echo "  ✓ fish_logs/ created"
 
 echo ""
 echo "╔══════════════════════════════════════════════════╗"
 echo "║   Setup Complete!                                ║"
 echo "║                                                  ║"
 echo "║   Run the tracker:                               ║"
-echo "║   python3 fish_tracker.py                        ║"
+echo "║   python3 fish_tracker.py --no-display --stream  ║"
 echo "║                                                  ║"
-echo "║   Or with recording:                             ║"
-echo "║   python3 fish_tracker.py --record               ║"
+echo "║   With TensorRT engine:                          ║"
+echo "║   python3 fish_tracker.py --model yolov8n.engine ║"
 echo "║                                                  ║"
-echo "║   Fine-tuning (optional):                        ║"
-echo "║   python3 train_fish_model.py                    ║"
+echo "║   With public stream:                            ║"
+echo "║   python3 fish_tracker.py --stream --public      ║"
 echo "╚══════════════════════════════════════════════════╝"
