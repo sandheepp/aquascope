@@ -241,7 +241,7 @@ class FishTracker:
                     iou=self.config["iou_threshold"],
                     imgsz=self.config["imgsz"],
                     verbose=False,
-                    classes=[0],  # COCO class 0 = person; update after fine-tuning on fish
+                    classes=self.config.get("detect_classes"),  # None = all classes
                     device=0,
                 )
                 if not (results and results[0].boxes is not None and len(results[0].boxes)):

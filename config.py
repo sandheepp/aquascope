@@ -24,6 +24,7 @@ DEFAULT_CONFIG: dict = {
     # SAHI — sliced inference for small fish detection (off by default for FPS)
     # At 1920×1080 with 640px tiles: 0% overlap→6 tiles, 10%→8 tiles, 20%→12 tiles
     # Tip: use --resolution 720p to halve tile count (4 tiles at 0% overlap)
+    "detect_classes": None,          # None = all classes; set to [0] after fish-specific training
     "sahi": False,                   # Enable via --sahi flag
     "sahi_slice_height": 640,        # Tile height (px); match imgsz
     "sahi_slice_width": 640,         # Tile width (px); match imgsz
