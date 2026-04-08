@@ -1,0 +1,64 @@
+# AquaScope — Python dependencies
+# Generated from Jetson Orin Nano (JetPack 6.1, CUDA 12.6, Python 3.10)
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# JETSON-SPECIFIC (install manually — NOT via pip install -r requirements.txt)
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# 1. PyTorch (NVIDIA Jetson wheel for JetPack 6.1 / CUDA 12.6 / Python 3.10):
+#      pip3 install --no-cache \
+#        https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch/torch-2.5.0a0+872d972e41.nv24.08.17622132-cp310-cp310-linux_aarch64.whl
+#
+# 2. cuSPARSELt (required by torch 2.5.0, not bundled in JetPack):
+#      wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/arm64/cuda-keyring_1.1-1_all.deb
+#      sudo dpkg -i cuda-keyring_1.1-1_all.deb && sudo apt-get update
+#      sudo apt-get install libcusparselt0 libcusparselt-dev
+#
+# 3. torchvision (build from source against Jetson torch):
+#      sudo apt-get install libjpeg-dev libpng-dev libavcodec-dev libavformat-dev libswscale-dev
+#      git clone --branch v0.20.0 https://github.com/pytorch/vision ~/vision
+#      cd ~/vision && FORCE_CUDA=0 python3 setup.py install --user
+#
+# 4. OpenCV (apt — Jetson hardware-accelerated build):
+#      sudo apt-get install python3-opencv
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# PIP-INSTALLABLE (pip3 install -r requirements.txt)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Core
+ultralytics==8.3.0
+numpy==1.26.4
+sympy==1.13.1
+filelock==3.25.2
+fsspec==2026.3.0
+Jinja2==3.1.6
+MarkupSafe==2.0.1
+mpmath==1.3.0
+networkx==3.4.2
+typing_extensions==4.15.0
+
+# Inference & tracking
+lap==0.5.13
+tensorrt==10.3.0
+tensorrt_dispatch==10.3.0
+tensorrt_lean==10.3.0
+
+# ultralytics runtime deps
+Pillow==9.0.1
+PyYAML==5.4.1
+requests==2.25.1
+tqdm==4.67.3
+matplotlib==3.5.1
+pandas==1.3.5
+seaborn==0.13.2
+psutil==7.2.2
+scipy==1.10.1
+py-cpuinfo==9.0.0
+ultralytics-thop==2.0.18
+
+# Streaming
+pyngrok==8.0.0
+
+# Jetson system
+jetson-stats==4.3.2
