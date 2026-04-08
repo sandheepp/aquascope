@@ -13,7 +13,7 @@ fi
 
 REMOTE_USER="${JETSON_USER:-jetson}"
 REMOTE_HOST="${JETSON_HOST:-192.168.31.141}"
-REMOTE_PATH="${JETSON_PATH:-~/projects/aquascope}"
+REMOTE_PATH="${JETSON_PATH:-/home/jetson/projects/aquascope}"
 PASSWORD="${JETSON_PASSWORD:?JETSON_PASSWORD not set. Add it to .env or export it.}"
 
 if ! command -v sshpass >/dev/null 2>&1; then
