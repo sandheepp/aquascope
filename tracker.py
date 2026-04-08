@@ -14,8 +14,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 import supervision as sv
-from sahi import AutoDetectionModel
-from sahi.predict import get_sliced_prediction
+from ultralytics import YOLO
 
 from camera import init_camera
 from config import TRAIL_COLORS
@@ -45,7 +44,7 @@ class FishTracker:
 
     # ── Initialisation helpers ────────────────────────────
 
-    def _load_model(self) -> AutoDetectionModel:
+    def _load_model(self) -> YOLO:
         path = self.config["model_path"]
         if path.endswith(".engine") and not os.path.exists(path):
             pt = path.replace(".engine", ".pt")
@@ -56,12 +55,7 @@ class FishTracker:
                   f"imgsz={self.config['imgsz']})\"")
             path = pt
         print(f"[MODEL] Loading: {path} (SAHI sliced inference)")
-        return AutoDetectionModel.from_pretrained(
-            model_type="ultralytics",
-            model_path=path,
-            confidence_threshold=self.config["confidence_threshold"],
-            device="cuda:0",
-        )
+        return YOLO(path)
 
     def _init_writer(self) -> cv2.VideoWriter | None:
         if not self.config["record"]:
@@ -211,33 +205,62 @@ class FishTracker:
                 print("[CAM] Frame capture failed, retrying...")
         return frame if ret else None
 
+    def _slice_tiles(self, frame: np.ndarray) -> list[tuple[np.ndarray, int, int]]:
+        """Slice frame into overlapping tiles. Returns (tile, x_offset, y_offset)."""
+        h, w = frame.shape[:2]
+        sh = self.config["sahi_slice_height"]
+        sw = self.config["sahi_slice_width"]
+        stride_h = int(sh * (1 - self.config["sahi_overlap_ratio"]))
+        stride_w = int(sw * (1 - self.config["sahi_overlap_ratio"]))
+        tiles = []
+        y = 0
+        while True:
+            y2 = min(y + sh, h)
+            y1 = max(y2 - sh, 0)
+            x = 0
+            while True:
+                x2 = min(x + sw, w)
+                x1 = max(x2 - sw, 0)
+                tiles.append((frame[y1:y2, x1:x2], x1, y1))
+                if x2 == w:
+                    break
+                x += stride_w
+            if y2 == h:
+                break
+            y += stride_h
+        return tiles
+
     def _infer_and_annotate(self, frame: np.ndarray) -> np.ndarray:
-        # ── SAHI sliced prediction ────────────────────────────
-        result = get_sliced_prediction(
-            frame,
-            self.model,
-            slice_height=self.config["sahi_slice_height"],
-            slice_width=self.config["sahi_slice_width"],
-            overlap_height_ratio=self.config["sahi_overlap_ratio"],
-            overlap_width_ratio=self.config["sahi_overlap_ratio"],
-            verbose=0,
-        )
-
-        # Filter to class 0 (COCO person; update after fine-tuning on fish)
-        preds = [p for p in result.object_prediction_list if p.category.id == 0]
-
-        if preds:
-            xyxy = np.array(
-                [[p.bbox.minx, p.bbox.miny, p.bbox.maxx, p.bbox.maxy] for p in preds],
-                dtype=np.float32,
+        # ── SAHI: run predict on each tile, shift coords to frame space ──
+        all_xyxy, all_confs = [], []
+        for tile, x_off, y_off in self._slice_tiles(frame):
+            results = self.model.predict(
+                source=tile,
+                conf=self.config["confidence_threshold"],
+                iou=self.config["iou_threshold"],
+                imgsz=self.config["imgsz"],
+                verbose=False,
+                classes=[0],  # COCO class 0 = person; update after fine-tuning on fish
+                device=0,
             )
-            confs = np.array([p.score.value for p in preds], dtype=np.float32)
+            if not (results and results[0].boxes is not None and len(results[0].boxes)):
+                continue
+            boxes = results[0].boxes.xyxy.cpu().numpy().copy()
+            boxes[:, [0, 2]] += x_off
+            boxes[:, [1, 3]] += y_off
+            all_xyxy.append(boxes)
+            all_confs.append(results[0].boxes.conf.cpu().numpy())
+
+        if all_xyxy:
+            xyxy = np.concatenate(all_xyxy, axis=0).astype(np.float32)
+            confs = np.concatenate(all_confs, axis=0).astype(np.float32)
         else:
             xyxy = np.empty((0, 4), dtype=np.float32)
             confs = np.empty(0, dtype=np.float32)
 
-        # ── ByteTrack via supervision ─────────────────────────
+        # ── Merge overlapping boxes from adjacent tiles, then track ──
         detections = sv.Detections(xyxy=xyxy, confidence=confs)
+        detections = detections.with_nms(threshold=self.config["iou_threshold"])
         tracked = self.sv_tracker.update_with_detections(detections)
 
         # ── Draw ─────────────────────────────────────────────

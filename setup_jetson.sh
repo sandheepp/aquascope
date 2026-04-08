@@ -123,7 +123,6 @@ pip3 install \
     "python-dotenv==1.0.1" \
     "onnx" \
     "onnxslim==0.1.34" \
-    "sahi==0.11.15" \
     "supervision==0.25.1"
 # Note: onnxruntime-gpu has no ARM64 pip wheel — skip it.
 # onnx+onnxslim are sufficient for the .pt → ONNX → TensorRT export path.
