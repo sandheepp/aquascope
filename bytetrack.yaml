@@ -1,0 +1,17 @@
+# ByteTrack configuration — optimized for aquarium fish tracking
+# Fish move erratically and can overlap/occlude frequently.
+# These settings are tuned for small, fast-moving objects.
+
+tracker_type: bytetrack
+
+# ── Tracking thresholds ──
+track_high_thresh: 0.3       # Lower than default (0.5) — fish are often partially occluded
+track_low_thresh: 0.05       # Keep low-confidence detections for association
+new_track_thresh: 0.4        # Confidence needed to start a new track
+track_buffer: 60             # Frames to keep a lost track alive (2 sec at 30fps)
+match_thresh: 0.85           # IoU threshold for matching — fish shapes change rapidly
+fuse_score: true             # Fuse detection score into matching cost (added ultralytics 8.3.0)
+
+# ── Motion model ──
+# Kalman filter settings are defaults from ByteTrack;
+# the buffer above is the key tuning knob for aquarium use

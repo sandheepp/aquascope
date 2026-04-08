@@ -1,0 +1,34 @@
+"""
+Default configuration and constants for AquaScope.
+"""
+
+DEFAULT_CONFIG: dict = {
+    "camera_id": 0,                  # /dev/video0 for C920
+    "camera_width": 1280,
+    "camera_height": 720,
+    "camera_fps": 30,
+    "model_path": "yolov8n.pt",      # Auto-falls back to .pt if .engine missing
+    "confidence_threshold": 0.35,
+    "iou_threshold": 0.45,
+    "tracker_config": "bytetrack.yaml",
+    "imgsz": 416,
+    "max_trail_length": 60,          # Trail length in frames
+    "log_interval_sec": 60,          # Save JSON stats every N seconds
+    "output_dir": "fish_logs",
+    "display": True,
+    "exposure": None,                # None = auto; int = manual V4L2 value (e.g. -6)
+    "record": False,
+    "record_path": "fish_recording.mp4",
+    "stream": False,
+    "stream_port": 8080,
+    "public": False,
+}
+
+# Color palette for fish trails — up to 20 unique fish get distinct colors
+TRAIL_COLORS: list[tuple[int, int, int]] = [
+    (255, 107, 107), (78, 205, 196),  (69, 183, 209),  (150, 206, 180),
+    (255, 238, 173), (255, 154, 162), (199, 206, 234),  (254, 200, 154),
+    (255, 183, 178), (181, 234, 215), (224, 187, 228),  (149, 225, 211),
+    (253, 253, 150), (174, 198, 207), (179, 158, 181),  (255, 218, 185),
+    (119, 221, 231), (203, 153, 201), (162, 217, 206),  (255, 179, 186),
+]

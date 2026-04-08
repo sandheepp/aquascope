@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.venv/
+
+# Models & engines (large binary files)
+*.pt
+*.engine
+*.onnx
+*.trt
+*.whl
+
+# Output
+fish_logs/
+*.mp4
+*.jpg
+*.png
+snapshot_*.jpg
+
+# Jetson setup downloads
+cloudflared
+cloudflared-linux-arm64
+cuda-keyring*.deb
+
+# Environment / secrets
+.env
+*.env
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
