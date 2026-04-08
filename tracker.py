@@ -182,7 +182,7 @@ class FishTracker:
                     self.writer.write(annotated)
 
                 if self.config["stream"]:
-                    _, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                    _, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, self.config.get("stream_quality", 85)])
                     push_frame(jpeg.tobytes())
 
                 self._log_stats()

@@ -45,6 +45,8 @@ def parse_args() -> argparse.Namespace:
                    help="Expose stream publicly via Cloudflare tunnel")
     p.add_argument("--sahi", action="store_true",
                    help="Enable SAHI sliced inference (better small-fish recall, lower FPS)")
+    p.add_argument("--stream-quality", type=int, default=85, metavar="Q",
+                   help="JPEG stream quality 1-100 (default 85; lower = faster, higher = sharper)")
     return p.parse_args()
 
 
@@ -66,6 +68,7 @@ def build_config(args: argparse.Namespace) -> dict:
     config["stream_port"] = args.stream_port
     config["public"] = args.public
     config["sahi"] = args.sahi
+    config["stream_quality"] = args.stream_quality
 
     if config["display"] and not os.environ.get("DISPLAY"):
         print("[INFO] No DISPLAY — switching to headless mode (use --no-display to suppress)")

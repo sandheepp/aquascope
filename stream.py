@@ -42,8 +42,29 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
 
     def _serve_index(self):
         body = (
-            b"<html><body style='margin:0;background:#000'>"
-            b"<img src='/stream' style='max-width:100%;height:100vh;object-fit:contain'>"
+            b"<!doctype html><html><head>"
+            b"<meta charset='utf-8'>"
+            b"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            b"<title>AquaScope Live</title>"
+            b"<style>"
+            b"*{margin:0;padding:0;box-sizing:border-box}"
+            b"body{background:#000;display:flex;flex-direction:column;"
+            b"align-items:center;justify-content:center;height:100vh;font-family:monospace}"
+            b"#feed{width:100%;height:100vh;object-fit:contain;display:block}"
+            b"#bar{position:fixed;top:0;left:0;right:0;padding:6px 12px;"
+            b"background:rgba(0,0,0,0.55);color:#0f0;font-size:13px;"
+            b"display:flex;justify-content:space-between;pointer-events:none}"
+            b"</style></head><body>"
+            b"<img id='feed' src='/stream'>"
+            b"<div id='bar'>"
+            b"<span>&#127744; AquaScope Live</span>"
+            b"<span id='ts'></span>"
+            b"</div>"
+            b"<script>"
+            b"setInterval(()=>{document.getElementById('ts').textContent=new Date().toLocaleTimeString();},1000);"
+            b"document.getElementById('feed').onerror=function(){"
+            b"  setTimeout(()=>{this.src='/stream?t='+Date.now();},2000);};"
+            b"</script>"
             b"</body></html>"
         )
         self.send_response(200)
