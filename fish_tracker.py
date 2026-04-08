@@ -34,7 +34,7 @@ def parse_args() -> argparse.Namespace:
                    help="Capture resolution (default 1080p)")
     p.add_argument("--model", default="yolov8s.pt", help="YOLOv8 model path (.pt or .engine)")
     p.add_argument("--conf", type=float, default=0.35, help="Detection confidence threshold")
-    p.add_argument("--imgsz", type=int, default=416, help="Inference image size")
+    p.add_argument("--imgsz", type=int, default=640, help="Inference image size")
     p.add_argument("--exposure", type=int, default=None,
                    help="Manual V4L2 exposure (e.g. -6). Omit for auto.")
     p.add_argument("--record", action="store_true", help="Record annotated video to file")
