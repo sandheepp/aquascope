@@ -19,6 +19,9 @@ import jetson_compat  # noqa: F401
 import argparse
 import os
 
+from dotenv import load_dotenv
+load_dotenv()
+
 from config import DEFAULT_CONFIG
 from tracker import FishTracker
 

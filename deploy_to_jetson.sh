@@ -34,6 +34,10 @@ sshpass -p "$PASSWORD" rsync -avz --delete \
   --exclude='*.log' \
   --exclude='*.tmp' \
   --exclude='*.swp' \
+  --exclude='*.engine' \
+  --exclude='*.pt' \
+  --exclude='*.onnx' \
+  --exclude='*.trt' \
   "$SCRIPT_DIR"/ "$REMOTE_USER"@"$REMOTE_HOST":"$REMOTE_PATH"/
 
 echo "Done. Code synced to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"

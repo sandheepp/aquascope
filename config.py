@@ -6,7 +6,7 @@ DEFAULT_CONFIG: dict = {
     "camera_id": 0,                  # /dev/video0 for C920
     "camera_width": 1920,
     "camera_height": 1080,
-    "camera_fps": 30,
+    "camera_fps": 60,
     "model_path": "yolov8n.pt",      # Auto-falls back to .pt if .engine missing
     "confidence_threshold": 0.35,
     "iou_threshold": 0.45,

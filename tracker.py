@@ -70,7 +70,8 @@ class FishTracker:
             return
         port = self.config["stream_port"]
         start_stream(port)
-        print(f"[STREAM] Local:  http://192.168.31.141:{port}/")
+        host = os.getenv("JETSON_HOST", "localhost")
+        print(f"[STREAM] Local:  http://{host}:{port}/")
         if self.config.get("public"):
             start_public_tunnel(port)
 

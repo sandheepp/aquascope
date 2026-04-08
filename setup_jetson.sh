@@ -119,7 +119,12 @@ pip3 install \
     "py-cpuinfo==9.0.0" \
     "ultralytics-thop==2.0.18" \
     "pyngrok==8.0.0" \
-    "jetson-stats==4.3.2"
+    "jetson-stats==4.3.2" \
+    "python-dotenv==1.0.1" \
+    "onnx" \
+    "onnxslim==0.1.34"
+# Note: onnxruntime-gpu has no ARM64 pip wheel — skip it.
+# onnx+onnxslim are sufficient for the .pt → ONNX → TensorRT export path.
 
 echo "  ✓ Python packages installed"
 

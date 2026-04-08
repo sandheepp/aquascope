@@ -59,6 +59,11 @@ ultralytics-thop==2.0.18
 
 # Streaming
 pyngrok==8.0.0
+python-dotenv==1.0.1
+
+# TensorRT export (onnxruntime-gpu has no ARM64 pip wheel — not needed for export)
+onnx
+onnxslim==0.1.34
 
 # Jetson system
 jetson-stats==4.3.2
