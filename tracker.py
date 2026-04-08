@@ -260,7 +260,7 @@ class FishTracker:
                 confs = np.empty(0, dtype=np.float32)
 
             detections = sv.Detections(xyxy=xyxy, confidence=confs)
-            detections = detections.with_nms(threshold=self.config["iou_threshold"])
+            detections = detections.with_nms(threshold=self.config["iou_threshold"], class_agnostic=True)
         else:
             # ── Full-frame inference (fast path) ──────────────────────
             results = self.model.predict(
