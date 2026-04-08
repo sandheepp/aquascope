@@ -11,7 +11,7 @@ echo "╚═══════════════════════�
 
 # ── 1. System packages ────────────────────────────────────
 echo ""
-echo "▸ [1/6] Installing system packages..."
+echo "▸ [1/7] Installing system packages..."
 sudo apt-get update
 sudo apt-get install -y \
     python3-pip \
@@ -30,7 +30,7 @@ sudo apt-get install -y \
     git
 
 echo ""
-echo "▸ [1.1/6] Installing cuSPARSELt (required by torch 2.5.0)..."
+echo "▸ [1.1/7] Installing cuSPARSELt (required by torch 2.5.0)..."
 # cuSPARSELt is not bundled in JetPack — must be installed from CUDA repo
 if ! dpkg -l libcusparselt0 &>/dev/null; then
     wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/arm64/cuda-keyring_1.1-1_all.deb
@@ -42,7 +42,7 @@ sudo apt-get install -y libcusparselt0 libcusparselt-dev
 echo "  ✓ cuSPARSELt installed"
 
 echo ""
-echo "▸ [1.2/6] Verifying Jetson runtime stack..."
+echo "▸ [1.2/7] Verifying Jetson runtime stack..."
 if command -v nvcc >/dev/null 2>&1; then
     nvcc --version | head -n 2
 else
@@ -58,14 +58,14 @@ echo "  cuDNN: $(dpkg -l | grep libcudnn9-cuda | awk '{print $3}' || echo 'not f
 
 # ── 2. Set Jetson to max performance ─────────────────────
 echo ""
-echo "▸ [2/6] Setting Jetson to max performance mode..."
+echo "▸ [2/7] Setting Jetson to max performance mode..."
 sudo nvpmodel -m 0
 sudo jetson_clocks
 echo "  ✓ Performance mode set (15W, clocks maxed)"
 
 # ── 3. Python packages ────────────────────────────────────
 echo ""
-echo "▸ [3/6] Installing Python packages..."
+echo "▸ [3/7] Installing Python packages..."
 
 # Remove any CPU-only apt/pip torch builds that shadow the Jetson wheel
 sudo apt-get remove -y python3-torch python3-torchvision python3-torchaudio 2>/dev/null || true
@@ -125,7 +125,7 @@ echo "  ✓ Python packages installed"
 
 # ── 4. Verify camera ──────────────────────────────────────
 echo ""
-echo "▸ [4/6] Checking Logitech C920 camera..."
+echo "▸ [4/7] Checking Logitech C920 camera..."
 if v4l2-ctl --list-devices 2>/dev/null | grep -i "logitech\|C920\|video0"; then
     echo "  ✓ Camera detected"
     v4l2-ctl -d /dev/video0 --list-formats-ext 2>/dev/null | head -20
@@ -136,7 +136,7 @@ fi
 
 # ── 5. Download YOLOv8n model and export to TensorRT ──────
 echo ""
-echo "▸ [5/6] Downloading YOLOv8n model and exporting to TensorRT..."
+echo "▸ [5/7] Downloading YOLOv8n model and exporting to TensorRT..."
 cd "$(dirname "$0")"
 
 python3 -c "
@@ -155,9 +155,23 @@ else:
     print(f'✓ TensorRT engine created: {engine}')
 "
 
-# ── 6. Create output directory ────────────────────────────
+# ── 6. Install cloudflared (for --public tunnel) ──────────
 echo ""
-echo "▸ [6/6] Creating output directories..."
+echo "▸ [6/7] Installing cloudflared..."
+if command -v cloudflared >/dev/null 2>&1; then
+    echo "  ✓ cloudflared already installed: $(cloudflared --version)"
+else
+    CLOUDFLARED_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64"
+    echo "  Downloading cloudflared for arm64..."
+    wget -q "$CLOUDFLARED_URL" -O /tmp/cloudflared
+    chmod +x /tmp/cloudflared
+    sudo mv /tmp/cloudflared /usr/local/bin/cloudflared
+    echo "  ✓ cloudflared installed: $(cloudflared --version)"
+fi
+
+# ── 7. Create output directory ────────────────────────────
+echo ""
+echo "▸ [7/7] Creating output directories..."
 mkdir -p fish_logs
 echo "  ✓ fish_logs/ created"
 
