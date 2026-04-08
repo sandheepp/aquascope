@@ -26,8 +26,8 @@ from tracker import FishTracker
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="AquaScope — real-time aquarium fish tracker")
     p.add_argument("--camera", type=int, default=0, help="Camera device ID (default 0)")
-    p.add_argument("--resolution", default="720p", choices=["480p", "720p", "1080p"],
-                   help="Capture resolution (default 720p)")
+    p.add_argument("--resolution", default="1080p", choices=["480p", "720p", "1080p"],
+                   help="Capture resolution (default 1080p)")
     p.add_argument("--model", default="yolov8n.pt", help="YOLOv8 model path (.pt or .engine)")
     p.add_argument("--conf", type=float, default=0.35, help="Detection confidence threshold")
     p.add_argument("--imgsz", type=int, default=416, help="Inference image size")
