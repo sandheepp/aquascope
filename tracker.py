@@ -231,11 +231,40 @@ class FishTracker:
         return tiles
 
     def _infer_and_annotate(self, frame: np.ndarray) -> np.ndarray:
-        # ── SAHI: run predict on each tile, shift coords to frame space ──
-        all_xyxy, all_confs = [], []
-        for tile, x_off, y_off in self._slice_tiles(frame):
+        if self.config.get("sahi"):
+            # ── SAHI: run predict on each tile, shift coords to frame space ──
+            all_xyxy, all_confs = [], []
+            for tile, x_off, y_off in self._slice_tiles(frame):
+                results = self.model.predict(
+                    source=tile,
+                    conf=self.config["confidence_threshold"],
+                    iou=self.config["iou_threshold"],
+                    imgsz=self.config["imgsz"],
+                    verbose=False,
+                    classes=[0],  # COCO class 0 = person; update after fine-tuning on fish
+                    device=0,
+                )
+                if not (results and results[0].boxes is not None and len(results[0].boxes)):
+                    continue
+                boxes = results[0].boxes.xyxy.cpu().numpy().copy()
+                boxes[:, [0, 2]] += x_off
+                boxes[:, [1, 3]] += y_off
+                all_xyxy.append(boxes)
+                all_confs.append(results[0].boxes.conf.cpu().numpy())
+
+            if all_xyxy:
+                xyxy = np.concatenate(all_xyxy, axis=0).astype(np.float32)
+                confs = np.concatenate(all_confs, axis=0).astype(np.float32)
+            else:
+                xyxy = np.empty((0, 4), dtype=np.float32)
+                confs = np.empty(0, dtype=np.float32)
+
+            detections = sv.Detections(xyxy=xyxy, confidence=confs)
+            detections = detections.with_nms(threshold=self.config["iou_threshold"])
+        else:
+            # ── Full-frame inference (fast path) ──────────────────────
             results = self.model.predict(
-                source=tile,
+                source=frame,
                 conf=self.config["confidence_threshold"],
                 iou=self.config["iou_threshold"],
                 imgsz=self.config["imgsz"],
@@ -243,24 +272,14 @@ class FishTracker:
                 classes=[0],  # COCO class 0 = person; update after fine-tuning on fish
                 device=0,
             )
-            if not (results and results[0].boxes is not None and len(results[0].boxes)):
-                continue
-            boxes = results[0].boxes.xyxy.cpu().numpy().copy()
-            boxes[:, [0, 2]] += x_off
-            boxes[:, [1, 3]] += y_off
-            all_xyxy.append(boxes)
-            all_confs.append(results[0].boxes.conf.cpu().numpy())
+            if results and results[0].boxes is not None and len(results[0].boxes):
+                xyxy = results[0].boxes.xyxy.cpu().numpy().astype(np.float32)
+                confs = results[0].boxes.conf.cpu().numpy().astype(np.float32)
+            else:
+                xyxy = np.empty((0, 4), dtype=np.float32)
+                confs = np.empty(0, dtype=np.float32)
+            detections = sv.Detections(xyxy=xyxy, confidence=confs)
 
-        if all_xyxy:
-            xyxy = np.concatenate(all_xyxy, axis=0).astype(np.float32)
-            confs = np.concatenate(all_confs, axis=0).astype(np.float32)
-        else:
-            xyxy = np.empty((0, 4), dtype=np.float32)
-            confs = np.empty(0, dtype=np.float32)
-
-        # ── Merge overlapping boxes from adjacent tiles, then track ──
-        detections = sv.Detections(xyxy=xyxy, confidence=confs)
-        detections = detections.with_nms(threshold=self.config["iou_threshold"])
         tracked = self.sv_tracker.update_with_detections(detections)
 
         # ── Draw ─────────────────────────────────────────────

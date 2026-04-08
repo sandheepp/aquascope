@@ -2,15 +2,16 @@
 """
 AquaScope — CLI entry point.
 
-Jetson Orin Nano + Logitech C920 + YOLOv8n + ByteTrack.
+Jetson Orin Nano + Logitech C920 + YOLOv8s + supervision ByteTrack.
 
 Usage:
-    python3 fish_tracker.py                          # local display
-    python3 fish_tracker.py --no-display --stream    # headless + browser stream
-    python3 fish_tracker.py --no-display --stream --public   # + public URL
-    python3 fish_tracker.py --model yolov8n.engine   # TensorRT engine
-    python3 fish_tracker.py --resolution 1080p       # higher resolution
-    python3 fish_tracker.py --exposure -6            # manual exposure
+    python3 fish_tracker.py                                    # local display
+    python3 fish_tracker.py --no-display --stream              # headless + browser stream
+    python3 fish_tracker.py --no-display --stream --public     # + public URL
+    python3 fish_tracker.py --model yolov8s.engine             # TensorRT engine
+    python3 fish_tracker.py --sahi                             # sliced inference (lower FPS)
+    python3 fish_tracker.py --sahi --resolution 720p           # SAHI at 4 tiles (~2× faster)
+    python3 fish_tracker.py --exposure -6                      # manual exposure
 """
 
 # jetson_compat MUST be imported before torch / torchvision / ultralytics
@@ -42,6 +43,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--stream-port", type=int, default=8080, help="MJPEG server port (default 8080)")
     p.add_argument("--public", action="store_true",
                    help="Expose stream publicly via Cloudflare tunnel")
+    p.add_argument("--sahi", action="store_true",
+                   help="Enable SAHI sliced inference (better small-fish recall, lower FPS)")
     return p.parse_args()
 
 
@@ -62,6 +65,7 @@ def build_config(args: argparse.Namespace) -> dict:
     config["stream"] = args.stream
     config["stream_port"] = args.stream_port
     config["public"] = args.public
+    config["sahi"] = args.sahi
 
     if config["display"] and not os.environ.get("DISPLAY"):
         print("[INFO] No DISPLAY — switching to headless mode (use --no-display to suppress)")
