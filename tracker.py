@@ -1,8 +1,8 @@
 """
 FishTracker — core tracking loop.
 
-Wraps YOLOv8 + ByteTrack inference, draws trails and HUD,
-handles recording, streaming, and periodic JSON logging.
+Wraps YOLOv8s + SAHI sliced inference + supervision ByteTrack,
+draws trails and HUD, handles recording, streaming, and periodic JSON logging.
 """
 
 import json
@@ -13,7 +13,9 @@ from datetime import datetime
 
 import cv2
 import numpy as np
-from ultralytics import YOLO
+import supervision as sv
+from sahi import AutoDetectionModel
+from sahi.predict import get_sliced_prediction
 
 from camera import init_camera
 from config import TRAIL_COLORS
@@ -21,7 +23,7 @@ from stream import push_frame, start_public_tunnel, start_stream
 
 
 class FishTracker:
-    """Real-time aquarium fish tracker using YOLOv8 + ByteTrack."""
+    """Real-time aquarium fish tracker using YOLOv8s + SAHI + supervision ByteTrack."""
 
     def __init__(self, config: dict):
         self.config = config
@@ -36,13 +38,14 @@ class FishTracker:
 
         os.makedirs(config["output_dir"], exist_ok=True)
         self.model = self._load_model()
+        self.sv_tracker = sv.ByteTrack()
         self.cap = init_camera(config)
         self.writer = self._init_writer()
         self._start_stream()
 
     # ── Initialisation helpers ────────────────────────────
 
-    def _load_model(self) -> YOLO:
+    def _load_model(self) -> AutoDetectionModel:
         path = self.config["model_path"]
         if path.endswith(".engine") and not os.path.exists(path):
             pt = path.replace(".engine", ".pt")
@@ -52,8 +55,13 @@ class FishTracker:
                   f"YOLO('{pt}').export(format='engine', device=0, half=True, "
                   f"imgsz={self.config['imgsz']})\"")
             path = pt
-        print(f"[MODEL] Loading: {path}")
-        return YOLO(path)
+        print(f"[MODEL] Loading: {path} (SAHI sliced inference)")
+        return AutoDetectionModel.from_pretrained(
+            model_type="ultralytics",
+            model_path=path,
+            confidence_threshold=self.config["confidence_threshold"],
+            device="cuda:0",
+        )
 
     def _init_writer(self) -> cv2.VideoWriter | None:
         if not self.config["record"]:
@@ -204,28 +212,40 @@ class FishTracker:
         return frame if ret else None
 
     def _infer_and_annotate(self, frame: np.ndarray) -> np.ndarray:
-        results = self.model.track(
-            source=frame,
-            persist=True,
-            tracker=self.config["tracker_config"],
-            conf=self.config["confidence_threshold"],
-            iou=self.config["iou_threshold"],
-            imgsz=self.config["imgsz"],
-            verbose=False,
-            classes=[0],  # COCO class 0 = person; update after fine-tuning on fish
+        # ── SAHI sliced prediction ────────────────────────────
+        result = get_sliced_prediction(
+            frame,
+            self.model,
+            slice_height=self.config["sahi_slice_height"],
+            slice_width=self.config["sahi_slice_width"],
+            overlap_height_ratio=self.config["sahi_overlap_ratio"],
+            overlap_width_ratio=self.config["sahi_overlap_ratio"],
+            verbose=0,
         )
 
-        annotated = frame.copy()
-        if not (results and results[0].boxes is not None and results[0].boxes.id is not None):
-            return annotated
+        # Filter to class 0 (COCO person; update after fine-tuning on fish)
+        preds = [p for p in result.object_prediction_list if p.category.id == 0]
 
-        boxes = results[0].boxes
-        for box, track_id, conf in zip(
-            boxes.xyxy.cpu().numpy(),
-            boxes.id.cpu().numpy().astype(int),
-            boxes.conf.cpu().numpy(),
-        ):
-            x1, y1, x2, y2 = map(int, box)
+        if preds:
+            xyxy = np.array(
+                [[p.bbox.minx, p.bbox.miny, p.bbox.maxx, p.bbox.maxy] for p in preds],
+                dtype=np.float32,
+            )
+            confs = np.array([p.score.value for p in preds], dtype=np.float32)
+        else:
+            xyxy = np.empty((0, 4), dtype=np.float32)
+            confs = np.empty(0, dtype=np.float32)
+
+        # ── ByteTrack via supervision ─────────────────────────
+        detections = sv.Detections(xyxy=xyxy, confidence=confs)
+        tracked = self.sv_tracker.update_with_detections(detections)
+
+        # ── Draw ─────────────────────────────────────────────
+        annotated = frame.copy()
+        for i in range(len(tracked)):
+            x1, y1, x2, y2 = map(int, tracked.xyxy[i])
+            track_id = int(tracked.tracker_id[i])
+            conf = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             color = self._color(track_id)
 

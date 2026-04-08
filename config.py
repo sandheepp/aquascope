@@ -7,11 +7,10 @@ DEFAULT_CONFIG: dict = {
     "camera_width": 1920,
     "camera_height": 1080,
     "camera_fps": 60,
-    "model_path": "yolov8n.pt",      # Auto-falls back to .pt if .engine missing
+    "model_path": "yolov8s.pt",      # Auto-falls back to .pt if .engine missing
     "confidence_threshold": 0.35,
     "iou_threshold": 0.45,
-    "tracker_config": "bytetrack.yaml",
-    "imgsz": 416,
+    "imgsz": 640,
     "max_trail_length": 60,          # Trail length in frames
     "log_interval_sec": 60,          # Save JSON stats every N seconds
     "output_dir": "fish_logs",
@@ -22,6 +21,10 @@ DEFAULT_CONFIG: dict = {
     "stream": False,
     "stream_port": 8080,
     "public": False,
+    # SAHI — sliced inference for small fish detection
+    "sahi_slice_height": 640,        # Tile height (px); match imgsz
+    "sahi_slice_width": 640,         # Tile width (px); match imgsz
+    "sahi_overlap_ratio": 0.2,       # Overlap between adjacent tiles
 }
 
 # Color palette for fish trails — up to 20 unique fish get distinct colors
