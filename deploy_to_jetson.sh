@@ -2,10 +2,19 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Load .env if present
+ENV_FILE="$SCRIPT_DIR/.env"
+if [ -f "$ENV_FILE" ]; then
+  set -a
+  source "$ENV_FILE"
+  set +a
+fi
+
 REMOTE_USER="${JETSON_USER:-jetson}"
 REMOTE_HOST="${JETSON_HOST:-192.168.31.141}"
 REMOTE_PATH="${JETSON_PATH:-~/projects/aquascope}"
-PASSWORD="${JETSON_PASSWORD:?Set JETSON_PASSWORD env var}"
+PASSWORD="${JETSON_PASSWORD:?JETSON_PASSWORD not set. Add it to .env or export it.}"
 
 if ! command -v sshpass >/dev/null 2>&1; then
   echo "ERROR: sshpass is required to use this script."
