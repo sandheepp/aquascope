@@ -55,7 +55,7 @@ class FishTracker:
                   f"imgsz={self.config['imgsz']})\"")
             path = pt
         print(f"[MODEL] Loading: {path} (SAHI sliced inference)")
-        return YOLO(path)
+        return YOLO(path, task="detect")
 
     def _init_writer(self) -> cv2.VideoWriter | None:
         if not self.config["record"]:
