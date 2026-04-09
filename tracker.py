@@ -18,7 +18,7 @@ from ultralytics import YOLO
 
 from camera import init_camera
 from config import TRAIL_COLORS
-from stream import push_frame, request_reset, start_public_tunnel, start_stream
+from stream import push_frame, push_stats, request_reset, start_public_tunnel, start_stream
 
 
 class FishTracker:
@@ -182,6 +182,36 @@ class FishTracker:
         if stats["first_seen"] is None:
             stats["first_seen"] = now
 
+    # ── Stats for stream dashboard ────────────────────────
+
+    def _build_stats(self) -> dict:
+        now = datetime.now()
+        avg_fps = float(np.mean(self.fps_history)) if self.fps_history else 0.0
+        active = sum(
+            1 for s in self.fish_stats.values()
+            if s["last_seen"] and
+            (now - datetime.fromisoformat(s["last_seen"])).total_seconds() < 2
+        )
+        return {
+            "fps": round(avg_fps, 1),
+            "active": active,
+            "total_ids": len(self.fish_stats),
+            "frame": self.frame_count,
+            "model": self.config["model_path"].split("/")[-1],
+            "sahi": bool(self.config.get("sahi")),
+            "fish": {
+                str(tid): {
+                    "first_seen": s["first_seen"],
+                    "last_seen": s["last_seen"],
+                    "last_seen_ts": datetime.fromisoformat(s["last_seen"]).timestamp()
+                        if s["last_seen"] else 0,
+                    "total_distance_px": round(s["total_distance_px"], 1),
+                    "frame_count": s["frame_count"],
+                }
+                for tid, s in self.fish_stats.items()
+            },
+        }
+
     # ── Logging ───────────────────────────────────────────
 
     def _log_stats(self) -> None:
@@ -238,6 +268,7 @@ class FishTracker:
                 if self.config["stream"]:
                     _, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, self.config.get("stream_quality", 85)])
                     push_frame(jpeg.tobytes())
+                    push_stats(self._build_stats())
 
                 self._log_stats()
                 self._handle_display(annotated)
