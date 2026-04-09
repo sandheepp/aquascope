@@ -30,6 +30,14 @@ _stats_lock = threading.Lock()
 _reset_flag = False
 _reset_lock = threading.Lock()
 
+_hat_mode = False
+_hat_lock = threading.Lock()
+
+
+def hat_mode_enabled() -> bool:
+    with _hat_lock:
+        return _hat_mode
+
 _screenshots: list[dict] = []   # [{filename, ts, label}]
 _screenshots_lock = threading.Lock()
 _screenshot_dir = "fish_logs/screenshots"
@@ -71,6 +79,8 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_json(_stats, _stats_lock)
         elif p == "/reset":
             self._serve_reset()
+        elif p == "/hat":
+            self._serve_hat()
         elif p == "/screenshot":
             self._serve_screenshot()
         elif p == "/screenshots":
@@ -101,6 +111,13 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         with _reset_lock:
             _reset_flag = True
         self._json_response(b'{"status":"reset requested"}')
+
+    def _serve_hat(self):
+        global _hat_mode
+        with _hat_lock:
+            _hat_mode = not _hat_mode
+            state = _hat_mode
+        self._json_response(json.dumps({"hat": state}).encode())
 
     def _serve_screenshot(self):
         with _lock:
@@ -338,6 +355,14 @@ body{
 }
 .tag-on{background:rgba(0,212,170,0.15);color:var(--teal);border:1px solid rgba(0,212,170,0.3)}
 .tag-off{background:rgba(74,85,104,0.2);color:var(--dim);border:1px solid var(--border)}
+#hat-btn{
+  width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
+  background:rgba(245,197,24,0.07);color:var(--accent);
+  font-size:12px;cursor:pointer;transition:all 0.15s;font-family:var(--font);
+  margin-bottom:6px;
+}
+#hat-btn:hover{background:rgba(245,197,24,0.18)}
+#hat-btn.on{background:rgba(245,197,24,0.22);border-color:var(--accent)}
 #reset-btn{
   width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
   background:rgba(252,92,101,0.08);color:var(--danger);
@@ -484,6 +509,7 @@ body{
       <div id="fish-list"></div>
     </div>
 
+    <button id="hat-btn" onclick="toggleHat()">🎩 Party Hats: OFF</button>
     <button id="reset-btn" onclick="doReset()">↺ Reset Trails</button>
   </div>
 </main>
@@ -509,6 +535,14 @@ let startTime = Date.now();
 function doReset() {
   fetch('/reset').then(() => {
     document.getElementById('fish-list').innerHTML = '';
+  });
+}
+
+function toggleHat() {
+  fetch('/hat').then(r => r.json()).then(d => {
+    const btn = document.getElementById('hat-btn');
+    btn.textContent = '🎩 Party Hats: ' + (d.hat ? 'ON' : 'OFF');
+    btn.classList.toggle('on', d.hat);
   });
 }
 

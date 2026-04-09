@@ -19,7 +19,7 @@ from ultralytics import YOLO
 
 from camera import init_camera
 from config import TRAIL_COLORS
-from stream import push_frame, push_stats, request_reset, start_public_tunnel, start_stream
+from stream import hat_mode_enabled, push_frame, push_stats, request_reset, start_public_tunnel, start_stream
 
 
 class FishTracker:
@@ -79,6 +79,33 @@ class FishTracker:
             start_public_tunnel(port)
 
     # ── Drawing ───────────────────────────────────────────
+
+    def _draw_hat(self, frame: np.ndarray, x1: int, y1: int, x2: int) -> None:
+        """Draw a tiny top hat above the bounding box."""
+        w = x2 - x1
+        hat_w = max(int(w * 0.7), 14)
+        hat_h = max(int(hat_w * 0.6), 8)
+        brim_h = max(int(hat_h * 0.3), 3)
+        cx = (x1 + x2) // 2
+
+        # Crown
+        crown_x1 = cx - hat_w // 2
+        crown_y2 = y1 - 2
+        crown_y1 = crown_y2 - hat_h
+        crown_x2 = cx + hat_w // 2
+        cv2.rectangle(frame, (crown_x1, crown_y1), (crown_x2, crown_y2), (30, 30, 30), -1, cv2.LINE_AA)
+        cv2.rectangle(frame, (crown_x1, crown_y1), (crown_x2, crown_y2), (200, 180, 50), 1, cv2.LINE_AA)
+
+        # Hat band
+        band_y1 = crown_y2 - brim_h - 1
+        band_y2 = crown_y2 - 1
+        cv2.rectangle(frame, (crown_x1 + 1, band_y1), (crown_x2 - 1, band_y2), (200, 180, 50), -1, cv2.LINE_AA)
+
+        # Brim
+        brim_x1 = cx - int(hat_w * 0.65)
+        brim_x2 = cx + int(hat_w * 0.65)
+        cv2.rectangle(frame, (brim_x1, crown_y2), (brim_x2, crown_y2 + brim_h), (30, 30, 30), -1, cv2.LINE_AA)
+        cv2.rectangle(frame, (brim_x1, crown_y2), (brim_x2, crown_y2 + brim_h), (200, 180, 50), 1, cv2.LINE_AA)
 
     def _color(self, track_id: int) -> tuple:
         return TRAIL_COLORS[track_id % len(TRAIL_COLORS)]
@@ -388,6 +415,8 @@ class FishTracker:
             cv2.putText(annotated, label, (x1 + 3, y1 - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
             cv2.circle(annotated, (cx, cy), 4, color, -1, cv2.LINE_AA)
+            if hat_mode_enabled():
+                self._draw_hat(annotated, x1, y1, x2)
 
         return annotated
 
