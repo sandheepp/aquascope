@@ -94,25 +94,67 @@ class FishTracker:
                          max(1, int(3 * alpha)), cv2.LINE_AA)
 
     def _draw_hud(self, frame: np.ndarray) -> None:
-        overlay = frame.copy()
-        cv2.rectangle(overlay, (10, 10), (320, 130), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
-
+        h, w = frame.shape[:2]
+        now = datetime.now()
         avg_fps = float(np.mean(self.fps_history)) if self.fps_history else 0.0
         active = sum(
             1 for s in self.fish_stats.values()
             if s["last_seen"] and
-            (datetime.now() - datetime.fromisoformat(s["last_seen"])).total_seconds() < 2
+            (now - datetime.fromisoformat(s["last_seen"])).total_seconds() < 2
         )
-        for text, y in [
-            (f"FPS: {avg_fps:.1f}", 40),
-            (f"Active Fish: {active}", 70),
-            (f"Total IDs: {len(self.fish_stats)}", 100),
-        ]:
-            cv2.putText(frame, text, (20, y),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 200), 2, cv2.LINE_AA)
-        cv2.putText(frame, f"Frame: {self.frame_count}", (20, 125),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 150), 1, cv2.LINE_AA)
+
+        # ── Top-left panel ────────────────────────────────────
+        pad, lh, panel_w = 12, 28, 230
+        rows = [
+            ("AquaScope", (200, 220, 255), 0.62, 2),
+            (f"FPS    {avg_fps:5.1f}", (80, 255, 140), 0.58, 1),
+            (f"Active {active:5d}", (80, 220, 255), 0.58, 1),
+            (f"Total  {len(self.fish_stats):5d}", (180, 180, 255), 0.58, 1),
+            (f"Frame  {self.frame_count:5d}", (120, 120, 120), 0.45, 1),
+        ]
+        panel_h = pad * 2 + lh * len(rows)
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (8, 8), (8 + panel_w, 8 + panel_h), (10, 10, 10), -1)
+        cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+        # subtle border
+        cv2.rectangle(frame, (8, 8), (8 + panel_w, 8 + panel_h), (60, 60, 60), 1, cv2.LINE_AA)
+
+        for i, (text, color, scale, thickness) in enumerate(rows):
+            y = 8 + pad + lh * i + int(lh * 0.72)
+            cv2.putText(frame, text, (18, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, thickness, cv2.LINE_AA)
+
+        # ── FPS colour bar (green→yellow→red) ─────────────────
+        fps_max = 30.0
+        bar_x, bar_y, bar_w, bar_h = 8 + panel_w + 6, 8, 8, panel_h
+        ratio = min(avg_fps / fps_max, 1.0)
+        filled = int(bar_h * ratio)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (40, 40, 40), -1)
+        bar_color = (
+            (0, int(255 * ratio), int(255 * (1 - ratio)))
+            if ratio < 0.5
+            else (0, 255, 0)
+        )
+        cv2.rectangle(frame, (bar_x, bar_y + bar_h - filled),
+                      (bar_x + bar_w, bar_y + bar_h), bar_color, -1)
+        cv2.rectangle(frame, (bar_x, bar_y), (bar_x + bar_w, bar_y + bar_h), (80, 80, 80), 1)
+
+        # ── Bottom status bar ─────────────────────────────────
+        bar_h2 = 26
+        overlay2 = frame.copy()
+        cv2.rectangle(overlay2, (0, h - bar_h2), (w, h), (10, 10, 10), -1)
+        cv2.addWeighted(overlay2, 0.6, frame, 0.4, 0, frame)
+        ts = now.strftime("%Y-%m-%d  %H:%M:%S")
+        model_name = self.config["model_path"].split("/")[-1]
+        sahi_tag = "  [SAHI]" if self.config.get("sahi") else ""
+        status = f"  {ts}    {model_name}{sahi_tag}"
+        cv2.putText(frame, status, (8, h - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 160, 160), 1, cv2.LINE_AA)
+        # right-align keys hint
+        hint = "Q quit   S snap   R reset"
+        (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+        cv2.putText(frame, hint, (w - hw - 10, h - 7),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1, cv2.LINE_AA)
 
     # ── Tracking state ────────────────────────────────────
 
@@ -320,7 +362,10 @@ class FishTracker:
                 print(f"[SNAP] Saved {snap}")
             elif key == ord("r"):
                 self.trails.clear()
-                print("[INFO] Trails reset")
+                self.fish_stats.clear()
+                self.sv_tracker = sv.ByteTrack()
+                self.frame_count = 0
+                print("[INFO] Reset — trails, stats, and tracker cleared")
         except cv2.error as e:
             print(f"[WARN] Display error: {e} — switching to headless")
             self.config["display"] = False
