@@ -210,6 +210,39 @@ body{
   height:100vh;overflow:hidden;
 }
 
+/* ── Mobile: stack vertically, hide sidebar ── */
+@media (max-width: 700px) {
+  body{
+    grid-template-columns: 1fr;
+    grid-template-rows: 48px auto auto auto;
+    grid-template-areas:
+      "topbar"
+      "main-feed"
+      "main-stats"
+      "filmstrip";
+    height:auto;overflow-y:auto;overflow-x:hidden;
+  }
+  #sidebar{ display:none }
+  #topbar{ grid-area:topbar }
+  #main{
+    grid-area:unset;
+    display:flex;flex-direction:column;gap:0;padding:0;
+  }
+  #feed-wrap{
+    height:56vw;min-height:200px;
+    border-radius:0;border-left:none;border-right:none;border-top:none;
+  }
+  #stats-panel{
+    flex-direction:row;flex-wrap:wrap;
+    gap:8px;padding:10px;overflow:visible;
+  }
+  #stats-panel .card{ flex:1 1 140px;min-width:130px }
+  #stats-panel #fish-list{ max-height:180px }
+  #filmstrip{ height:auto;min-height:110px }
+  #uptime{ display:none }
+  #snap-popover{ right:auto;left:0;width:280px }
+}
+
 /* ── Sidebar ── */
 #sidebar{
   grid-area:sidebar;
@@ -251,6 +284,12 @@ body{
   background:var(--sidebar);border-bottom:1px solid var(--border);
   display:flex;align-items:center;justify-content:space-between;
   padding:0 20px;
+}
+@media (max-width: 700px) {
+  #topbar{ padding:0 10px }
+  .page-title{ font-size:13px }
+  .live-badge{ padding:2px 7px;font-size:10px }
+  #snap-btn{ padding:5px 10px;font-size:11px }
 }
 .topbar-left{display:flex;align-items:center;gap:14px}
 .page-title{font-size:15px;font-weight:600;color:var(--text)}
@@ -306,6 +345,14 @@ body{
   grid-template-columns:1fr 200px;
   gap:10px;padding:10px;
   overflow:hidden;
+}
+@media (max-width: 700px) {
+  #main{
+    display:flex;flex-direction:column;
+    gap:0;padding:0;
+    grid-area:unset;
+    overflow:visible;
+  }
 }
 
 /* ── Feed ── */
