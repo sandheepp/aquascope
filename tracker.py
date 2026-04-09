@@ -259,7 +259,9 @@ class FishTracker:
                 self.frame_count += 1
                 annotated = self._infer_and_annotate(frame)
                 self._draw_trails(annotated)
-                self._draw_hud(annotated)
+                # HUD drawn on frame only for local display; sidebar handles it for stream
+                if self.config["display"]:
+                    self._draw_hud(annotated)
 
                 self.fps_history.append(1.0 / max(time.time() - t0, 1e-6))
 
