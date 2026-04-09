@@ -252,6 +252,35 @@ body{
 }
 #snap-btn:hover{opacity:0.85}
 #snap-btn:active{opacity:0.7}
+#snap-wrap{position:relative}
+#snap-popover{
+  display:none;
+  position:absolute;top:calc(100% + 8px);right:0;
+  width:340px;
+  background:var(--card);border:1px solid var(--border);border-radius:8px;
+  padding:10px;z-index:50;
+  box-shadow:0 8px 32px rgba(0,0,0,0.6);
+}
+#snap-wrap:focus-within #snap-popover,
+#snap-wrap.open #snap-popover{display:block}
+#snap-pop-row{
+  display:flex;gap:6px;overflow-x:auto;
+  scrollbar-width:thin;scrollbar-color:var(--border) transparent;
+  padding-bottom:4px;
+}
+#snap-pop-empty{color:var(--dim);font-size:11px;text-align:center;padding:10px 0}
+.pop-thumb{
+  flex-shrink:0;width:100px;height:56px;border-radius:5px;overflow:hidden;
+  border:1px solid var(--border);cursor:pointer;position:relative;transition:border-color 0.15s;
+}
+.pop-thumb:hover{border-color:var(--accent)}
+.pop-thumb img{width:100%;height:100%;object-fit:cover}
+.pop-thumb .del{
+  position:absolute;top:2px;right:2px;
+  background:rgba(0,0,0,0.7);color:#fc5c65;border:none;
+  border-radius:3px;font-size:10px;padding:1px 4px;cursor:pointer;display:none;
+}
+.pop-thumb:hover .del{display:block}
 
 /* ── Main ── */
 #main{
@@ -400,7 +429,13 @@ body{
   <div class="topbar-right">
     <span id="uptime" style="color:var(--dim);font-size:11px"></span>
     <span id="clock"></span>
-    <button id="snap-btn" onclick="takeSnap()">📷 Snapshot</button>
+    <div id="snap-wrap" style="position:relative">
+      <button id="snap-btn" onclick="takeSnap()">📷 Snapshot</button>
+      <div id="snap-popover">
+        <div id="snap-pop-row"></div>
+        <div id="snap-pop-empty">No snapshots yet</div>
+      </div>
+    </div>
   </div>
 </header>
 
@@ -477,15 +512,71 @@ function doReset() {
   });
 }
 
+// ── Snapshot state ──────────────────────────────────────
+let snapList = [];
+
+function addThumb(s) {
+  const url = '/screenshots/' + s.filename;
+  // Popover thumb
+  const popRow = document.getElementById('snap-pop-row');
+  const popEmpty = document.getElementById('snap-pop-empty');
+  popEmpty.style.display = 'none';
+  const pt = document.createElement('div');
+  pt.className = 'pop-thumb';
+  pt.dataset.file = s.filename;
+  pt.innerHTML = '<img src="' + url + '"><button class="del" onclick="deleteSnap(event,\'' + s.filename + '\')">✕</button>';
+  pt.querySelector('img').onclick = () => openModal(url);
+  popRow.prepend(pt);
+
+  // Filmstrip thumb
+  const row = document.getElementById('snap-row');
+  const empty = document.getElementById('snap-empty');
+  empty.style.display = 'none';
+  const ft = document.createElement('div');
+  ft.className = 'snap-thumb';
+  ft.dataset.file = s.filename;
+  ft.innerHTML = '<img src="' + url + '" loading="lazy"><div class="snap-label">' + s.label + '</div>';
+  ft.onclick = () => openModal(url);
+  row.prepend(ft);
+
+  document.getElementById('snap-count').textContent = snapList.length;
+}
+
 function takeSnap() {
   const btn = document.getElementById('snap-btn');
+  const wrap = document.getElementById('snap-wrap');
   btn.disabled = true;
-  btn.textContent = '⏳ Saving…';
+  btn.textContent = '⏳';
   fetch('/screenshot').then(r => r.json()).then(d => {
-    btn.textContent = '✓ Saved!';
-    setTimeout(() => { btn.textContent = '📷 Snapshot'; btn.disabled = false; }, 1500);
-    loadSnapshots();
+    btn.textContent = '✓';
+    wrap.classList.add('open');
+    const s = {filename: d.filename, ts: d.filename.replace('snap_','').replace('.jpg',''), label: 'Snap ' + d.filename.slice(9,15)};
+    snapList.unshift(s);
+    addThumb(s);
+    setTimeout(() => { btn.textContent = '📷 Snapshot'; btn.disabled = false; }, 1200);
   }).catch(() => { btn.textContent = '📷 Snapshot'; btn.disabled = false; });
+}
+
+// Toggle popover on button area click
+document.getElementById('snap-wrap').addEventListener('click', function(e) {
+  if (e.target.id !== 'snap-btn' && snapList.length) {
+    this.classList.toggle('open');
+  }
+});
+document.addEventListener('click', e => {
+  if (!document.getElementById('snap-wrap').contains(e.target))
+    document.getElementById('snap-wrap').classList.remove('open');
+});
+
+function deleteSnap(e, filename) {
+  e.stopPropagation();
+  snapList = snapList.filter(s => s.filename !== filename);
+  document.querySelectorAll('[data-file="' + filename + '"]').forEach(el => el.remove());
+  document.getElementById('snap-count').textContent = snapList.length;
+  if (!snapList.length) {
+    document.getElementById('snap-empty').style.display = '';
+    document.getElementById('snap-pop-empty').style.display = '';
+  }
 }
 
 function openModal(url) {
@@ -501,19 +592,14 @@ document.getElementById('modal').addEventListener('click', e => {
 
 function loadSnapshots() {
   fetch('/screenshots').then(r => r.json()).then(list => {
-    const row = document.getElementById('snap-row');
-    const empty = document.getElementById('snap-empty');
-    document.getElementById('snap-count').textContent = list.length;
-    if (!list.length) { empty.style.display = ''; return; }
-    empty.style.display = 'none';
-    row.innerHTML = '';
+    if (list.length === snapList.length) return; // no change
+    // sync any new entries added by other clients
+    const existing = new Set(snapList.map(s => s.filename));
     list.forEach(s => {
-      const url = '/screenshots/' + s.filename;
-      const div = document.createElement('div');
-      div.className = 'snap-thumb';
-      div.innerHTML = '<img src="' + url + '" loading="lazy"><div class="snap-label">' + s.label + '</div>';
-      div.onclick = () => openModal(url);
-      row.appendChild(div);
+      if (!existing.has(s.filename)) {
+        snapList.unshift(s);
+        addThumb(s);
+      }
     });
   });
 }
