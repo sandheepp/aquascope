@@ -575,7 +575,7 @@ function tick() {
 }
 
 setInterval(tick, 1000);
-setInterval(loadSnapshots, 10000);
+setInterval(loadSnapshots, 2000);
 tick();
 loadSnapshots();
 

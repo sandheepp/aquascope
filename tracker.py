@@ -5,6 +5,7 @@ Wraps YOLOv8s + SAHI sliced inference + supervision ByteTrack,
 draws trails and HUD, handles recording, streaming, and periodic JSON logging.
 """
 
+import glob
 import json
 import os
 import time
@@ -416,4 +417,16 @@ class FishTracker:
         if self.writer:
             self.writer.release()
         cv2.destroyAllWindows()
+        self._delete_snapshots()
         print("[INFO] Tracker stopped.")
+
+    def _delete_snapshots(self) -> None:
+        snap_dir = os.path.join(self.config["output_dir"], "screenshots")
+        files = glob.glob(os.path.join(snap_dir, "snap_*.jpg"))
+        for f in files:
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        if files:
+            print(f"[INFO] Deleted {len(files)} snapshot(s) from {snap_dir}")
