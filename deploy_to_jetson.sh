@@ -34,6 +34,7 @@ sshpass -p "$PASSWORD" rsync -avz --delete \
   --exclude='*.log' \
   --exclude='*.tmp' \
   --exclude='*.swp' \
+  --exclude='datasets' \
   --exclude='*.engine' \
   --exclude='*.pt' \
   --exclude='*.onnx' \

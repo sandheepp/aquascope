@@ -12,6 +12,7 @@ venv/
 *.onnx
 *.trt
 *.whl
+*.zip
 
 # Output
 fish_logs/
@@ -19,6 +20,7 @@ fish_logs/
 *.jpg
 *.png
 snapshot_*.jpg
+*.csv
 
 # Jetson setup downloads
 cloudflared

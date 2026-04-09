@@ -228,7 +228,8 @@ body{
   #snap-btn{ padding:5px 10px;font-size:11px }
   #uptime{ display:none }
   #main{
-    display:flex;flex-direction:column;
+    display:flex !important;flex-direction:column !important;
+    grid-template-columns:unset !important;
     width:100%;padding:0;gap:0;flex-shrink:0;
   }
   #feed-wrap{
@@ -460,6 +461,27 @@ body{
   position:absolute;top:20px;right:24px;
   background:none;border:none;color:var(--text);font-size:24px;cursor:pointer;
 }
+
+/* Fullscreen video overlay */
+#fs-overlay{
+  display:none;position:fixed;inset:0;
+  background:#000;z-index:300;
+  align-items:center;justify-content:center;
+}
+#fs-overlay.open{display:flex}
+#fs-overlay img{
+  width:100%;height:100%;object-fit:contain;
+}
+#fs-close{
+  position:absolute;top:14px;right:14px;
+  background:rgba(0,0,0,0.65);color:#fff;
+  border:1px solid rgba(255,255,255,0.25);border-radius:50%;
+  width:38px;height:38px;font-size:18px;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;
+  z-index:301;transition:background 0.15s;
+}
+#fs-close:hover{background:rgba(255,255,255,0.15)}
+#feed-wrap{cursor:pointer}
 </style>
 </head><body>
 
@@ -564,6 +586,12 @@ body{
 <div id="modal">
   <button id="modal-close" onclick="closeModal()">✕</button>
   <img id="modal-img" src="" alt="snapshot">
+</div>
+
+<!-- Fullscreen video overlay -->
+<div id="fs-overlay">
+  <button id="fs-close" onclick="closeFeed()">✕</button>
+  <img id="fs-feed" src="" alt="fullscreen feed">
 </div>
 
 <script>
@@ -739,6 +767,37 @@ loadSnapshots();
 document.getElementById('feed').onerror = function() {
   setTimeout(() => { this.src = '/stream?t=' + Date.now(); }, 2000);
 };
+
+// ── Fullscreen feed ──────────────────────────────────────
+document.getElementById('feed-wrap').addEventListener('click', function() {
+  const overlay = document.getElementById('fs-overlay');
+  const fsFeed  = document.getElementById('fs-feed');
+  fsFeed.src = '/stream?t=' + Date.now();
+  overlay.classList.add('open');
+  // Try native fullscreen on supported browsers
+  if (overlay.requestFullscreen) overlay.requestFullscreen().catch(() => {});
+  else if (overlay.webkitRequestFullscreen) overlay.webkitRequestFullscreen();
+});
+
+function closeFeed() {
+  const overlay = document.getElementById('fs-overlay');
+  overlay.classList.remove('open');
+  document.getElementById('fs-feed').src = '';
+  if (document.fullscreenElement || document.webkitFullscreenElement) {
+    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
+  }
+}
+
+// Close fullscreen overlay on backdrop tap (not on close button)
+document.getElementById('fs-overlay').addEventListener('click', function(e) {
+  if (e.target === this) closeFeed();
+});
+
+// Sync if browser exits native fullscreen via Escape
+document.addEventListener('fullscreenchange', () => {
+  if (!document.fullscreenElement)
+    document.getElementById('fs-overlay').classList.remove('open');
+});
 </script>
 </body></html>"""
         body = html.encode()

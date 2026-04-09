@@ -22,9 +22,8 @@ def init_camera(config: dict) -> cv2.VideoCapture:
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, config["camera_height"])
     cap.set(cv2.CAP_PROP_FPS, config["camera_fps"])
 
-    # Fixed focus — prevents autofocus hunting which destabilises detection
-    cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
-    cap.set(cv2.CAP_PROP_FOCUS, 40)  # tune for your tank distance
+    # Autofocus enabled
+    cap.set(cv2.CAP_PROP_AUTOFOCUS, 1)
 
     # Exposure (V4L2: 3=aperture-priority auto, 1=manual)
     exp = config.get("exposure")
