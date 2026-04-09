@@ -18,7 +18,7 @@ from ultralytics import YOLO
 
 from camera import init_camera
 from config import TRAIL_COLORS
-from stream import push_frame, start_public_tunnel, start_stream
+from stream import push_frame, request_reset, start_public_tunnel, start_stream
 
 
 class FishTracker:
@@ -156,6 +156,15 @@ class FishTracker:
         cv2.putText(frame, hint, (w - hw - 10, h - 7),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1, cv2.LINE_AA)
 
+    # ── Reset ─────────────────────────────────────────────
+
+    def _reset(self) -> None:
+        self.trails.clear()
+        self.fish_stats.clear()
+        self.sv_tracker = sv.ByteTrack()
+        self.frame_count = 0
+        print("[INFO] Reset — trails, stats, and tracker cleared")
+
     # ── Tracking state ────────────────────────────────────
 
     def _update_trail(self, track_id: int, center: tuple) -> None:
@@ -208,6 +217,9 @@ class FishTracker:
 
         try:
             while True:
+                if request_reset():
+                    self._reset()
+
                 t0 = time.time()
                 frame = self._read_frame()
                 if frame is None:
@@ -361,11 +373,7 @@ class FishTracker:
                 cv2.imwrite(snap, frame)
                 print(f"[SNAP] Saved {snap}")
             elif key == ord("r"):
-                self.trails.clear()
-                self.fish_stats.clear()
-                self.sv_tracker = sv.ByteTrack()
-                self.frame_count = 0
-                print("[INFO] Reset — trails, stats, and tracker cleared")
+                self._reset()
         except cv2.error as e:
             print(f"[WARN] Display error: {e} — switching to headless")
             self.config["display"] = False

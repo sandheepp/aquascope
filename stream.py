@@ -17,6 +17,18 @@ from socketserver import ThreadingMixIn
 # ── Shared frame state ────────────────────────────────────
 _frame: bytes = b""
 _lock = threading.Lock()
+_reset_flag = False
+_reset_lock = threading.Lock()
+
+
+def request_reset() -> bool:
+    """Return True (and clear the flag) if a reset was requested via /reset."""
+    global _reset_flag
+    with _reset_lock:
+        if _reset_flag:
+            _reset_flag = False
+            return True
+    return False
 
 
 def push_frame(jpeg_bytes: bytes) -> None:
@@ -36,9 +48,22 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_index()
         elif self.path == "/stream":
             self._serve_stream()
+        elif self.path == "/reset":
+            self._serve_reset()
         else:
             self.send_response(404)
             self.end_headers()
+
+    def _serve_reset(self):
+        global _reset_flag
+        with _reset_lock:
+            _reset_flag = True
+        body = b'{"status":"reset requested"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _serve_index(self):
         body = (
@@ -48,18 +73,22 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             b"<title>AquaScope Live</title>"
             b"<style>"
             b"*{margin:0;padding:0;box-sizing:border-box}"
-            b"body{background:#000;display:flex;flex-direction:column;"
-            b"align-items:center;justify-content:center;height:100vh;font-family:monospace}"
+            b"body{background:#000;height:100vh;overflow:hidden;font-family:monospace}"
             b"#feed{width:100%;height:100vh;object-fit:contain;display:block}"
-            b"#bar{position:fixed;top:0;left:0;right:0;padding:6px 12px;"
-            b"background:rgba(0,0,0,0.55);color:#0f0;font-size:13px;"
-            b"display:flex;justify-content:space-between;pointer-events:none}"
+            b"#bar{position:fixed;bottom:0;left:0;right:0;padding:5px 14px;"
+            b"background:rgba(0,0,0,0.6);color:#aaa;font-size:12px;"
+            b"display:flex;justify-content:space-between;align-items:center;"
+            b"pointer-events:none;border-top:1px solid #333}"
+            b"#resetbtn{position:fixed;bottom:6px;right:10px;padding:3px 10px;"
+            b"background:#1a1a2e;color:#7af;border:1px solid #444;border-radius:4px;"
+            b"font-size:12px;cursor:pointer;pointer-events:all}"
             b"</style></head><body>"
             b"<img id='feed' src='/stream'>"
             b"<div id='bar'>"
-            b"<span>&#127744; AquaScope Live</span>"
+            b"<span>AquaScope Live</span>"
             b"<span id='ts'></span>"
             b"</div>"
+            b"<button id='resetbtn' onclick=\"fetch('/reset')\">Reset Trails</button>"
             b"<script>"
             b"setInterval(()=>{document.getElementById('ts').textContent=new Date().toLocaleTimeString();},1000);"
             b"document.getElementById('feed').onerror=function(){"

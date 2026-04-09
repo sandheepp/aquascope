@@ -4,8 +4,8 @@ Default configuration and constants for AquaScope.
 
 DEFAULT_CONFIG: dict = {
     "camera_id": 0,                  # /dev/video0 for C920
-    "camera_width": 1920,
-    "camera_height": 1080,
+    "camera_width": 1280,
+    "camera_height": 720,
     "camera_fps": 60,
     "model_path": "yolov8s.pt",      # Auto-falls back to .pt if .engine missing
     "confidence_threshold": 0.35,
