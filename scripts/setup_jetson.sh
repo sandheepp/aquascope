@@ -2,12 +2,21 @@
 # ============================================================
 #  AquaScope — Jetson Orin Nano Setup Script
 #  Tested on: JetPack 6.1 (L4T R36.5), CUDA 12.6, Python 3.10
+#
+#  Run from project root:
+#    bash scripts/setup_jetson.sh
 # ============================================================
 
 set -e
+
+# Resolve project root (one level above scripts/)
+PROJECT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$PROJECT_ROOT"
+
 echo "╔══════════════════════════════════════════════════╗"
 echo "║   AquaScope — Jetson Setup                       ║"
 echo "╚══════════════════════════════════════════════════╝"
+echo "  Project root: $PROJECT_ROOT"
 
 # ── 1. System packages ────────────────────────────────────
 echo ""
@@ -78,7 +87,7 @@ TORCH_WHEEL="https://developer.download.nvidia.com/compute/redist/jp/v61/pytorch
 echo "  Installing torch 2.5.0 Jetson wheel..."
 pip3 install --no-cache "$TORCH_WHEEL"
 
-# ── torchvision: pip install (jetson_compat.py patches the NMS ops at runtime) ──
+# ── torchvision: pip install (app/jetson_compat.py patches NMS ops at runtime) ──
 echo "  Installing torchvision 0.26.0..."
 pip3 install torchvision==0.26.0 --no-deps
 
@@ -122,7 +131,8 @@ pip3 install \
     "jetson-stats==4.3.2" \
     "python-dotenv==1.0.1" \
     "onnx" \
-    "onnxslim==0.1.34"
+    "onnxslim==0.1.34" \
+    "supervision==0.25.1"
 # Note: onnxruntime-gpu has no ARM64 pip wheel — skip it.
 # onnx+onnxslim are sufficient for the .pt → ONNX → TensorRT export path.
 
@@ -139,24 +149,25 @@ else
     echo "    Run: v4l2-ctl --list-devices"
 fi
 
-# ── 5. Download YOLOv8n model and export to TensorRT ──────
+# ── 5. Download YOLOv8s model and export to TensorRT ──────
 echo ""
-echo "▸ [5/7] Downloading YOLOv8n model and exporting to TensorRT..."
-cd "$(dirname "$0")"
+echo "▸ [5/7] Downloading YOLOv8s model and exporting to TensorRT..."
+# Run from project root so yolov8s.pt and yolov8s.engine land here,
+# where app/fish_tracker.py can find them by default.
 
 python3 -c "
 import os
 from ultralytics import YOLO
 
-model = YOLO('yolov8n.pt')
-print('✓ Model downloaded: yolov8n.pt')
+model = YOLO('yolov8s.pt')
+print('✓ Model downloaded: yolov8s.pt')
 
-engine = 'yolov8n.engine'
+engine = 'yolov8s.engine'
 if os.path.exists(engine):
     print(f'✓ TensorRT engine already exists: {engine}')
 else:
     print('Exporting to TensorRT FP16 (this takes several minutes)...')
-    model.export(format='engine', device=0, half=True, imgsz=416)
+    model.export(format='engine', device=0, half=True, imgsz=640)
     print(f'✓ TensorRT engine created: {engine}')
 "
 
@@ -184,12 +195,18 @@ echo ""
 echo "╔══════════════════════════════════════════════════╗"
 echo "║   Setup Complete!                                ║"
 echo "║                                                  ║"
-echo "║   Run the tracker:                               ║"
-echo "║   python3 fish_tracker.py --no-display --stream  ║"
+echo "║   Run the tracker (from project root):           ║"
+echo "║   python3 app/fish_tracker.py                    ║"
+echo "║                                                  ║"
+echo "║   Headless + browser stream:                     ║"
+echo "║   python3 app/fish_tracker.py \                  ║"
+echo "║     --no-display --stream                        ║"
 echo "║                                                  ║"
 echo "║   With TensorRT engine:                          ║"
-echo "║   python3 fish_tracker.py --model yolov8n.engine ║"
+echo "║   python3 app/fish_tracker.py \                  ║"
+echo "║     --model yolov8s.engine                       ║"
 echo "║                                                  ║"
-echo "║   With public stream:                            ║"
-echo "║   python3 fish_tracker.py --stream --public      ║"
+echo "║   With public Cloudflare stream:                 ║"
+echo "║   python3 app/fish_tracker.py \                  ║"
+echo "║     --no-display --stream --public               ║"
 echo "╚══════════════════════════════════════════════════╝"

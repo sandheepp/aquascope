@@ -2,9 +2,10 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Load .env if present
-ENV_FILE="$SCRIPT_DIR/.env"
+# Load .env from project root if present
+ENV_FILE="$PROJECT_ROOT/.env"
 if [ -f "$ENV_FILE" ]; then
   set -a
   source "$ENV_FILE"
@@ -24,7 +25,7 @@ if ! command -v sshpass >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "Syncing code from ${SCRIPT_DIR} to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"
+echo "Syncing code from ${PROJECT_ROOT} to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"
 sshpass -p "$PASSWORD" rsync -avz --delete \
   --exclude='venv' \
   --exclude='fish_logs' \
@@ -34,10 +35,12 @@ sshpass -p "$PASSWORD" rsync -avz --delete \
   --exclude='*.log' \
   --exclude='*.tmp' \
   --exclude='*.swp' \
+  --exclude='datasets' \
   --exclude='*.engine' \
   --exclude='*.pt' \
   --exclude='*.onnx' \
   --exclude='*.trt' \
-  "$SCRIPT_DIR"/ "$REMOTE_USER"@"$REMOTE_HOST":"$REMOTE_PATH"/
+  --exclude='*.whl' \
+  "$PROJECT_ROOT"/ "$REMOTE_USER"@"$REMOTE_HOST":"$REMOTE_PATH"/
 
 echo "Done. Code synced to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"

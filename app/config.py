@@ -4,14 +4,13 @@ Default configuration and constants for AquaScope.
 
 DEFAULT_CONFIG: dict = {
     "camera_id": 0,                  # /dev/video0 for C920
-    "camera_width": 1920,
-    "camera_height": 1080,
+    "camera_width": 1280,
+    "camera_height": 720,
     "camera_fps": 60,
-    "model_path": "yolov8n.pt",      # Auto-falls back to .pt if .engine missing
+    "model_path": "yolov8s.pt",      # Auto-falls back to .pt if .engine missing
     "confidence_threshold": 0.35,
     "iou_threshold": 0.45,
-    "tracker_config": "bytetrack.yaml",
-    "imgsz": 416,
+    "imgsz": 640,
     "max_trail_length": 60,          # Trail length in frames
     "log_interval_sec": 60,          # Save JSON stats every N seconds
     "output_dir": "fish_logs",
@@ -21,7 +20,16 @@ DEFAULT_CONFIG: dict = {
     "record_path": "fish_recording.mp4",
     "stream": False,
     "stream_port": 8080,
+    "stream_quality": 85,            # JPEG quality 1-100; 85 = good balance over Cloudflare
     "public": False,
+    # SAHI — sliced inference for small fish detection (off by default for FPS)
+    # At 1920×1080 with 640px tiles: 0% overlap→6 tiles, 10%→8 tiles, 20%→12 tiles
+    # Tip: use --resolution 720p to halve tile count (4 tiles at 0% overlap)
+    "detect_classes": None,          # None = all classes; set to [0] after fish-specific training
+    "sahi": False,                   # Enable via --sahi flag
+    "sahi_slice_height": 640,        # Tile height (px); match imgsz
+    "sahi_slice_width": 640,         # Tile width (px); match imgsz
+    "sahi_overlap_ratio": 0.1,       # 10% overlap — balance coverage vs tile count
 }
 
 # Color palette for fish trails — up to 20 unique fish get distinct colors

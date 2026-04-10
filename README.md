@@ -2,47 +2,56 @@
 
 Real-time fish detection and tracking for home aquariums using **NVIDIA Jetson Orin Nano** and a **Logitech C920** webcam.
 
+## Project Structure
+
+```
+aquascope/
+├── app/                        # Core tracker application
+│   ├── fish_tracker.py         # Entry point (CLI)
+│   ├── tracker.py              # Main tracking loop (YOLOv8s + ByteTrack)
+│   ├── stream.py               # MJPEG HTTP server + dashboard UI
+│   ├── camera.py               # Camera initialisation (V4L2)
+│   ├── config.py               # Default config & constants
+│   ├── jetson_compat.py        # torchvision NMS patch for Jetson
+│   └── bytetrack.yaml          # ByteTrack tuning reference
+├── training/                   # Model fine-tuning & analysis
+│   ├── quick_train.py          # Quick YOLOv8s training script
+│   ├── train_fish_model.py     # Roboflow download + full training pipeline
+│   └── analyse_training.py     # Analyse training_mem.csv + plot graphs
+├── monitoring/                 # Jetson resource monitoring
+│   └── jetson_monitor.py       # Logs CPU/GPU/RAM/temp to CSV during training
+├── scripts/                    # Deployment & setup
+│   ├── setup_jetson.sh         # One-shot Jetson setup (run once after flash)
+│   └── deploy_to_jetson.sh     # rsync project to Jetson over LAN
+├── requirements.txt
+├── .env                        # Local secrets (gitignored)
+└── fish_logs/                  # Runtime output: JSON stats + screenshots
+```
+
 ## Architecture
 
 ```
 ┌──────────────┐     USB      ┌──────────────────┐     TensorRT      ┌──────────────┐
-│ Logitech C920 │ ──────────▶ │  Jetson Orin Nano │ ───────────────▶  │  YOLOv8n     │
-│   (1280×720)  │             │  (JetPack 5/6)   │                   │  Detection   │
+│ Logitech C920 │ ──────────▶ │  Jetson Orin Nano │ ───────────────▶  │  YOLOv8s     │
+│   (1280×720)  │             │  (JetPack 6.1)   │                   │  Detection   │
 └──────────────┘              └────────┬─────────┘                   └──────┬───────┘
                                        │                                     │
                                        │              ┌──────────────────────┘
                                        │              ▼
                                        │       ┌──────────────┐
                                        │       │  ByteTrack   │
-                                       │       │  Tracker     │
+                                       │       │  (supervision)│
                                        │       └──────┬───────┘
                                        │              │
                                        ▼              ▼
                                 ┌─────────────────────────────┐
-                                │  Annotated Display + Logs   │
+                                │  Dashboard (MJPEG stream)   │
                                 │  • Fish trails & IDs        │
                                 │  • Count & activity stats   │
-                                │  • JSON logging             │
+                                │  • Screenshots / filmstrip  │
+                                │  • Cloudflare public URL    │
                                 └─────────────────────────────┘
 ```
-
-## Why YOLOv8n + ByteTrack?
-
-| Criterion             | YOLOv8n + ByteTrack           | Alternatives                      |
-|----------------------|-------------------------------|-----------------------------------|
-| **Orin Nano FPS**    | ~30-43 FPS (TensorRT FP16)    | YOLOv8s: ~20 FPS, YOLOv5: ~35    |
-| **Accuracy**         | High (mAP 37.3 COCO)         | Comparable for fish detection     |
-| **Tracking**         | ByteTrack: low ID switches    | DeepSORT: heavier, slower         |
-| **Memory**           | ~1.5 GB                       | YOLOv8m: ~3 GB                    |
-| **Ecosystem**        | Ultralytics (batteries incl.) | Manual integration needed         |
-| **Fish research**    | Validated in aquaculture      | Limited published results         |
-
-**Key reasons:**
-- YOLOv8n is the smallest variant (~3.2M params), ideal for the Orin Nano's 8GB RAM
-- TensorRT export gives ~2-3x speedup over PyTorch inference
-- ByteTrack outperforms BoT-SORT for fish tracking due to its two-stage matching that handles occlusions well
-- The Ultralytics library includes built-in ByteTrack support — zero extra code
-- Multiple aquaculture studies validate this exact combo (YOLOv8 + ByteTrack) for fish detection
 
 ## Hardware Setup
 
@@ -56,10 +65,9 @@ Real-time fish detection and tracking for home aquariums using **NVIDIA Jetson O
 
 ### Camera mounting
 1. Position the C920 facing the front glass of your aquarium
-2. Distance: 30-60 cm from the glass works best
-3. Avoid reflections: angle slightly downward (5-10°) and use a matte background
+2. Distance: 30–60 cm from the glass works best
+3. Avoid reflections: angle slightly downward (5–10°) and use a matte background
 4. Ensure even lighting — avoid direct overhead lights causing glare
-5. Disable autofocus (done in software) for stable detection
 
 ## Software Setup
 
@@ -69,78 +77,117 @@ If not already done, flash JetPack 6.1 (or 5.1.3+) to your Jetson:
 - Download from: https://developer.nvidia.com/jetson-orin-nano-developer-kit
 - Use NVIDIA SDK Manager or balenaEtcher with the SD card image
 
-### Step 2: Run the setup script
+### Step 2: Deploy code to Jetson
+
+From your **host machine** (Mac/Linux):
 
 ```bash
-# Copy this project to your Jetson
+# Configure connection in .env (copy from .env.example)
+cp .env.example .env
+# Edit: JETSON_HOST, JETSON_USER, JETSON_PASSWORD, JETSON_PATH
 
+# Deploy project files to Jetson
+bash scripts/deploy_to_jetson.sh
+```
 
-# SSH into the Jetson
+### Step 3: Run setup on Jetson
+
+SSH into the Jetson, then:
+
+```bash
 ssh jetson@<jetson-ip>
+cd ~/projects/aquascope
 
-# Run setup
-cd ~/fish_tracker
-chmod +x setup_jetson.sh
-./setup_jetson.sh
+# One-time setup: installs all dependencies, downloads YOLOv8s, exports TensorRT engine
+bash scripts/setup_jetson.sh
 ```
 
-This installs all dependencies, sets max performance mode, downloads YOLOv8n,
-and exports it to a TensorRT engine.
+This installs all Python packages, sets max performance mode, downloads YOLOv8s,
+and exports it to a TensorRT FP16 engine.
 
-### Step 3: Run the tracker
+### Step 4: Run the tracker
+
+All commands are run from the **project root** (`~/projects/aquascope`):
 
 ```bash
-# Basic usage
-python3 fish_tracker.py
+# Local display (requires monitor)
+python3 app/fish_tracker.py
 
-# With recording
-python3 fish_tracker.py --record
+# Headless + browser dashboard (recommended for SSH)
+python3 app/fish_tracker.py --no-display --stream
 
-# Headless (no display, just logging)
-python3 fish_tracker.py --no-display
+# With TensorRT engine (~2× faster)
+python3 app/fish_tracker.py --model yolov8s.engine --no-display --stream
 
-# Custom confidence threshold
-python3 fish_tracker.py --conf 0.4
+# Public URL via Cloudflare tunnel
+python3 app/fish_tracker.py --model yolov8s.engine --no-display --stream --public
+
+# SAHI sliced inference (better small-fish recall, lower FPS)
+python3 app/fish_tracker.py --sahi --no-display --stream
+
+# Custom confidence + resolution
+python3 app/fish_tracker.py --conf 0.3 --resolution 1080p --no-display --stream
+
+# Manual camera exposure (e.g. dimly lit tank)
+python3 app/fish_tracker.py --exposure -6 --no-display --stream
 ```
 
-### Keyboard controls
+Open the dashboard at `http://<jetson-ip>:8080` in your browser.
+
+### Keyboard controls (local display mode only)
 - `q` — Quit
-- `s` — Save snapshot
 - `r` — Reset all trails
 
-## Fine-Tuning for Your Aquarium (Optional but Recommended)
+## Training (Optional)
 
-The default YOLOv8n is trained on COCO (80 classes). It can detect some fish out
-of the box, but fine-tuning on aquarium data dramatically improves accuracy.
+Fine-tuning on aquarium data dramatically improves detection accuracy
+over the default COCO-trained YOLOv8s.
 
-### Option A: Use Roboflow Aquarium Dataset (quick start)
+### Option A: Quick train (Roboflow dataset)
 
 ```bash
-# Get a free API key from https://app.roboflow.com
-python3 train_fish_model.py download --api-key YOUR_KEY
+# Download dataset (get free API key from https://app.roboflow.com)
+python3 training/train_fish_model.py download --api-key YOUR_KEY
 
-# Train (runs on Jetson GPU — ~2-4 hours for 100 epochs)
-python3 train_fish_model.py train --data datasets/data.yaml --epochs 100
+# Fine-tune (~2–4 hours on Jetson for 50 epochs)
+python3 training/quick_train.py
+
+# Export best weights to TensorRT after training
+python3 -c "
+from ultralytics import YOLO
+YOLO('runs/detect/train/weights/best.pt') \
+  .export(format='engine', device=0, half=True, imgsz=640)
+"
+
+# Run with custom model
+python3 app/fish_tracker.py --model runs/detect/train/weights/best.engine \
+  --no-display --stream
 ```
 
-### Option B: Label Your Own Fish (best accuracy)
+### Option B: Label your own fish
 
 ```bash
-# 1. Capture images from your tank
-python3 train_fish_model.py capture --num 200
+# Capture images from your tank
+python3 training/train_fish_model.py capture --num 200
 
-# 2. Upload to https://app.roboflow.com and label bounding boxes
-#    Label classes: "fish" (or specific species)
+# Upload to https://app.roboflow.com, label bounding boxes, download YOLOv8 format
+# Then train:
+python3 training/train_fish_model.py train --data path/to/data.yaml
+```
 
-# 3. Download in YOLOv8 format
+### Monitor Jetson resources during training
 
-# 4. Train
-python3 train_fish_model.py train --data path/to/data.yaml
+```bash
+# In a separate terminal — logs CPU/GPU/RAM/temp to CSV
+python3 monitoring/jetson_monitor.py --interval 2 --output training_mem.csv
+
+# After training, analyse the log and generate graphs
+python3 training/analyse_training.py --csv training_mem.csv
 ```
 
 ## Output & Logs
 
-The tracker saves JSON logs to `fish_logs/` every 60 seconds:
+The tracker saves JSON stats to `fish_logs/` every 60 seconds:
 
 ```json
 {
@@ -158,38 +205,40 @@ The tracker saves JSON logs to `fish_logs/` every 60 seconds:
 }
 ```
 
+Screenshots taken via the dashboard are saved to `fish_logs/screenshots/`.
+
 ## Performance Tuning
 
-| Setting                        | Command / Action                     | Effect              |
-|-------------------------------|--------------------------------------|---------------------|
-| Max Jetson performance        | `sudo nvpmodel -m 0 && sudo jetson_clocks` | +20-40% FPS  |
-| Use TensorRT FP16             | Export with `half=True`              | ~2x faster          |
-| Use TensorRT INT8             | Export with `int8=True`              | ~3x faster (needs calibration) |
-| Reduce input size             | `--imgsz 416`                        | +30% FPS, slight accuracy drop |
-| Lower camera resolution       | Change `camera_width/height`         | Less CPU overhead   |
-| Increase confidence threshold | `--conf 0.5`                         | Fewer false positives |
+| Setting                        | Command / Action                              | Effect              |
+|-------------------------------|-----------------------------------------------|---------------------|
+| Max Jetson performance        | `sudo nvpmodel -m 0 && sudo jetson_clocks`    | +20–40% FPS         |
+| Use TensorRT FP16             | `--model yolov8s.engine`                      | ~2× faster          |
+| Reduce input size             | `--imgsz 416`                                 | +30% FPS            |
+| Lower resolution              | `--resolution 480p`                           | Less CPU overhead   |
+| Higher confidence threshold   | `--conf 0.5`                                  | Fewer false positives|
+| Stream quality                | `--stream-quality 70`                         | Lower bandwidth     |
 
 ## Troubleshooting
 
 **Low FPS (<15)?**
 - Ensure `nvpmodel -m 0` and `jetson_clocks` are active
-- Use TensorRT engine (`.engine`) not PyTorch (`.pt`)
+- Use TensorRT engine (`--model yolov8s.engine`), not PyTorch `.pt`
 - Close other GPU-intensive apps
 
 **Camera not detected?**
 - Run `v4l2-ctl --list-devices` to check
-- Try `/dev/video0` or `/dev/video1`
+- Try `--camera 1` if video0 is taken
 - Ensure USB cable supports data (not charge-only)
 
 **Fish not being detected?**
 - Lower confidence: `--conf 0.2`
-- Fine-tune on your specific aquarium (see above)
+- Try SAHI: `--sahi` (better recall for small fish)
+- Fine-tune on your specific aquarium (see Training section above)
 - Check lighting — too dark or too much glare hurts detection
 
 **ID switches (fish swapping IDs)?**
-- Increase `track_buffer` in `bytetrack.yaml`
-- Lower `match_thresh` for stricter matching
-- Fine-tuned model produces more stable detections
+- Increase `track_buffer` in `app/bytetrack.yaml`
+- A fine-tuned model produces more stable detections
 
 ## License
 
