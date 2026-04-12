@@ -19,7 +19,7 @@ from ultralytics import YOLO
 
 from camera import init_camera
 from config import TRAIL_COLORS
-from stream import hat_mode_enabled, push_frame, push_stats, request_reset, start_public_tunnel, start_stream
+from stream import hat_mode_enabled, push_frame, push_stats, request_reset, start_public_tunnel, start_stream, trails_mode_enabled
 
 
 class FishTracker:
@@ -283,9 +283,11 @@ class FishTracker:
                 if frame is None:
                     continue
 
+                frame = self._enhance_frame(frame)
                 self.frame_count += 1
                 annotated = self._infer_and_annotate(frame)
-                self._draw_trails(annotated)
+                if trails_mode_enabled():
+                    self._draw_trails(annotated)
                 # HUD drawn on frame only for local display; sidebar handles it for stream
                 if self.config["display"]:
                     self._draw_hud(annotated)
@@ -307,6 +309,13 @@ class FishTracker:
             print("\n[INFO] Interrupted by user")
         finally:
             self._cleanup()
+
+    def _enhance_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Subtle CLAHE to lift contrast in the fish zone without crushing colours."""
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
+        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
     def _read_frame(self) -> np.ndarray | None:
         ret, frame = self.cap.read()
