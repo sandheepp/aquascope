@@ -35,6 +35,10 @@ class FishTracker:
         self.frame_count = 0
         self.fps_history: deque = deque(maxlen=30)
         self.last_log_time = time.time()
+        self._last_stream_push = 0.0
+        self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        self._thermal_zones: dict[str, str] = {}   # label → /sys path, built on first call
+        self._temps: dict[str, float] = {}          # label → °C, updated each frame
 
         os.makedirs(config["output_dir"], exist_ok=True)
         self.model = self._load_model()
@@ -77,6 +81,39 @@ class FishTracker:
         print(f"[STREAM] Local:  http://{host}:{port}/")
         if self.config.get("public"):
             start_public_tunnel(port)
+
+    # ── Thermal ───────────────────────────────────────────
+
+    # Priority order: first matching label wins for each slot.
+    _TEMP_SLOTS: dict[str, list[str]] = {
+        "CPU": ["CPU-therm", "cpu-thermal", "cpu_thermal"],
+        "GPU": ["GPU-therm", "gpu-thermal", "gpu_thermal"],
+    }
+
+    def _build_thermal_map(self) -> None:
+        """Scan /sys/class/thermal once and cache zone paths by label."""
+        import glob as _glob
+        for zone_type_path in sorted(_glob.glob("/sys/class/thermal/thermal_zone*/type")):
+            try:
+                zone_label = open(zone_type_path).read().strip()
+            except OSError:
+                continue
+            zone_dir = os.path.dirname(zone_type_path)
+            for slot, candidates in self._TEMP_SLOTS.items():
+                if slot not in self._thermal_zones and zone_label in candidates:
+                    self._thermal_zones[slot] = os.path.join(zone_dir, "temp")
+
+    def _read_jetson_temps(self) -> dict[str, float]:
+        """Return {slot: °C} for each mapped thermal zone. Silent on error."""
+        if not self._thermal_zones:
+            self._build_thermal_map()
+        result: dict[str, float] = {}
+        for slot, path in self._thermal_zones.items():
+            try:
+                result[slot] = int(open(path).read().strip()) / 1000.0
+            except OSError:
+                pass
+        return result
 
     # ── Drawing ───────────────────────────────────────────
 
@@ -131,6 +168,27 @@ class FishTracker:
             (now - datetime.fromisoformat(s["last_seen"])).total_seconds() < 2
         )
 
+        # ── Temperatures ──────────────────────────────────────
+        self._temps = self._read_jetson_temps()
+
+        def _temp_color(t: float) -> tuple:
+            if t >= 75:
+                return (60, 60, 255)    # red — throttle territory
+            if t >= 60:
+                return (30, 165, 255)   # orange — warm
+            return (80, 255, 140)       # green — nominal
+
+        if self._temps:
+            temp_parts = "  ".join(
+                f"{slot} {t:.0f}°C" for slot, t in sorted(self._temps.items())
+            )
+            # Use the hottest sensor to pick the row colour
+            max_t = max(self._temps.values())
+            temp_color = _temp_color(max_t)
+        else:
+            temp_parts = "Temp  N/A"
+            temp_color = (120, 120, 120)
+
         # ── Top-left panel ────────────────────────────────────
         pad, lh, panel_w = 12, 28, 230
         rows = [
@@ -139,6 +197,7 @@ class FishTracker:
             (f"Active {active:5d}", (80, 220, 255), 0.58, 1),
             (f"Total  {len(self.fish_stats):5d}", (180, 180, 255), 0.58, 1),
             (f"Frame  {self.frame_count:5d}", (120, 120, 120), 0.45, 1),
+            (temp_parts, temp_color, 0.45, 1),
         ]
         panel_h = pad * 2 + lh * len(rows)
         overlay = frame.copy()
@@ -227,6 +286,7 @@ class FishTracker:
             "frame": self.frame_count,
             "model": self.config["model_path"].split("/")[-1],
             "sahi": bool(self.config.get("sahi")),
+            "temps_c": {slot: round(t, 1) for slot, t in self._temps.items()},
             "fish": {
                 str(tid): {
                     "first_seen": s["first_seen"],
@@ -279,16 +339,19 @@ class FishTracker:
                     self._reset()
 
                 t0 = time.time()
-                frame = self._read_frame()
-                if frame is None:
+                raw = self._read_frame()
+                if raw is None:
                     continue
 
-                frame = self._enhance_frame(frame)
+                # Infer on the raw frame so the model sees unprocessed pixels
                 self.frame_count += 1
-                annotated = self._infer_and_annotate(frame)
+                annotated = self._infer_and_annotate(raw)
                 if trails_mode_enabled():
                     self._draw_trails(annotated)
-                # HUD drawn on frame only for local display; sidebar handles it for stream
+
+                # Enhance only the display/stream output
+                annotated = self._enhance_frame(annotated)
+
                 if self.config["display"]:
                     self._draw_hud(annotated)
 
@@ -298,9 +361,15 @@ class FishTracker:
                     self.writer.write(annotated)
 
                 if self.config["stream"]:
-                    _, jpeg = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, self.config.get("stream_quality", 85)])
-                    push_frame(jpeg.tobytes())
-                    push_stats(self._build_stats())
+                    now_t = time.time()
+                    stream_interval = 1.0 / self.config.get("stream_fps", 20)
+                    if now_t - self._last_stream_push >= stream_interval:
+                        _, jpeg = cv2.imencode(".jpg", annotated,
+                                              [cv2.IMWRITE_JPEG_QUALITY, self.config.get("stream_quality", 75)])
+                        push_frame(jpeg.tobytes())
+                        self._last_stream_push = now_t
+                    if self.frame_count % 5 == 0:
+                        push_stats(self._build_stats())
 
                 self._log_stats()
                 self._handle_display(annotated)
@@ -311,11 +380,20 @@ class FishTracker:
             self._cleanup()
 
     def _enhance_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Subtle CLAHE to lift contrast in the fish zone without crushing colours."""
+        """Enhance contrast, colour vibrancy, and sharpness — single LAB pass."""
+        # 1. CLAHE on L + saturation boost on a/b — one colour-space round-trip
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(16, 16))
-        lab[:, :, 0] = clahe.apply(lab[:, :, 0])
-        return cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+        lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
+        # a/b channels are stored as uint8 centred at 128; scale deviation for vibrancy
+        ab = lab[:, :, 1:].astype(np.float32)
+        lab[:, :, 1:] = np.clip((ab - 128) * 1.4 + 128, 0, 255).astype(np.uint8)
+        frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
+
+        # 2. Sharpening kernel — single filter pass, no Gaussian+blend overhead
+        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
+        frame = cv2.filter2D(frame, -1, kernel)
+
+        return frame
 
     def _read_frame(self) -> np.ndarray | None:
         ret, frame = self.cap.read()

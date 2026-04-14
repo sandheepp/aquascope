@@ -20,7 +20,8 @@ DEFAULT_CONFIG: dict = {
     "record_path": "fish_recording.mp4",
     "stream": False,
     "stream_port": 8080,
-    "stream_quality": 85,            # JPEG quality 1-100; 85 = good balance over Cloudflare
+    "stream_quality": 75,            # JPEG quality 1-100; 75 = fast encode with good quality
+    "stream_fps": 20,                # Max stream push rate (fps); caps encode overhead
     "public": False,
     # SAHI — sliced inference for small fish detection (off by default for FPS)
     # At 1920×1080 with 640px tiles: 0% overlap→6 tiles, 10%→8 tiles, 20%→12 tiles
