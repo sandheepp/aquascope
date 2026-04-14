@@ -33,10 +33,18 @@ _reset_lock = threading.Lock()
 _hat_mode = False
 _hat_lock = threading.Lock()
 
+_trails_enabled = False
+_trails_lock = threading.Lock()
+
 
 def hat_mode_enabled() -> bool:
     with _hat_lock:
         return _hat_mode
+
+
+def trails_mode_enabled() -> bool:
+    with _trails_lock:
+        return _trails_enabled
 
 _screenshots: list[dict] = []   # [{filename, ts, label}]
 _screenshots_lock = threading.Lock()
@@ -81,6 +89,8 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_reset()
         elif p == "/hat":
             self._serve_hat()
+        elif p == "/trails":
+            self._serve_trails()
         elif p == "/screenshot":
             self._serve_screenshot()
         elif p == "/screenshots":
@@ -118,6 +128,13 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             _hat_mode = not _hat_mode
             state = _hat_mode
         self._json_response(json.dumps({"hat": state}).encode())
+
+    def _serve_trails(self):
+        global _trails_enabled
+        with _trails_lock:
+            _trails_enabled = not _trails_enabled
+            state = _trails_enabled
+        self._json_response(json.dumps({"trails": state}).encode())
 
     def _serve_screenshot(self):
         with _lock:
@@ -198,7 +215,7 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
 }
 *{margin:0;padding:0;box-sizing:border-box}
 body{
-  background:var(--bg);color:var(--text);
+  background:linear-gradient(160deg,#0b1520 0%,#0e1117 40%,#0a1a1a 100%);color:var(--text);
   font-family:var(--font);font-size:13px;
   display:grid;
   grid-template-columns: 200px 1fr;
@@ -251,7 +268,7 @@ body{
 /* ── Sidebar ── */
 #sidebar{
   grid-area:sidebar;
-  background:var(--sidebar);
+  background:linear-gradient(180deg,#161d27 0%,#0f1820 100%);
   border-right:1px solid var(--border);
   display:flex;flex-direction:column;
   padding:16px 0;
@@ -259,7 +276,9 @@ body{
 .logo{
   display:flex;align-items:center;gap:10px;
   padding:0 18px 20px;
-  font-size:16px;font-weight:700;letter-spacing:1px;color:var(--accent);
+  font-size:16px;font-weight:700;letter-spacing:1px;
+  background:linear-gradient(90deg,#f5c518,#00d4aa);
+  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
 }
 .logo-icon{font-size:22px}
 .nav-section{
@@ -273,7 +292,7 @@ body{
   border-left:3px solid transparent;
 }
 .nav-item:hover{background:rgba(255,255,255,0.04);color:var(--text)}
-.nav-item.active{color:var(--accent);border-left-color:var(--accent);background:rgba(245,197,24,0.07)}
+.nav-item.active{color:var(--accent);border-left-color:var(--accent);background:linear-gradient(90deg,rgba(245,197,24,0.13) 0%,rgba(245,197,24,0.02) 100%)}
 .nav-icon{font-size:15px;width:18px;text-align:center}
 .nav-spacer{flex:1}
 .status-dot{
@@ -286,14 +305,14 @@ body{
 /* ── Topbar ── */
 #topbar{
   grid-area:topbar;
-  background:var(--sidebar);border-bottom:1px solid var(--border);
+  background:linear-gradient(90deg,#161d27 0%,#131a23 100%);border-bottom:1px solid var(--border);
   display:flex;align-items:center;justify-content:space-between;
   padding:0 20px;
 }
 .topbar-left{display:flex;align-items:center;gap:14px}
 .page-title{font-size:15px;font-weight:600;color:var(--text)}
 .live-badge{
-  background:rgba(0,212,170,0.12);color:var(--teal);
+  background:linear-gradient(90deg,rgba(0,212,170,0.18) 0%,rgba(0,212,170,0.06) 100%);color:var(--teal);
   border:1px solid rgba(0,212,170,0.3);
   padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;
 }
@@ -301,7 +320,7 @@ body{
 #clock{color:var(--blue);font-family:var(--mono);font-size:13px}
 #uptime{color:var(--dim);font-size:11px}
 #snap-btn{
-  background:var(--accent);color:#111;border:none;
+  background:linear-gradient(135deg,#f5c518 0%,#d4a017 100%);color:#111;border:none;
   padding:6px 14px;border-radius:6px;font-size:12px;font-weight:700;
   cursor:pointer;transition:opacity 0.15s;letter-spacing:0.5px;
 }
@@ -312,9 +331,9 @@ body{
   display:none;
   position:absolute;top:calc(100% + 8px);right:0;
   width:340px;
-  background:var(--card);border:1px solid var(--border);border-radius:8px;
+  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);border-radius:8px;
   padding:10px;z-index:50;
-  box-shadow:0 8px 32px rgba(0,0,0,0.6);
+  box-shadow:0 8px 32px rgba(0,0,0,0.7);
 }
 #snap-wrap:focus-within #snap-popover,
 #snap-wrap.open #snap-popover{display:block}
@@ -369,7 +388,7 @@ body{
   display:flex;flex-direction:column;gap:8px;overflow:hidden;
 }
 .card{
-  background:var(--card);border:1px solid var(--border);
+  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);
   border-radius:8px;padding:12px;
 }
 .card-title{
@@ -391,30 +410,38 @@ body{
 .tag{
   display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;
 }
-.tag-on{background:rgba(0,212,170,0.15);color:var(--teal);border:1px solid rgba(0,212,170,0.3)}
-.tag-off{background:rgba(74,85,104,0.2);color:var(--dim);border:1px solid var(--border)}
+.tag-on{background:linear-gradient(90deg,rgba(0,212,170,0.22) 0%,rgba(0,212,170,0.08) 100%);color:var(--teal);border:1px solid rgba(0,212,170,0.3)}
+.tag-off{background:linear-gradient(90deg,rgba(74,85,104,0.25) 0%,rgba(74,85,104,0.08) 100%);color:var(--dim);border:1px solid var(--border)}
 #hat-btn{
   width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
-  background:rgba(245,197,24,0.07);color:var(--accent);
+  background:linear-gradient(135deg,rgba(245,197,24,0.10) 0%,rgba(245,197,24,0.03) 100%);color:var(--accent);
   font-size:12px;cursor:pointer;transition:all 0.15s;font-family:var(--font);
   margin-bottom:6px;
 }
-#hat-btn:hover{background:rgba(245,197,24,0.18)}
-#hat-btn.on{background:rgba(245,197,24,0.22);border-color:var(--accent)}
+#hat-btn:hover{background:linear-gradient(135deg,rgba(245,197,24,0.22) 0%,rgba(245,197,24,0.08) 100%)}
+#hat-btn.on{background:linear-gradient(135deg,rgba(245,197,24,0.30) 0%,rgba(245,197,24,0.12) 100%);border-color:var(--accent)}
+#trails-btn{
+  width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
+  background:linear-gradient(135deg,rgba(79,195,247,0.10) 0%,rgba(79,195,247,0.03) 100%);color:var(--blue);
+  font-size:12px;cursor:pointer;transition:all 0.15s;font-family:var(--font);
+  margin-bottom:6px;
+}
+#trails-btn:hover{background:linear-gradient(135deg,rgba(79,195,247,0.22) 0%,rgba(79,195,247,0.08) 100%)}
+#trails-btn.on{background:linear-gradient(135deg,rgba(79,195,247,0.30) 0%,rgba(79,195,247,0.12) 100%);border-color:var(--blue)}
 #reset-btn{
   width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
-  background:rgba(252,92,101,0.08);color:var(--danger);
+  background:linear-gradient(135deg,rgba(252,92,101,0.12) 0%,rgba(252,92,101,0.04) 100%);color:var(--danger);
   font-size:12px;cursor:pointer;transition:background 0.15s;font-family:var(--font);
 }
-#reset-btn:hover{background:rgba(252,92,101,0.18)}
+#reset-btn:hover{background:linear-gradient(135deg,rgba(252,92,101,0.24) 0%,rgba(252,92,101,0.08) 100%)}
 
 /* Fish list */
 #fish-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
 .fish-card{
-  background:var(--card);border:1px solid var(--border);border-radius:6px;
+  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);border-radius:6px;
   padding:7px 9px;transition:border-color 0.2s;
 }
-.fish-card.alive{border-left:3px solid var(--teal)}
+.fish-card.alive{border-left:3px solid var(--teal);background:linear-gradient(90deg,rgba(0,212,170,0.08) 0%,#141c26 60%)}
 .fish-card.dead{border-left:3px solid var(--border);opacity:0.55}
 .fish-id{font-size:12px;font-weight:600;color:var(--text);font-family:var(--mono)}
 .fish-meta{font-size:10px;color:var(--dim);margin-top:2px}
@@ -422,7 +449,7 @@ body{
 /* ── Filmstrip ── */
 #filmstrip{
   grid-area:filmstrip;
-  background:var(--sidebar);border-top:1px solid var(--border);
+  background:linear-gradient(180deg,#0f1820 0%,#161d27 100%);border-top:1px solid var(--border);
   padding:10px 14px;display:flex;flex-direction:column;gap:8px;overflow:hidden;
 }
 .film-header{
@@ -444,8 +471,8 @@ body{
 .snap-thumb img{width:100%;height:100%;object-fit:cover}
 .snap-label{
   position:absolute;bottom:0;left:0;right:0;
-  background:rgba(0,0,0,0.65);color:var(--text);
-  font-size:9px;padding:3px 5px;font-family:var(--mono);
+  background:linear-gradient(to top,rgba(0,0,0,0.85) 0%,transparent 100%);color:var(--text);
+  font-size:9px;padding:6px 5px 3px;font-family:var(--mono);
 }
 .snap-empty{color:var(--dim);font-size:12px;padding-top:20px}
 
@@ -568,6 +595,7 @@ body{
       <div id="fish-list"></div>
     </div>
 
+    <button id="trails-btn" onclick="toggleTrails()">〰 Trails: OFF</button>
     <button id="hat-btn" onclick="toggleHat()">🎩 Party Hats: OFF</button>
     <button id="reset-btn" onclick="doReset()">↺ Reset Trails</button>
   </div>
@@ -600,6 +628,14 @@ let startTime = Date.now();
 function doReset() {
   fetch('/reset').then(() => {
     document.getElementById('fish-list').innerHTML = '';
+  });
+}
+
+function toggleTrails() {
+  fetch('/trails').then(r => r.json()).then(d => {
+    const btn = document.getElementById('trails-btn');
+    btn.textContent = '〰 Trails: ' + (d.trails ? 'ON' : 'OFF');
+    btn.classList.toggle('on', d.trails);
   });
 }
 

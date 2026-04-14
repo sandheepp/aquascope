@@ -4,9 +4,9 @@ Default configuration and constants for AquaScope.
 
 DEFAULT_CONFIG: dict = {
     "camera_id": 0,                  # /dev/video0 for C920
-    "camera_width": 1280,
-    "camera_height": 720,
-    "camera_fps": 60,
+    "camera_width": 1920,
+    "camera_height": 1080,
+    "camera_fps": 30,
     "model_path": "yolov8s.pt",      # Auto-falls back to .pt if .engine missing
     "confidence_threshold": 0.35,
     "iou_threshold": 0.45,
@@ -20,7 +20,8 @@ DEFAULT_CONFIG: dict = {
     "record_path": "fish_recording.mp4",
     "stream": False,
     "stream_port": 8080,
-    "stream_quality": 85,            # JPEG quality 1-100; 85 = good balance over Cloudflare
+    "stream_quality": 75,            # JPEG quality 1-100; 75 = fast encode with good quality
+    "stream_fps": 20,                # Max stream push rate (fps); caps encode overhead
     "public": False,
     # SAHI — sliced inference for small fish detection (off by default for FPS)
     # At 1920×1080 with 640px tiles: 0% overlap→6 tiles, 10%→8 tiles, 20%→12 tiles

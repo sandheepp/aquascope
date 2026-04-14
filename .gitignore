@@ -6,6 +6,9 @@ __pycache__/
 venv/
 .venv/
 
+# Datasets
+dataset/
+
 # Models & engines (large binary files)
 *.pt
 *.engine

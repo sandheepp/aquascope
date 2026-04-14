@@ -18,10 +18,29 @@ if not os.environ.get("DISPLAY"):
 
 # ── 2. torchvision::nms dispatch stub ────────────────────
 import torch
+import glob
+import importlib.util
+
+# torchvision._C.so registers ops via TORCH_LIBRARY (not PyInit), so it cannot
+# be imported as a Python module. Load it via torch.ops.load_library first so
+# the native nms op is registered before we check — otherwise the check fires
+# too early and we double-register when torchvision.ops later loads _C.so.
+_tv_spec = importlib.util.find_spec('torchvision')
+if _tv_spec and _tv_spec.submodule_search_locations:
+    _tv_dir = list(_tv_spec.submodule_search_locations)[0]
+    for _cext in glob.glob(os.path.join(_tv_dir, '_C*.so')):
+        try:
+            torch.ops.load_library(_cext)
+        except Exception:
+            pass
 
 try:
-    torch.ops.torchvision.nms  # already registered — C++ ext loaded, nothing to do
+    torch.ops.torchvision.nms  # already registered — nothing to do
+    _need_nms_stub = False
 except AttributeError:
+    _need_nms_stub = True
+
+if _need_nms_stub:
     _tv_lib = torch.library.Library("torchvision", "DEF")
     _tv_lib.define("nms(Tensor dets, Tensor scores, float iou_threshold) -> Tensor")
 
