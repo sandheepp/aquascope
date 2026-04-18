@@ -42,6 +42,8 @@ sshpass -p "$PASSWORD" rsync -avz --delete \
   --exclude='*.trt' \
   --exclude='*.whl' \
   --exclude='*.mp4' \
+  --exclude='*.zip' \
+  --exclude='*.jpg' \
   "$PROJECT_ROOT"/ "$REMOTE_USER"@"$REMOTE_HOST":"$REMOTE_PATH"/
 
 echo "Done. Code synced to ${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PATH}"

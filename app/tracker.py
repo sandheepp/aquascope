@@ -15,11 +15,24 @@ from datetime import datetime
 import cv2
 import numpy as np
 import supervision as sv
-from ultralytics import YOLO
 
 from camera import init_camera
 from config import TRAIL_COLORS
-from stream import hat_mode_enabled, push_frame, push_stats, request_reset, start_public_tunnel, start_stream, trails_mode_enabled
+from enhancer import FrameEnhancer
+from model import load_model, run_inference
+from stream import (
+    _RESOLUTIONS,
+    enhance_mode_enabled,
+    get_conf_threshold,
+    get_resolution,
+    hat_mode_enabled,
+    push_frame,
+    push_stats,
+    request_reset,
+    start_public_tunnel,
+    start_stream,
+    trails_mode_enabled,
+)
 
 
 class FishTracker:
@@ -36,31 +49,19 @@ class FishTracker:
         self.fps_history: deque = deque(maxlen=30)
         self.last_log_time = time.time()
         self._last_stream_push = 0.0
-        self._clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+        self._applied_resolution = get_resolution()
+        self._enhancer = FrameEnhancer()
         self._thermal_zones: dict[str, str] = {}   # label → /sys path, built on first call
         self._temps: dict[str, float] = {}          # label → °C, updated each frame
 
         os.makedirs(config["output_dir"], exist_ok=True)
-        self.model = self._load_model()
+        self.model = load_model(config)
         self.sv_tracker = sv.ByteTrack()
         self.cap = init_camera(config)
         self.writer = self._init_writer()
         self._start_stream()
 
     # ── Initialisation helpers ────────────────────────────
-
-    def _load_model(self) -> YOLO:
-        path = self.config["model_path"]
-        if path.endswith(".engine") and not os.path.exists(path):
-            pt = path.replace(".engine", ".pt")
-            print(f"[MODEL] Engine not found: {path}")
-            print(f"[MODEL] Falling back to: {pt}")
-            print(f"[MODEL] Export hint: python3 -c \"from ultralytics import YOLO; "
-                  f"YOLO('{pt}').export(format='engine', device=0, half=True, "
-                  f"imgsz={self.config['imgsz']})\"")
-            path = pt
-        print(f"[MODEL] Loading: {path} (SAHI sliced inference)")
-        return YOLO(path, task="detect")
 
     def _init_writer(self) -> cv2.VideoWriter | None:
         if not self.config["record"]:
@@ -182,7 +183,6 @@ class FishTracker:
             temp_parts = "  ".join(
                 f"{slot} {t:.0f}°C" for slot, t in sorted(self._temps.items())
             )
-            # Use the hottest sensor to pick the row colour
             max_t = max(self._temps.values())
             temp_color = _temp_color(max_t)
         else:
@@ -203,7 +203,6 @@ class FishTracker:
         overlay = frame.copy()
         cv2.rectangle(overlay, (8, 8), (8 + panel_w, 8 + panel_h), (10, 10, 10), -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
-        # subtle border
         cv2.rectangle(frame, (8, 8), (8 + panel_w, 8 + panel_h), (60, 60, 60), 1, cv2.LINE_AA)
 
         for i, (text, color, scale, thickness) in enumerate(rows):
@@ -237,7 +236,6 @@ class FishTracker:
         status = f"  {ts}    {model_name}{sahi_tag}"
         cv2.putText(frame, status, (8, h - 7),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (160, 160, 160), 1, cv2.LINE_AA)
-        # right-align keys hint
         hint = "Q quit   S snap   R reset"
         (hw, _), _ = cv2.getTextSize(hint, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
         cv2.putText(frame, hint, (w - hw - 10, h - 7),
@@ -286,6 +284,7 @@ class FishTracker:
             "frame": self.frame_count,
             "model": self.config["model_path"].split("/")[-1],
             "sahi": bool(self.config.get("sahi")),
+            "resolution": self._applied_resolution,
             "temps_c": {slot: round(t, 1) for slot, t in self._temps.items()},
             "fish": {
                 str(tid): {
@@ -338,19 +337,26 @@ class FishTracker:
                 if request_reset():
                     self._reset()
 
+                desired_res = get_resolution()
+                if desired_res != self._applied_resolution:
+                    w, h = _RESOLUTIONS[desired_res]
+                    self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
+                    self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
+                    self._applied_resolution = desired_res
+                    print(f"[CAM] Resolution changed to {desired_res} ({w}x{h})")
+
                 t0 = time.time()
                 raw = self._read_frame()
                 if raw is None:
                     continue
 
-                # Infer on the raw frame so the model sees unprocessed pixels
                 self.frame_count += 1
                 annotated = self._infer_and_annotate(raw)
                 if trails_mode_enabled():
                     self._draw_trails(annotated)
 
-                # Enhance only the display/stream output
-                annotated = self._enhance_frame(annotated)
+                if enhance_mode_enabled():
+                    annotated = self._enhancer.enhance(annotated)
 
                 if self.config["display"]:
                     self._draw_hud(annotated)
@@ -379,21 +385,7 @@ class FishTracker:
         finally:
             self._cleanup()
 
-    def _enhance_frame(self, frame: np.ndarray) -> np.ndarray:
-        """Enhance contrast, colour vibrancy, and sharpness — single LAB pass."""
-        # 1. CLAHE on L + saturation boost on a/b — one colour-space round-trip
-        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-        lab[:, :, 0] = self._clahe.apply(lab[:, :, 0])
-        # a/b channels are stored as uint8 centred at 128; scale deviation for vibrancy
-        ab = lab[:, :, 1:].astype(np.float32)
-        lab[:, :, 1:] = np.clip((ab - 128) * 1.4 + 128, 0, 255).astype(np.uint8)
-        frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
-
-        # 2. Sharpening kernel — single filter pass, no Gaussian+blend overhead
-        kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]], dtype=np.float32)
-        frame = cv2.filter2D(frame, -1, kernel)
-
-        return frame
+    # ── Frame I/O ─────────────────────────────────────────
 
     def _read_frame(self) -> np.ndarray | None:
         ret, frame = self.cap.read()
@@ -407,96 +399,24 @@ class FishTracker:
                 print("[CAM] Frame capture failed, retrying...")
         return frame if ret else None
 
-    def _slice_tiles(self, frame: np.ndarray) -> list[tuple[np.ndarray, int, int]]:
-        """Slice frame into overlapping tiles. Returns (tile, x_offset, y_offset)."""
-        h, w = frame.shape[:2]
-        sh = self.config["sahi_slice_height"]
-        sw = self.config["sahi_slice_width"]
-        stride_h = int(sh * (1 - self.config["sahi_overlap_ratio"]))
-        stride_w = int(sw * (1 - self.config["sahi_overlap_ratio"]))
-        tiles = []
-        y = 0
-        while True:
-            y2 = min(y + sh, h)
-            y1 = max(y2 - sh, 0)
-            x = 0
-            while True:
-                x2 = min(x + sw, w)
-                x1 = max(x2 - sw, 0)
-                tiles.append((frame[y1:y2, x1:x2], x1, y1))
-                if x2 == w:
-                    break
-                x += stride_w
-            if y2 == h:
-                break
-            y += stride_h
-        return tiles
+    # ── Inference + annotation ────────────────────────────
 
     def _infer_and_annotate(self, frame: np.ndarray) -> np.ndarray:
-        if self.config.get("sahi"):
-            # ── SAHI: run predict on each tile, shift coords to frame space ──
-            all_xyxy, all_confs = [], []
-            for tile, x_off, y_off in self._slice_tiles(frame):
-                results = self.model.predict(
-                    source=tile,
-                    conf=self.config["confidence_threshold"],
-                    iou=self.config["iou_threshold"],
-                    imgsz=self.config["imgsz"],
-                    verbose=False,
-                    classes=self.config.get("detect_classes"),  # None = all classes
-                    device=0,
-                )
-                if not (results and results[0].boxes is not None and len(results[0].boxes)):
-                    continue
-                boxes = results[0].boxes.xyxy.cpu().numpy().copy()
-                boxes[:, [0, 2]] += x_off
-                boxes[:, [1, 3]] += y_off
-                all_xyxy.append(boxes)
-                all_confs.append(results[0].boxes.conf.cpu().numpy())
-
-            if all_xyxy:
-                xyxy = np.concatenate(all_xyxy, axis=0).astype(np.float32)
-                confs = np.concatenate(all_confs, axis=0).astype(np.float32)
-            else:
-                xyxy = np.empty((0, 4), dtype=np.float32)
-                confs = np.empty(0, dtype=np.float32)
-
-            detections = sv.Detections(xyxy=xyxy, confidence=confs)
-            detections = detections.with_nms(threshold=self.config["iou_threshold"], class_agnostic=True)
-        else:
-            # ── Full-frame inference (fast path) ──────────────────────
-            results = self.model.predict(
-                source=frame,
-                conf=self.config["confidence_threshold"],
-                iou=self.config["iou_threshold"],
-                imgsz=self.config["imgsz"],
-                verbose=False,
-                classes=[0],  # COCO class 0 = person; update after fine-tuning on fish
-                device=0,
-            )
-            if results and results[0].boxes is not None and len(results[0].boxes):
-                xyxy = results[0].boxes.xyxy.cpu().numpy().astype(np.float32)
-                confs = results[0].boxes.conf.cpu().numpy().astype(np.float32)
-            else:
-                xyxy = np.empty((0, 4), dtype=np.float32)
-                confs = np.empty(0, dtype=np.float32)
-            detections = sv.Detections(xyxy=xyxy, confidence=confs)
-
+        detections = run_inference(self.model, frame, self.config, get_conf_threshold())
         tracked = self.sv_tracker.update_with_detections(detections)
 
-        # ── Draw ─────────────────────────────────────────────
         annotated = frame.copy()
         for i in range(len(tracked)):
             x1, y1, x2, y2 = map(int, tracked.xyxy[i])
             track_id = int(tracked.tracker_id[i])
-            conf = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
+            det_conf = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             color = self._color(track_id)
 
             self._update_trail(track_id, (cx, cy))
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
-            label = f"Fish #{track_id} ({conf:.0%})"
+            label = f"Fish #{track_id} ({det_conf:.0%})"
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
             cv2.rectangle(annotated, (x1, y1 - th - 8), (x1 + tw + 6, y1), color, -1)
             cv2.putText(annotated, label, (x1 + 3, y1 - 4),
@@ -506,6 +426,8 @@ class FishTracker:
                 self._draw_hat(annotated, x1, y1, x2)
 
         return annotated
+
+    # ── Display + keyboard ────────────────────────────────
 
     def _handle_display(self, frame: np.ndarray) -> None:
         if not self.config["display"]:
@@ -527,6 +449,8 @@ class FishTracker:
         except cv2.error as e:
             print(f"[WARN] Display error: {e} — switching to headless")
             self.config["display"] = False
+
+    # ── Cleanup ───────────────────────────────────────────
 
     def _cleanup(self) -> None:
         self._log_stats()

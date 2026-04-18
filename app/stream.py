@@ -36,6 +36,21 @@ _hat_lock = threading.Lock()
 _trails_enabled = False
 _trails_lock = threading.Lock()
 
+_enhance_enabled = True
+_enhance_lock = threading.Lock()
+
+_conf_threshold = 0.35
+_conf_lock = threading.Lock()
+
+_resolution = "1080p"
+_resolution_lock = threading.Lock()
+
+_RESOLUTIONS = {
+    "480p":  (854,  480),
+    "720p":  (1280, 720),
+    "1080p": (1920, 1080),
+}
+
 
 def hat_mode_enabled() -> bool:
     with _hat_lock:
@@ -45,6 +60,21 @@ def hat_mode_enabled() -> bool:
 def trails_mode_enabled() -> bool:
     with _trails_lock:
         return _trails_enabled
+
+
+def enhance_mode_enabled() -> bool:
+    with _enhance_lock:
+        return _enhance_enabled
+
+
+def get_conf_threshold() -> float:
+    with _conf_lock:
+        return _conf_threshold
+
+
+def get_resolution() -> str:
+    with _resolution_lock:
+        return _resolution
 
 _screenshots: list[dict] = []   # [{filename, ts, label}]
 _screenshots_lock = threading.Lock()
@@ -91,6 +121,12 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_hat()
         elif p == "/trails":
             self._serve_trails()
+        elif p == "/enhance":
+            self._serve_enhance()
+        elif p == "/conf":
+            self._serve_conf()
+        elif p == "/resolution":
+            self._serve_resolution()
         elif p == "/screenshot":
             self._serve_screenshot()
         elif p == "/screenshots":
@@ -135,6 +171,39 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             _trails_enabled = not _trails_enabled
             state = _trails_enabled
         self._json_response(json.dumps({"trails": state}).encode())
+
+    def _serve_enhance(self):
+        global _enhance_enabled
+        with _enhance_lock:
+            _enhance_enabled = not _enhance_enabled
+            state = _enhance_enabled
+        self._json_response(json.dumps({"enhance": state}).encode())
+
+    def _serve_resolution(self):
+        global _resolution
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        val = params.get("v", "")
+        if val not in _RESOLUTIONS:
+            self._json_response(b'{"error":"invalid resolution"}')
+            return
+        with _resolution_lock:
+            _resolution = val
+        self._json_response(json.dumps({"resolution": val}).encode())
+
+    def _serve_conf(self):
+        global _conf_threshold
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        try:
+            val = float(params["v"])
+            val = max(0.05, min(0.95, val))
+        except (KeyError, ValueError):
+            with _conf_lock:
+                val = _conf_threshold
+        with _conf_lock:
+            _conf_threshold = val
+        self._json_response(json.dumps({"conf": round(val, 2)}).encode())
 
     def _serve_screenshot(self):
         with _lock:
@@ -428,6 +497,45 @@ body{
 }
 #trails-btn:hover{background:linear-gradient(135deg,rgba(79,195,247,0.22) 0%,rgba(79,195,247,0.08) 100%)}
 #trails-btn.on{background:linear-gradient(135deg,rgba(79,195,247,0.30) 0%,rgba(79,195,247,0.12) 100%);border-color:var(--blue)}
+#enhance-btn{
+  width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
+  background:linear-gradient(135deg,rgba(0,212,170,0.10) 0%,rgba(0,212,170,0.03) 100%);color:var(--teal);
+  font-size:12px;cursor:pointer;transition:all 0.15s;font-family:var(--font);
+  margin-bottom:6px;
+}
+#enhance-btn:hover{background:linear-gradient(135deg,rgba(0,212,170,0.22) 0%,rgba(0,212,170,0.08) 100%)}
+#enhance-btn.on{background:linear-gradient(135deg,rgba(0,212,170,0.30) 0%,rgba(0,212,170,0.12) 100%);border-color:var(--teal)}
+/* Confidence slider card */
+#conf-card{margin-bottom:0}
+.conf-title-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
+.conf-title-row .card-title{margin-bottom:0}
+#conf-val{font-family:var(--mono);font-size:12px;color:var(--accent)}
+.conf-row{display:flex;align-items:center;gap:6px}
+/* Resolution dropdown */
+#res-select{
+  width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);
+  background:linear-gradient(135deg,#1a2130 0%,#141c26 100%);color:var(--text);
+  font-size:12px;font-family:var(--font);cursor:pointer;outline:none;
+  appearance:none;-webkit-appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a5568'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 10px center;
+  padding-right:28px;
+}
+#conf-slider{
+  flex:1;-webkit-appearance:none;appearance:none;
+  height:4px;border-radius:2px;outline:none;cursor:pointer;
+  background:linear-gradient(to right,var(--accent) 0%,var(--accent) 35%,#1e2d3d 35%,#1e2d3d 100%);
+}
+#conf-slider::-webkit-slider-thumb{
+  -webkit-appearance:none;width:14px;height:14px;border-radius:50%;
+  background:var(--accent);cursor:pointer;border:2px solid #0e1117;
+  box-shadow:0 0 4px rgba(245,197,24,0.5);
+}
+#conf-slider::-moz-range-thumb{
+  width:14px;height:14px;border-radius:50%;border:2px solid #0e1117;
+  background:var(--accent);cursor:pointer;
+}
+#conf-val{font-family:var(--mono);font-size:12px;color:var(--accent);width:30px;text-align:right;flex-shrink:0}
 #reset-btn{
   width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
   background:linear-gradient(135deg,rgba(252,92,101,0.12) 0%,rgba(252,92,101,0.04) 100%);color:var(--danger);
@@ -582,12 +690,6 @@ body{
       <div class="stat-row"><span class="stat-lbl">Frame</span><span class="stat-val" id="s-frame">--</span></div>
     </div>
 
-    <!-- Model -->
-    <div class="card">
-      <div class="card-title">Model</div>
-      <div class="stat-row"><span class="stat-lbl">File</span><span class="stat-val" id="s-model" style="font-size:10px;max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">--</span></div>
-      <div class="stat-row"><span class="stat-lbl">SAHI</span><span id="s-sahi" class="tag tag-off">OFF</span></div>
-    </div>
 
     <!-- Fish list -->
     <div class="card" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
@@ -595,7 +697,26 @@ body{
       <div id="fish-list"></div>
     </div>
 
+    <div class="card">
+      <div class="card-title">Resolution</div>
+      <select id="res-select" onchange="setResolution(this.value)">
+        <option value="480p">480p &nbsp;(854×480)</option>
+        <option value="720p">720p &nbsp;(1280×720)</option>
+        <option value="1080p" selected>1080p (1920×1080)</option>
+      </select>
+    </div>
+
+    <div class="card" id="conf-card">
+      <div class="conf-title-row">
+        <div class="card-title">Confidence</div>
+        <span id="conf-val">35%</span>
+      </div>
+      <div class="conf-row">
+        <input id="conf-slider" type="range" min="5" max="95" step="5" value="35" oninput="onConfSlider(this.value)">
+      </div>
+    </div>
     <button id="trails-btn" onclick="toggleTrails()">〰 Trails: OFF</button>
+    <button id="enhance-btn" class="on" onclick="toggleEnhance()">✨ Enhance: ON</button>
     <button id="hat-btn" onclick="toggleHat()">🎩 Party Hats: OFF</button>
     <button id="reset-btn" onclick="doReset()">↺ Reset Trails</button>
   </div>
@@ -636,6 +757,44 @@ function toggleTrails() {
     const btn = document.getElementById('trails-btn');
     btn.textContent = '〰 Trails: ' + (d.trails ? 'ON' : 'OFF');
     btn.classList.toggle('on', d.trails);
+  });
+}
+
+// ── Resolution dropdown ──────────────────────────────────
+function setResolution(val) {
+  fetch('/resolution?v=' + encodeURIComponent(val));
+}
+
+// ── Confidence slider ────────────────────────────────────
+let _confDebounce = null;
+
+function _sendConf(pct) {
+  clearTimeout(_confDebounce);
+  _confDebounce = setTimeout(() => {
+    fetch('/conf?v=' + (pct / 100).toFixed(2));
+  }, 120);
+}
+
+function _updateConfUI(pct) {
+  const slider = document.getElementById('conf-slider');
+  const fill = Math.round((pct - 5) / 90 * 100); // map [5,95] → [0,100]%
+  slider.value = pct;
+  slider.style.background =
+    'linear-gradient(to right,var(--accent) 0%,var(--accent) ' + fill + '%,#1e2d3d ' + fill + '%,#1e2d3d 100%)';
+  document.getElementById('conf-val').textContent = pct + '%';
+}
+
+function onConfSlider(val) {
+  const pct = parseInt(val, 10);
+  _updateConfUI(pct);
+  _sendConf(pct);
+}
+
+function toggleEnhance() {
+  fetch('/enhance').then(r => r.json()).then(d => {
+    const btn = document.getElementById('enhance-btn');
+    btn.textContent = '✨ Enhance: ' + (d.enhance ? 'ON' : 'OFF');
+    btn.classList.toggle('on', d.enhance);
   });
 }
 
@@ -751,12 +910,10 @@ function updateStats(d) {
   document.getElementById('s-active').textContent = d.active ?? '--';
   document.getElementById('s-total').textContent  = d.total_ids ?? '--';
   document.getElementById('s-frame').textContent  = (d.frame ?? 0).toLocaleString();
-  document.getElementById('s-model').textContent  = d.model ?? '--';
-
-  const sahi = d.sahi;
-  const sahibadge = document.getElementById('s-sahi');
-  sahibadge.textContent = sahi ? 'ON' : 'OFF';
-  sahibadge.className = 'tag ' + (sahi ? 'tag-on' : 'tag-off');
+  if (d.resolution) {
+    const sel = document.getElementById('res-select');
+    if (sel.value !== d.resolution) sel.value = d.resolution;
+  }
 
   const bar = document.getElementById('fps-bar');
   bar.style.width = Math.min(fps / 30 * 100, 100) + '%';
