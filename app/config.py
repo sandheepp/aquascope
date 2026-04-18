@@ -7,8 +7,17 @@ DEFAULT_CONFIG: dict = {
     "camera_width": 1920,
     "camera_height": 1080,
     "camera_fps": 30,
-    "model_path": "yolov8s.pt",      # Auto-falls back to .pt if .engine missing
+    # Grounding DINO model — HuggingFace model ID or local path.
+    # 1.5 Edge and 1.6 Edge are DeepDataSpace API-only (no public weights).
+    # Locally downloadable options:
+    #   "IDEA-Research/grounding-dino-tiny"   ← faster, recommended for Jetson
+    #   "IDEA-Research/grounding-dino-base"   ← higher accuracy, slower
+    "model_path": "IDEA-Research/grounding-dino-tiny",
+    # Detection prompt — Grounding DINO uses text to describe what to find.
+    # Separate multiple classes with " . " (e.g. "fish . shrimp . crab .")
+    "detection_prompt": "fish .",
     "confidence_threshold": 0.35,
+    "text_threshold": 0.25,          # Grounding DINO text-matching threshold
     "iou_threshold": 0.45,
     "imgsz": 640,
     "max_trail_length": 60,          # Trail length in frames

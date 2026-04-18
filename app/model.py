@@ -1,32 +1,66 @@
 """
-Model loading and inference for AquaScope.
+Model loading and inference for AquaScope — Grounding DINO backend.
 
-Wraps YOLOv8 (+ optional SAHI sliced inference) and returns supervision Detections.
+Uses the HuggingFace transformers GroundingDinoForObjectDetection API.
+Supports both full-frame and SAHI sliced inference.
+
+Model IDs (set via config["model_path"]):
+  "IDEA-Research/grounding-dino-tiny"   — Swin-T backbone, publicly downloadable (recommended)
+  "IDEA-Research/grounding-dino-base"   — Swin-B backbone, publicly downloadable (slower)
+
+  Note: Grounding DINO 1.5 Edge and 1.6 Edge weights are not publicly released —
+  they are DeepDataSpace cloud-API-only models and cannot be run locally.
 """
 
-import os
+from __future__ import annotations
 
+from dataclasses import dataclass
+
+import cv2
 import numpy as np
 import supervision as sv
-from ultralytics import YOLO
+import torch
+from PIL import Image
+from transformers import AutoProcessor, GroundingDinoForObjectDetection
 
 
-def load_model(config: dict) -> YOLO:
-    """Load a YOLOv8 model, falling back from .engine to .pt when needed."""
-    path = config["model_path"]
-    if path.endswith(".engine") and not os.path.exists(path):
-        pt = path.replace(".engine", ".pt")
-        print(f"[MODEL] Engine not found: {path}")
-        print(f"[MODEL] Falling back to: {pt}")
-        print(
-            f"[MODEL] Export hint: python3 -c \"from ultralytics import YOLO; "
-            f"YOLO('{pt}').export(format='engine', device=0, half=True, "
-            f"imgsz={config['imgsz']})\""
-        )
-        path = pt
-    print(f"[MODEL] Loading: {path} (SAHI sliced inference)")
-    return YOLO(path, task="detect")
+@dataclass
+class GroundingDinoDetector:
+    """Bundles the processor + model so they travel as one object."""
+    processor: AutoProcessor
+    model: GroundingDinoForObjectDetection
+    device: str
 
+
+# ── Model loading ─────────────────────────────────────────
+
+def load_model(config: dict) -> GroundingDinoDetector:
+    """Load a Grounding DINO model from HuggingFace Hub.
+
+    Forced to CPU: Grounding DINO's multi-scale deformable attention uses a
+    cumsum kernel (spatial_shapes.prod(1).cumsum(0)) that raises a CUDA driver
+    error on Jetson regardless of dtype. Recompiling the custom CUDA ops for
+    Jetson's CUDA version would fix this, but CPU inference is the safe path.
+    """
+    model_id = config["model_path"]
+    device = "cpu"
+
+    print(f"[MODEL] Loading Grounding DINO: {model_id}")
+    print(f"[MODEL] Device: {device}  |  dtype: torch.float32")
+    print(f"[MODEL] Note: CUDA deformable attention is incompatible with Jetson driver; running on CPU")
+
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = (
+        GroundingDinoForObjectDetection
+        .from_pretrained(model_id)
+        .to(device)
+        .eval()
+    )
+    print("[MODEL] Grounding DINO ready")
+    return GroundingDinoDetector(processor=processor, model=model, device=device)
+
+
+# ── SAHI tile helper ──────────────────────────────────────
 
 def slice_tiles(
     frame: np.ndarray, config: dict
@@ -59,38 +93,31 @@ def slice_tiles(
     return tiles
 
 
+# ── Inference ─────────────────────────────────────────────
+
 def run_inference(
-    model: YOLO,
+    detector: GroundingDinoDetector,
     frame: np.ndarray,
     config: dict,
     conf_threshold: float,
 ) -> sv.Detections:
-    """Run YOLO detection on *frame* and return supervision ``Detections``.
+    """Run Grounding DINO on *frame* and return supervision ``Detections``.
 
-    Uses SAHI sliced inference when ``config["sahi"]`` is truthy; otherwise
-    runs a single full-frame forward pass.
+    Uses SAHI sliced inference when ``config["sahi"]`` is truthy.
     """
     if config.get("sahi"):
         all_xyxy: list[np.ndarray] = []
         all_confs: list[np.ndarray] = []
 
         for tile, x_off, y_off in slice_tiles(frame, config):
-            results = model.predict(
-                source=tile,
-                conf=conf_threshold,
-                iou=config["iou_threshold"],
-                imgsz=config["imgsz"],
-                verbose=False,
-                classes=config.get("detect_classes"),
-                device=0,
-            )
-            if not (results and results[0].boxes is not None and len(results[0].boxes)):
+            dets = _infer_single(detector, tile, config, conf_threshold)
+            if len(dets) == 0:
                 continue
-            boxes = results[0].boxes.xyxy.cpu().numpy().copy()
+            boxes = dets.xyxy.copy()
             boxes[:, [0, 2]] += x_off
             boxes[:, [1, 3]] += y_off
             all_xyxy.append(boxes)
-            all_confs.append(results[0].boxes.conf.cpu().numpy())
+            all_confs.append(dets.confidence)
 
         if all_xyxy:
             xyxy = np.concatenate(all_xyxy, axis=0).astype(np.float32)
@@ -103,22 +130,70 @@ def run_inference(
         detections = detections.with_nms(
             threshold=config["iou_threshold"], class_agnostic=True
         )
-    else:
-        results = model.predict(
-            source=frame,
-            conf=conf_threshold,
-            iou=config["iou_threshold"],
-            imgsz=config["imgsz"],
-            verbose=False,
-            classes=[0],  # COCO class 0 = person; update after fish fine-tuning
-            device=0,
-        )
-        if results and results[0].boxes is not None and len(results[0].boxes):
-            xyxy = results[0].boxes.xyxy.cpu().numpy().astype(np.float32)
-            confs = results[0].boxes.conf.cpu().numpy().astype(np.float32)
-        else:
-            xyxy = np.empty((0, 4), dtype=np.float32)
-            confs = np.empty(0, dtype=np.float32)
-        detections = sv.Detections(xyxy=xyxy, confidence=confs)
+        return detections
 
-    return detections
+    return _infer_single(detector, frame, config, conf_threshold)
+
+
+def _post_process(detector, outputs, inputs, box_threshold, text_threshold, h, w):
+    """Call post_process_grounded_object_detection, adapting to transformers API version."""
+    import inspect
+    fn = detector.processor.post_process_grounded_object_detection
+    params = inspect.signature(fn).parameters
+
+    # Build kwargs supported by this transformers version
+    kwargs: dict = {"target_sizes": [(h, w)]}
+    if "box_threshold" in params:
+        kwargs["box_threshold"] = box_threshold
+    if "text_threshold" in params:
+        kwargs["text_threshold"] = text_threshold
+    if "threshold" in params and "box_threshold" not in params:
+        kwargs["threshold"] = box_threshold
+
+    # input_ids — some versions take it, some don't
+    if "input_ids" in params:
+        kwargs["input_ids"] = inputs["input_ids"]
+
+    try:
+        return fn(outputs=outputs, **kwargs)
+    except TypeError as e:
+        # Fall back: pass outputs positionally in case `outputs` kw isn't supported
+        print(f"[MODEL] post_process kwarg failed ({e}), retrying positionally")
+        return fn(outputs, **kwargs)
+
+
+def _infer_single(
+    detector: GroundingDinoDetector,
+    frame: np.ndarray,
+    config: dict,
+    conf_threshold: float,
+) -> sv.Detections:
+    """Single forward pass on one frame / tile."""
+    image_pil = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    prompt = config.get("detection_prompt", "fish .")
+
+    inputs = detector.processor(
+        images=image_pil,
+        text=prompt,
+        return_tensors="pt",
+    ).to(detector.device)
+
+    with torch.no_grad():
+        outputs = detector.model(**inputs)
+
+    h, w = frame.shape[:2]
+    results = _post_process(
+        detector, outputs, inputs, conf_threshold,
+        config.get("text_threshold", 0.25), h, w,
+    )
+
+    result = results[0]
+    if len(result["boxes"]) == 0:
+        return sv.Detections(
+            xyxy=np.empty((0, 4), dtype=np.float32),
+            confidence=np.empty(0, dtype=np.float32),
+        )
+
+    xyxy = result["boxes"].cpu().float().numpy()
+    confs = result["scores"].cpu().float().numpy()
+    return sv.Detections(xyxy=xyxy, confidence=confs)

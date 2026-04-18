@@ -31,9 +31,15 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="AquaScope — real-time aquarium fish tracker")
     p.add_argument("--camera", type=int, default=0, help="Camera device ID (default 0)")
     p.add_argument("--resolution", default="720p", choices=["480p", "720p", "1080p"],
-                   help="Capture resolution (default 1080p)")
-    p.add_argument("--model", default="yolov8s.pt", help="YOLOv8 model path (.pt or .engine)")
-    p.add_argument("--conf", type=float, default=0.35, help="Detection confidence threshold")
+                   help="Capture resolution (default 720p)")
+    p.add_argument("--model", default="IDEA-Research/grounding-dino-tiny",
+                   help="Grounding DINO HuggingFace model ID or local path "
+                        "(e.g. IDEA-Research/grounding-dino-tiny or grounding-dino-base)")
+    p.add_argument("--prompt", default="fish .",
+                   help="Text prompt for Grounding DINO (e.g. 'fish .' or 'fish . shrimp .')")
+    p.add_argument("--conf", type=float, default=0.35, help="Box detection confidence threshold")
+    p.add_argument("--text-threshold", type=float, default=0.25,
+                   help="Grounding DINO text-matching threshold (default 0.25)")
     p.add_argument("--imgsz", type=int, default=640, help="Inference image size")
     p.add_argument("--exposure", type=int, default=None,
                    help="Manual V4L2 exposure (e.g. -6). Omit for auto.")
@@ -61,7 +67,9 @@ def build_config(args: argparse.Namespace) -> dict:
         "1080p": (1920, 1080),
     }[args.resolution]
     config["model_path"] = args.model
+    config["detection_prompt"] = args.prompt
     config["confidence_threshold"] = args.conf
+    config["text_threshold"] = args.text_threshold
     config["imgsz"] = args.imgsz
     config["exposure"] = args.exposure
     config["record"] = args.record
