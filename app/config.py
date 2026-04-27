@@ -7,9 +7,7 @@ DEFAULT_CONFIG: dict = {
     "camera_width": 1920,
     "camera_height": 1080,
     "camera_fps": 30,
-    "model_path": "models/best.engine",  # .pt / .engine → YOLOv8; .xml → OpenVINO IR
-    "openvino_device": "CPU",        # OpenVINO target: "CPU" (only option on Jetson)
-    "model_input_size": [640, 640],  # [H, W] fed to OpenVINO model preprocessing
+    "model_path": "models/best.engine",  # YOLOv8 .pt or TensorRT .engine
     "confidence_threshold": 0.35,
     "iou_threshold": 0.45,
     "imgsz": 640,
