@@ -458,7 +458,8 @@ class FishTracker:
             self.cap.release()
         if self.writer:
             self.writer.release()
-        cv2.destroyAllWindows()
+        if self.config["display"]:
+            cv2.destroyAllWindows()
         self._delete_snapshots()
         print("[INFO] Tracker stopped.")
 

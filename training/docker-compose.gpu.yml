@@ -1,0 +1,20 @@
+services:
+  train:
+    build:
+      context: ..
+      dockerfile: training/Dockerfile.gpu
+    image: aquascope-train
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      # Dataset (read-only)
+      - ../dataset:/workspace/dataset:ro
+      # Distillation pseudo-labels (read-only)
+      - ../distillation:/workspace/distillation:ro
+      # Training runs output (read-write — engine lands here)
+      - ../runs:/workspace/runs
+    # Default: merge both sources, 100 epochs, batch 32, export .engine
+    # Override via: docker compose ... run train --epochs 150 --batch 16
+    command: []

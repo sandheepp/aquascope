@@ -32,7 +32,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera", type=int, default=0, help="Camera device ID (default 0)")
     p.add_argument("--resolution", default="720p", choices=["480p", "720p", "1080p"],
                    help="Capture resolution (default 1080p)")
-    p.add_argument("--model", default="yolov8s.pt", help="YOLOv8 model path (.pt or .engine)")
+    p.add_argument("--model", default="yolov8s.pt",
+                   help="Model path: .pt/.engine for YOLOv8, .xml for OpenVINO IR custom model")
+    p.add_argument("--openvino-device", default="CPU",
+                   help="OpenVINO inference device (default CPU; GPU not supported on Jetson)")
     p.add_argument("--conf", type=float, default=0.35, help="Detection confidence threshold")
     p.add_argument("--imgsz", type=int, default=640, help="Inference image size")
     p.add_argument("--exposure", type=int, default=None,
@@ -61,6 +64,7 @@ def build_config(args: argparse.Namespace) -> dict:
         "1080p": (1920, 1080),
     }[args.resolution]
     config["model_path"] = args.model
+    config["openvino_device"] = args.openvino_device
     config["confidence_threshold"] = args.conf
     config["imgsz"] = args.imgsz
     config["exposure"] = args.exposure
