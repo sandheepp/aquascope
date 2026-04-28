@@ -102,6 +102,11 @@ def request_reset() -> bool:
     return False
 
 
+# Per-connection MJPEG session cap. Viewers must refresh the page after this
+# elapses to start a new connection.
+_STREAM_SESSION_LIMIT_SEC = 180
+
+
 # ── HTTP handler ──────────────────────────────────────────
 class _MJPEGHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # noqa: A002
@@ -249,8 +254,9 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
         self.end_headers()
+        deadline = time.monotonic() + _STREAM_SESSION_LIMIT_SEC
         try:
-            while True:
+            while time.monotonic() < deadline:
                 with _lock:
                     frame = _frame
                 if frame:
@@ -451,6 +457,26 @@ body{
   position:absolute;inset:0;pointer-events:none;
   background:repeating-linear-gradient(to bottom,transparent 0 3px,rgba(0,0,0,0.07) 3px 4px);
 }
+#stream-expired{
+  display:none;position:absolute;inset:0;z-index:6;
+  background:rgba(0,0,0,0.82);backdrop-filter:blur(2px);
+  align-items:center;justify-content:center;
+}
+#stream-expired.show{display:flex}
+.expired-card{
+  text-align:center;padding:22px 28px;max-width:280px;
+  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);
+  border:1px solid var(--border);border-radius:10px;
+  box-shadow:0 8px 32px rgba(0,0,0,0.6);
+}
+.expired-title{font-size:16px;font-weight:700;color:var(--accent);margin-bottom:6px}
+.expired-msg{color:var(--dim);font-size:11px;margin-bottom:14px;line-height:1.5}
+.expired-card button{
+  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;
+  border:none;padding:8px 18px;border-radius:6px;
+  font-size:12px;font-weight:700;cursor:pointer;font-family:var(--font);
+}
+.expired-card button:hover{opacity:0.85}
 
 /* ── Stats panel ── */
 #stats-panel{
@@ -668,6 +694,13 @@ body{
     <div class="corner bl"></div>
     <div class="corner br"></div>
     <div class="scanlines"></div>
+    <div id="stream-expired">
+      <div class="expired-card">
+        <div class="expired-title">⏸ Stream paused</div>
+        <div class="expired-msg">3-minute session limit reached.<br>Refresh the page to keep streaming.</div>
+        <button onclick="location.reload()">↻ Refresh</button>
+      </div>
+    </div>
   </div>
 
   <!-- Stats -->
@@ -957,12 +990,28 @@ setInterval(loadSnapshots, 2000);
 tick();
 loadSnapshots();
 
+// ── 3-minute session limit ──────────────────────────────
+const STREAM_LIMIT_MS = 180000;
+let streamExpired = false;
+
+function expireStream() {
+  streamExpired = true;
+  document.getElementById('feed').src = '';
+  const fsFeed = document.getElementById('fs-feed');
+  if (fsFeed) fsFeed.src = '';
+  document.getElementById('fs-overlay').classList.remove('open');
+  document.getElementById('stream-expired').classList.add('show');
+}
+setTimeout(expireStream, STREAM_LIMIT_MS);
+
 document.getElementById('feed').onerror = function() {
-  setTimeout(() => { this.src = '/stream?t=' + Date.now(); }, 2000);
+  if (streamExpired) return;
+  setTimeout(() => { if (!streamExpired) this.src = '/stream?t=' + Date.now(); }, 2000);
 };
 
 // ── Fullscreen feed ──────────────────────────────────────
 document.getElementById('feed-wrap').addEventListener('click', function() {
+  if (streamExpired) return;
   const overlay = document.getElementById('fs-overlay');
   const fsFeed  = document.getElementById('fs-feed');
   fsFeed.src = '/stream?t=' + Date.now();
