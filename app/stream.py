@@ -413,6 +413,11 @@ def start_training(epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
                 cwd=os.getcwd(),
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
                 bufsize=0,
+                # Put the trainer in its own process group so cancel_training
+                # can kill the YOLO dataloader workers along with the parent
+                # via os.killpg — without start_new_session they'd share our
+                # group and survive a single SIGTERM to the parent pid.
+                start_new_session=True,
             )
         except OSError as e:
             try:
@@ -434,22 +439,63 @@ def start_training(epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
 
 
 def cancel_training() -> dict:
-    global _train_proc, _train_log_fh
+    """Tear down the trainer subprocess group asynchronously.
+
+    Returns immediately so the dashboard's HTTP request doesn't hang for
+    seconds while ultralytics shuts down. A background thread sends SIGTERM
+    to the whole process group (catches YOLO dataloader workers, not just
+    the parent), waits a few seconds, then escalates to SIGKILL. We also
+    stamp a cancelling/failed status so the modal flips to "Close" on the
+    very next poll instead of after the kill completes.
+    """
+    import signal as _signal
+
+    global _train_proc
     with _train_lock:
         if _train_proc is None or _train_proc.poll() is not None:
             return {"error": "no training in progress"}
-        _train_proc.terminate()
+        proc = _train_proc
+        pid = proc.pid
+
+    # Optimistic status update so the UI flips immediately. The real subprocess
+    # exit will overwrite this via train_jetson.py's except-handler if it's
+    # still alive, or via get_train_status()'s rc-reconciliation otherwise.
+    try:
+        with open(_train_status_file, "w") as f:
+            json.dump({
+                "state": "failed",
+                "message": "Cancelled by user",
+            }, f)
+    except OSError:
+        pass
+
+    def _reaper(p: subprocess.Popen, group_pid: int) -> None:
+        global _train_proc, _train_log_fh
         try:
-            _train_proc.wait(timeout=5)
+            os.killpg(group_pid, _signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
+        try:
+            p.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            _train_proc.kill()
-        if _train_log_fh is not None:
             try:
-                _train_log_fh.close()
-            except OSError:
+                os.killpg(group_pid, _signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
                 pass
-            _train_log_fh = None
-    return {"cancelled": True}
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        with _train_lock:
+            if _train_log_fh is not None:
+                try:
+                    _train_log_fh.close()
+                except OSError:
+                    pass
+                _train_log_fh = None
+
+    threading.Thread(target=_reaper, args=(proc, pid), daemon=True).start()
+    return {"cancelled": True, "pid": pid}
 
 
 def get_train_log(max_bytes: int = _TRAIN_LOG_TAIL_BYTES) -> str:
@@ -1902,7 +1948,10 @@ function confirmTraining() {
 function openTrainModal() {
   trainModalOpen = true;
   document.getElementById('train-overlay').classList.add('open');
-  document.getElementById('train-cancel').style.display = '';
+  const cancelBtn = document.getElementById('train-cancel');
+  cancelBtn.style.display = '';
+  cancelBtn.disabled = false;
+  cancelBtn.textContent = 'Cancel';
   document.getElementById('train-close').style.display = 'none';
   // Disable model dropdown + train button
   const ms = document.getElementById('model-select');
@@ -1924,9 +1973,13 @@ function closeTrainModal() {
 
 function cancelTraining() {
   if (!confirm('Cancel training? Progress will be lost.')) return;
-  fetch('/train/cancel').then(r => r.json()).then(() => {
-    // The poller will see state=failed and switch to Close.
-  });
+  // Lock the button + show that something's happening, so a slow ultralytics
+  // shutdown doesn't make the modal feel frozen between click and the next
+  // 2s status poll.
+  const btn = document.getElementById('train-cancel');
+  if (btn) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
+  document.getElementById('train-state-line').textContent = 'Cancelling — stopping the trainer…';
+  fetch('/train/cancel').catch(() => {});
 }
 
 function startTrainPolling() {
