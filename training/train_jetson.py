@@ -213,6 +213,25 @@ def main() -> None:
         except OSError:
             shutil.copy2(str(export_path), str(out_engine))
 
+        # Only wipe the user-recorded set if the engine actually landed on disk
+        # (and is non-empty). On any failure path above, the data stays put so
+        # the next run can re-train against it.
+        if out_engine.exists() and out_engine.stat().st_size > 0:
+            for sub in ("images", "labels"):
+                target = _DEFAULT_USERDATA / sub
+                if target.exists():
+                    shutil.rmtree(target, ignore_errors=True)
+            for stale in ("labels.cache",):
+                p = _DEFAULT_USERDATA / stale
+                try:
+                    p.unlink()
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    pass
+            print(f"[CLEANUP] Wiped {_DEFAULT_USERDATA}/images and /labels "
+                  f"after successful export of {out_engine.name}.")
+
         _write_status(args.status_file,
                       state="done", version=version,
                       engine_path=str(out_engine),
