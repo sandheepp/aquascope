@@ -30,6 +30,7 @@ from stream import (
     get_resolution,
     hat_mode_enabled,
     inference_should_pause,
+    label_enabled,
     label_should_capture,
     latest_engine_version,
     push_frame,
@@ -540,7 +541,13 @@ class FishTracker:
     # ── Inference + annotation ────────────────────────────
 
     def _infer_and_annotate(self, frame: np.ndarray) -> np.ndarray:
-        detections = run_inference(self.model, frame, self.config, get_conf_threshold())
+        # While the labeling tab is on, drop the inference conf to surface
+        # weak detections the user might still want to keep — even noisy boxes
+        # turn into useful training data once the human accepts/rejects them.
+        # Once labeling is off, snap back to the user-tuned threshold so the
+        # live feed isn't cluttered with false positives.
+        conf = 0.05 if label_enabled() else get_conf_threshold()
+        detections = run_inference(self.model, frame, self.config, conf)
         tracked = self.sv_tracker.update_with_detections(detections)
 
         annotated = frame.copy()
