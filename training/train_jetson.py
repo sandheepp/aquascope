@@ -69,6 +69,10 @@ def main() -> None:
                         help="Batch size (default: 2 for 8GB Orin Nano unified memory)")
     parser.add_argument("--imgsz", type=int, default=512,
                         help="Train resolution (default: 512; lower → less RAM)")
+    parser.add_argument("--export-imgsz", type=int, default=640,
+                        help="Engine export resolution — must match the inference imgsz "
+                             "(app/config.py imgsz, default 640). Decoupled from --imgsz so "
+                             "we can train cheap and still serve full-res inference.")
     parser.add_argument("--workers", type=int, default=0,
                         help="Dataloader workers (default: 0 — avoids RAM duplication on Jetson)")
     parser.add_argument("--mosaic", type=float, default=0.0,
@@ -184,11 +188,12 @@ def main() -> None:
         versioned_pt = models_dir / f"best_v{version}.pt"
         shutil.copy2(best_pt, versioned_pt)
 
-        # Export to TensorRT FP16, then move to versioned name.
+        # Export to TensorRT FP16 at the inference resolution (NOT the train resolution
+        # — TRT engines have a fixed input shape, so it must match what tracker.py feeds).
         export_model = YOLO(str(best_pt))
         export_path = export_model.export(
             format="engine",
-            imgsz=args.imgsz,
+            imgsz=args.export_imgsz,
             half=True,
             device=0,
             batch=1,
