@@ -93,6 +93,13 @@ _TRAIN_MIN_LABELS: int = 100                   # button stays disabled below thi
 _TRAIN_DEFAULT_EPOCHS: int = 30
 _TRAIN_DEFAULT_BATCH: int = 2                  # Orin Nano unified-memory friendly
 _TRAIN_LOG_TAIL_BYTES: int = 16384             # how much of the tail /train/log returns
+# Wall-clock anchor for the elapsed-timer the dashboard shows. The subprocess
+# only writes elapsed_sec at epoch boundaries / phase changes — between those,
+# the modal would show "—" for the slow data-setup + model-load phase. We
+# synthesize elapsed in get_train_status() so the timer ticks every second.
+_train_started_at: float | None = None
+_train_label_count_at_start: int = 0
+_train_epochs_used: int = _TRAIN_DEFAULT_EPOCHS
 
 _RESOLUTIONS = {
     "480p":  (854,  480),
@@ -285,6 +292,21 @@ def get_train_status() -> dict:
                 # Process exited but status file wasn't updated.
                 status["state"] = "done" if rc == 0 else "failed"
                 status.setdefault("message", f"subprocess exited rc={rc}")
+        # Synthesize elapsed_sec from the wall clock so the timer ticks every
+        # second from the moment the user clicks Train, not just at epoch
+        # boundaries (the subprocess can spend 30+s loading torch + the model
+        # before its first status write). Take max() so a per-epoch value from
+        # the subprocess can never go backwards.
+        active = status.get("state") in ("starting", "training", "exporting")
+        if _train_started_at is not None and active:
+            wall = int(time.time() - _train_started_at)
+            status["elapsed_sec"] = max(int(status.get("elapsed_sec", 0)), wall)
+        # ETA fallback for the "starting" phase: the subprocess can't compute a
+        # per-epoch ETA until epoch 1 finishes, so use the initial heuristic.
+        if status.get("state") == "starting" and not status.get("eta_sec"):
+            est = estimate_training_minutes(_train_label_count_at_start, _train_epochs_used)
+            est_total_sec = ((est["low_min"] + est["high_min"]) / 2.0) * 60.0
+            status["eta_sec"] = max(0, int(est_total_sec - status.get("elapsed_sec", 0)))
     return status
 
 
@@ -362,8 +384,7 @@ def _tee_train_output(proc: subprocess.Popen, log_fh) -> None:
 def start_training(epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
     """Spawn the training subprocess if not already running."""
     global _train_proc, _train_log_fh, _train_log_thread, _train_unacked
-    if epochs not in _TRAIN_EPOCH_CHOICES:
-        return {"error": f"epochs must be one of {list(_TRAIN_EPOCH_CHOICES)}"}
+    global _train_started_at, _train_label_count_at_start, _train_epochs_used
     with _train_lock:
         if _train_proc is not None and _train_proc.poll() is None:
             return {"error": "training already in progress"}
@@ -406,6 +427,9 @@ def start_training(epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
             daemon=True,
         )
         _train_log_thread.start()
+        _train_started_at = time.time()
+        _train_label_count_at_start = count_user_labels()
+        _train_epochs_used = epochs
         return {"started": True, "pid": _train_proc.pid}
 
 
