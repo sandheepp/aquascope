@@ -15,12 +15,19 @@ Endpoints:
   /label/queue       — JSON list of pending candidates
   /label/image/<id>  — JPEG of a pending candidate frame
   /label/decision    — accept/reject a candidate (?id=<id>&keep=0|1)
+  /train/labels      — current user-recorded label count + min required + ETA
+  /train/start       — spawn training subprocess (returns 409 if already running)
+  /train/status      — poll training progress (state/epoch/eta/message/version)
+  /train/cancel      — terminate the running training subprocess
+  /train/log         — tail of training subprocess stdout/stderr (text)
+  /train/acknowledge — user dismissed the training modal; resume inference
 """
 
 import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -70,6 +77,29 @@ _label_class_names: list[str] = []             # populated from model.names at s
 _LABEL_THROTTLE_SEC = 2.0                      # min seconds between captures of same track_id
 _LABEL_QUEUE_MAX = 50                          # cap pending queue to avoid disk blow-up
 _label_last_capture: dict[int, float] = {}     # track_id → last capture ts
+
+# ── Training state ────────────────────────────────────────
+_train_proc = None                             # subprocess.Popen | None
+_train_lock = threading.Lock()
+_train_status_file: str = "/tmp/aquascope_train_status.json"
+_train_log_file: str = "/tmp/aquascope_train.log"
+_train_log_fh = None                           # open file handle for the running subprocess
+_train_log_thread = None                       # daemon thread that tees subprocess output
+# Set True when user starts training; cleared when user clicks "Close" on the modal.
+# The tracker keeps inference paused while this is True — so the user controls when
+# inference resumes (via /train/acknowledge), not the subprocess exit.
+_train_unacked: bool = False
+_TRAIN_MIN_LABELS: int = 100                   # button stays disabled below this
+_TRAIN_DEFAULT_EPOCHS: int = 30
+_TRAIN_DEFAULT_BATCH: int = 2                  # Orin Nano unified-memory friendly
+_TRAIN_LOG_TAIL_BYTES: int = 16384             # how much of the tail /train/log returns
+# Wall-clock anchor for the elapsed-timer the dashboard shows. The subprocess
+# only writes elapsed_sec at epoch boundaries / phase changes — between those,
+# the modal would show "—" for the slow data-setup + model-load phase. We
+# synthesize elapsed in get_train_status() so the timer ticks every second.
+_train_started_at: float | None = None
+_train_label_count_at_start: int = 0
+_train_epochs_used: int = _TRAIN_DEFAULT_EPOCHS
 
 _RESOLUTIONS = {
     "480p":  (854,  480),
@@ -220,6 +250,224 @@ def _label_decide(candidate_id: str, keep: bool) -> dict:
         result["queued"] = len(_label_pending)
     return result
 
+
+# ── Training: public API used by tracker.py ──────────────
+def train_running() -> bool:
+    with _train_lock:
+        return _train_proc is not None and _train_proc.poll() is None
+
+
+def inference_should_pause() -> bool:
+    """Tracker pauses while training is running OR while the finished-modal hasn't been
+    acknowledged by the user (Close button). This keeps inference off the GPU until the
+    user explicitly hands control back."""
+    with _train_lock:
+        if _train_proc is not None and _train_proc.poll() is None:
+            return True
+        return _train_unacked
+
+
+def acknowledge_training() -> dict:
+    """Called by the dashboard when user clicks Close on the training modal.
+    Clears the 'unacknowledged' flag so the tracker resumes inference."""
+    global _train_unacked
+    with _train_lock:
+        was = _train_unacked
+        _train_unacked = False
+    return {"acknowledged": True, "was_pending": was}
+
+
+def get_train_status() -> dict:
+    """Read the JSON status file the subprocess writes; reconcile with proc state."""
+    status: dict = {"state": "idle"}
+    try:
+        with open(_train_status_file) as f:
+            status = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    with _train_lock:
+        if _train_proc is not None:
+            rc = _train_proc.poll()
+            if rc is not None and status.get("state") not in ("done", "failed"):
+                # Process exited but status file wasn't updated.
+                status["state"] = "done" if rc == 0 else "failed"
+                status.setdefault("message", f"subprocess exited rc={rc}")
+        # Synthesize elapsed_sec from the wall clock so the timer ticks every
+        # second from the moment the user clicks Train, not just at epoch
+        # boundaries (the subprocess can spend 30+s loading torch + the model
+        # before its first status write). Take max() so a per-epoch value from
+        # the subprocess can never go backwards.
+        active = status.get("state") in ("starting", "training", "exporting")
+        if _train_started_at is not None and active:
+            wall = int(time.time() - _train_started_at)
+            status["elapsed_sec"] = max(int(status.get("elapsed_sec", 0)), wall)
+        # ETA fallback for the "starting" phase: the subprocess can't compute a
+        # per-epoch ETA until epoch 1 finishes, so use the initial heuristic.
+        if status.get("state") == "starting" and not status.get("eta_sec"):
+            est = estimate_training_minutes(_train_label_count_at_start, _train_epochs_used)
+            est_total_sec = ((est["low_min"] + est["high_min"]) / 2.0) * 60.0
+            status["eta_sec"] = max(0, int(est_total_sec - status.get("elapsed_sec", 0)))
+    return status
+
+
+def count_user_labels() -> int:
+    labels_dir = os.path.join(_label_output_dir, "labels")
+    if not os.path.isdir(labels_dir):
+        return 0
+    return sum(1 for f in os.listdir(labels_dir) if f.endswith(".txt"))
+
+
+def estimate_training_minutes(label_count: int, epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
+    """
+    Rough ETA for the dashboard to show on the confirm dialog.
+    Real numbers come from the subprocess after epoch 1 (avg_epoch_sec).
+    Heuristic: ~1.5 min/epoch on Orin Nano + ~5ms per extra training sample/epoch.
+    """
+    base_min = epochs * 1.5
+    extra_min = (label_count * epochs * 0.005) / 60.0
+    total = base_min + extra_min
+    return {"low_min": max(15, int(total - 10)),
+            "high_min": int(total + 15),
+            "epochs": epochs}
+
+
+def latest_engine_version() -> tuple[int, str | None]:
+    """Return (version, path) for the highest models/best.engine_v<N>, or (0, None)."""
+    if not os.path.isdir(_models_dir):
+        return 0, None
+    best_n = 0
+    best_path: str | None = None
+    for name in os.listdir(_models_dir):
+        if not name.startswith("best.engine_v"):
+            continue
+        try:
+            n = int(name[len("best.engine_v"):])
+        except ValueError:
+            continue
+        if n > best_n:
+            best_n = n
+            best_path = os.path.join(_models_dir, name)
+    return best_n, best_path
+
+
+def _tee_train_output(proc: subprocess.Popen, log_fh) -> None:
+    """Background pump: copy each subprocess output line to BOTH the log file
+    (for /train/log polling) AND the parent's stdout (so the operator sees the
+    same stream in the terminal that launched the dashboard)."""
+    try:
+        for raw in iter(proc.stdout.readline, b""):
+            try:
+                line = raw.decode("utf-8", errors="replace")
+            except Exception:
+                line = repr(raw)
+            try:
+                log_fh.write(line)
+                log_fh.flush()
+            except (OSError, ValueError):
+                pass
+            try:
+                sys.stdout.write("[TRAIN] " + line)
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+    finally:
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            log_fh.close()
+        except (OSError, ValueError):
+            pass
+
+
+def start_training(epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
+    """Spawn the training subprocess if not already running."""
+    global _train_proc, _train_log_fh, _train_log_thread, _train_unacked
+    global _train_started_at, _train_label_count_at_start, _train_epochs_used
+    with _train_lock:
+        if _train_proc is not None and _train_proc.poll() is None:
+            return {"error": "training already in progress"}
+        _train_unacked = True
+        # Clear stale status + log so the dashboard doesn't show old data.
+        for path in (_train_status_file, _train_log_file):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        try:
+            _train_log_fh = open(_train_log_file, "w", buffering=1)
+        except OSError as e:
+            return {"error": f"could not open log file: {e}"}
+        cmd = [
+            sys.executable, "-u", "training/train_jetson.py",
+            "--status-file", _train_status_file,
+            "--epochs", str(epochs),
+            "--batch",  str(_TRAIN_DEFAULT_BATCH),
+        ]
+        try:
+            _train_proc = subprocess.Popen(  # noqa: S603
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                cwd=os.getcwd(),
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                bufsize=0,
+            )
+        except OSError as e:
+            try:
+                _train_log_fh.close()
+            except OSError:
+                pass
+            _train_log_fh = None
+            return {"error": str(e)}
+        _train_log_thread = threading.Thread(
+            target=_tee_train_output,
+            args=(_train_proc, _train_log_fh),
+            daemon=True,
+        )
+        _train_log_thread.start()
+        _train_started_at = time.time()
+        _train_label_count_at_start = count_user_labels()
+        _train_epochs_used = epochs
+        return {"started": True, "pid": _train_proc.pid}
+
+
+def cancel_training() -> dict:
+    global _train_proc, _train_log_fh
+    with _train_lock:
+        if _train_proc is None or _train_proc.poll() is not None:
+            return {"error": "no training in progress"}
+        _train_proc.terminate()
+        try:
+            _train_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _train_proc.kill()
+        if _train_log_fh is not None:
+            try:
+                _train_log_fh.close()
+            except OSError:
+                pass
+            _train_log_fh = None
+    return {"cancelled": True}
+
+
+def get_train_log(max_bytes: int = _TRAIN_LOG_TAIL_BYTES) -> str:
+    """Return the tail of the training subprocess log (max_bytes from the end)."""
+    try:
+        size = os.path.getsize(_train_log_file)
+    except OSError:
+        return ""
+    try:
+        with open(_train_log_file, "rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, 2)
+                f.readline()  # discard partial first line
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
+
 _screenshots: list[dict] = []   # [{filename, ts, label}]
 _screenshots_lock = threading.Lock()
 _screenshot_dir = "fish_logs/screenshots"
@@ -290,6 +538,18 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_label_image(p[len("/label/image/"):])
         elif p == "/label/decision":
             self._serve_label_decision()
+        elif p == "/train/labels":
+            self._serve_train_labels()
+        elif p == "/train/start":
+            self._serve_train_start()
+        elif p == "/train/status":
+            self._serve_train_status()
+        elif p == "/train/cancel":
+            self._serve_train_cancel()
+        elif p == "/train/log":
+            self._serve_train_log()
+        elif p == "/train/acknowledge":
+            self._serve_train_acknowledge()
         elif p == "/screenshot":
             self._serve_screenshot()
         elif p == "/screenshots":
@@ -450,6 +710,48 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    # ── Training tab handlers ─────────────────────────────
+
+    def _serve_train_labels(self):
+        count = count_user_labels()
+        body = json.dumps({
+            "count": count,
+            "min_required": _TRAIN_MIN_LABELS,
+            "ready": count >= _TRAIN_MIN_LABELS,
+            "estimate": estimate_training_minutes(count),
+        }).encode()
+        self._json_response(body)
+
+    def _serve_train_start(self):
+        count = count_user_labels()
+        if count < _TRAIN_MIN_LABELS:
+            self._json_response(json.dumps({
+                "error": f"need at least {_TRAIN_MIN_LABELS} labels (have {count})",
+                "count": count,
+                "min_required": _TRAIN_MIN_LABELS,
+            }).encode())
+            return
+        self._json_response(json.dumps(start_training()).encode())
+
+    def _serve_train_status(self):
+        status = get_train_status()
+        # Pin the running flag from proc state so the UI doesn't trust a stale file.
+        status["running"] = train_running()
+        ver, path = latest_engine_version()
+        status["latest_version"] = ver
+        status["latest_engine"] = path
+        self._json_response(json.dumps(status).encode())
+
+    def _serve_train_cancel(self):
+        self._json_response(json.dumps(cancel_training()).encode())
+
+    def _serve_train_log(self):
+        log_text = get_train_log()
+        self._json_response(json.dumps({"log": log_text}).encode())
+
+    def _serve_train_acknowledge(self):
+        self._json_response(json.dumps(acknowledge_training()).encode())
 
     def _serve_label_decision(self):
         qs = self.path.split("?", 1)[1] if "?" in self.path else ""
@@ -724,6 +1026,79 @@ body{
 }
 #label-actions .accept:hover, #label-actions .reject:hover, #label-toggle:hover{opacity:0.88}
 
+/* ── Train button ── */
+#train-btn{
+  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);color:#fff;border:none;
+  padding:8px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;
+  margin-left:auto;
+}
+#train-btn:disabled{
+  background:linear-gradient(135deg,#3a3a4a 0%,#2a2a35 100%);color:#666;cursor:not-allowed;
+}
+#train-btn:not(:disabled):hover{opacity:0.88}
+
+/* ── Training modal ── */
+#train-overlay{
+  display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);
+  z-index:400;align-items:center;justify-content:center;backdrop-filter:blur(2px);
+}
+#train-overlay.open{display:flex}
+#train-card{
+  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);
+  border-radius:12px;padding:24px 28px;min-width:360px;max-width:680px;width:min(680px,92vw);
+  box-shadow:0 16px 48px rgba(0,0,0,0.7);
+  display:flex;flex-direction:column;max-height:88vh;
+}
+#train-log-wrap{
+  background:#0a0f15;border:1px solid var(--border);border-radius:6px;
+  margin-bottom:14px;padding:8px 10px;
+  font-family:var(--mono);font-size:11px;line-height:1.45;color:#9fb3c8;
+  height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+}
+#train-log-wrap.empty{color:var(--dim);font-style:italic}
+#train-log-label{
+  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);
+  margin-bottom:5px;
+}
+#train-title{font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px}
+#train-state-line{color:var(--text);font-size:14px;margin-bottom:14px}
+#train-bar-wrap{background:#0d141d;border:1px solid var(--border);border-radius:4px;height:10px;overflow:hidden;margin-bottom:14px;position:relative}
+#train-bar{height:100%;width:0%;background:linear-gradient(90deg,#7c4dff,#00d4aa);transition:width 0.4s}
+/* Indeterminate animation used during the TensorRT export phase (no % known) */
+#train-bar-wrap.indeterminate #train-bar{
+  width:100% !important;
+  background:linear-gradient(90deg,
+    rgba(124,77,255,0.15) 0%, rgba(124,77,255,0.85) 25%,
+    rgba(0,212,170,0.85) 50%, rgba(124,77,255,0.85) 75%,
+    rgba(124,77,255,0.15) 100%);
+  background-size:200% 100%;
+  animation:train-stripes 1.4s linear infinite;
+}
+@keyframes train-stripes{0%{background-position:200% 0}100%{background-position:-200% 0}}
+#train-info{display:grid;grid-template-columns:1fr 1fr;gap:6px 18px;font-size:12px;margin-bottom:14px}
+#train-info .stat-val{font-family:var(--mono)}
+#train-msg{color:var(--dim);font-size:11px;margin-bottom:12px}
+#train-actions{display:flex;gap:10px;justify-content:flex-end}
+#train-actions button{
+  border:1px solid var(--border);background:#1a2130;color:var(--text);
+  padding:7px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:var(--font);
+}
+#train-cancel{color:var(--danger);border-color:rgba(252,92,101,0.4)}
+#train-actions button:hover{opacity:0.85}
+
+/* ── Inference-disabled overlay on the live feed ── */
+#feed-disabled{
+  position:absolute;inset:0;background:rgba(0,0,0,0.78);
+  z-index:5;display:flex;align-items:center;justify-content:center;
+}
+.feed-disabled-card{
+  text-align:center;padding:20px 26px;max-width:300px;
+  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);
+  border:1px solid var(--border);border-radius:10px;
+}
+.feed-disabled-title{font-size:15px;font-weight:700;color:var(--accent);margin-bottom:6px}
+.feed-disabled-msg{color:var(--dim);font-size:11px;line-height:1.5}
+
 /* ── Feed ── */
 #feed-wrap{
   position:relative;
@@ -981,6 +1356,12 @@ body{
     <div class="corner bl"></div>
     <div class="corner br"></div>
     <div class="scanlines"></div>
+    <div id="feed-disabled" style="display:none">
+      <div class="feed-disabled-card">
+        <div class="feed-disabled-title">⏸ Inference paused</div>
+        <div class="feed-disabled-msg">Training is using the GPU. The live feed will resume automatically when training completes.</div>
+      </div>
+    </div>
     <div id="stream-expired">
       <div class="expired-card">
         <div class="expired-title">⏸ Stream paused</div>
@@ -1062,6 +1443,10 @@ body{
       <span class="stat-val" id="label-count">0</span>
     </div>
     <div class="stat-row" style="margin:0">
+      <span class="stat-lbl">Saved</span>
+      <span class="stat-val" id="label-saved">0/100</span>
+    </div>
+    <div class="stat-row" style="margin:0">
       <span class="stat-lbl">Track</span>
       <span class="stat-val" id="label-track">—</span>
     </div>
@@ -1069,6 +1454,7 @@ body{
       <span class="stat-lbl">Class</span>
       <span class="stat-val" id="label-class">—</span>
     </div>
+    <button id="train-btn" disabled onclick="confirmTraining()">🧠 Train model</button>
   </div>
   <div id="label-canvas-wrap">
     <canvas id="label-canvas" style="display:none"></canvas>
@@ -1101,6 +1487,29 @@ body{
   <button id="fs-close" onclick="closeFeed()">✕</button>
   <img id="fs-feed" src="" alt="fullscreen feed">
 </div>
+
+<!-- Training progress modal -->
+<div id="train-overlay">
+  <div id="train-card">
+    <div id="train-title">🧠 Training model</div>
+    <div id="train-state-line">starting…</div>
+    <div id="train-bar-wrap"><div id="train-bar"></div></div>
+    <div id="train-info">
+      <div><span class="stat-lbl">Epoch</span> <span class="stat-val" id="train-epoch">—</span> / <span id="train-total">—</span></div>
+      <div><span class="stat-lbl">Elapsed</span> <span class="stat-val" id="train-elapsed">—</span></div>
+      <div><span class="stat-lbl">ETA</span> <span class="stat-val" id="train-eta">—</span></div>
+      <div><span class="stat-lbl">Version</span> <span class="stat-val" id="train-version">—</span></div>
+    </div>
+    <div id="train-msg">Inference is paused while training runs.</div>
+    <div id="train-log-label">Training output</div>
+    <div id="train-log-wrap" class="empty">waiting for training subprocess output…</div>
+    <div id="train-actions">
+      <button id="train-cancel" onclick="cancelTraining()">Cancel</button>
+      <button id="train-close" onclick="closeTrainModal()" style="display:none">Close</button>
+    </div>
+  </div>
+</div>
+
 
 <script>
 let startTime = Date.now();
@@ -1446,6 +1855,163 @@ fetch('/label/state').then(r => r.json()).then(d => {
     document.getElementById('label-state').textContent = 'on';
   }
 });
+
+// ── Training: label count + Train button ─────────────────
+let trainEstimate = null;
+function refreshTrainLabels() {
+  fetch('/train/labels').then(r => r.json()).then(d => {
+    document.getElementById('label-saved').textContent =
+      d.count + '/' + d.min_required;
+    const btn = document.getElementById('train-btn');
+    btn.disabled = !d.ready || trainModalOpen;
+    trainEstimate = d.estimate;
+  }).catch(() => {});
+}
+setInterval(refreshTrainLabels, 3000);
+refreshTrainLabels();
+
+// ── Training: confirm + start + poll progress ────────────
+let trainPollInterval = null;
+let trainModalOpen = false;
+
+function fmtSec(s) {
+  if (s == null || isNaN(s)) return '—';
+  s = Math.max(0, Math.round(s));
+  const m = Math.floor(s / 60), r = s % 60;
+  return m ? `${m}m ${r}s` : `${r}s`;
+}
+
+function confirmTraining() {
+  if (!trainEstimate) return;
+  const e = trainEstimate;
+  const ok = window.confirm(
+    `Train a new model on your labeled data?\n\n` +
+    `• Estimated time: ~${e.low_min}–${e.high_min} minutes (${e.epochs} epochs)\n` +
+    `• Inference will pause while the GPU is in use\n` +
+    `• On success a new models/best.engine_v<N> appears in the Model dropdown\n\n` +
+    `Continue?`
+  );
+  if (!ok) return;
+  fetch('/train/start').then(r => r.json()).then(d => {
+    if (d.error) { alert('Could not start training: ' + d.error); return; }
+    openTrainModal();
+    startTrainPolling();
+  });
+}
+
+function openTrainModal() {
+  trainModalOpen = true;
+  document.getElementById('train-overlay').classList.add('open');
+  document.getElementById('train-cancel').style.display = '';
+  document.getElementById('train-close').style.display = 'none';
+  // Disable model dropdown + train button
+  const ms = document.getElementById('model-select');
+  if (ms) ms.disabled = true;
+  document.getElementById('train-btn').disabled = true;
+}
+
+function closeTrainModal() {
+  // Tell the tracker the user has acknowledged the training-finished modal —
+  // this is what triggers inference to actually resume on the Jetson side.
+  fetch('/train/acknowledge').catch(() => {});
+  trainModalOpen = false;
+  document.getElementById('train-overlay').classList.remove('open');
+  if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
+  const ms = document.getElementById('model-select');
+  if (ms) ms.disabled = false;
+  refreshTrainLabels();
+}
+
+function cancelTraining() {
+  if (!confirm('Cancel training? Progress will be lost.')) return;
+  fetch('/train/cancel').then(r => r.json()).then(() => {
+    // The poller will see state=failed and switch to Close.
+  });
+}
+
+function startTrainPolling() {
+  if (trainPollInterval) clearInterval(trainPollInterval);
+  pollTrainStatus();
+  pollTrainLog();
+  trainPollInterval = setInterval(() => { pollTrainStatus(); pollTrainLog(); }, 2000);
+}
+
+function pollTrainStatus() {
+  fetch('/train/status').then(r => r.json()).then(updateTrainModal).catch(() => {});
+}
+
+function pollTrainLog() {
+  fetch('/train/log').then(r => r.json()).then(d => {
+    const box = document.getElementById('train-log-wrap');
+    if (!box) return;
+    const txt = (d && d.log) || '';
+    if (!txt) {
+      box.classList.add('empty');
+      box.textContent = 'waiting for training subprocess output…';
+      return;
+    }
+    box.classList.remove('empty');
+    // Pin to bottom only if user is already at the bottom.
+    const pinned = (box.scrollHeight - box.clientHeight - box.scrollTop) < 24;
+    box.textContent = txt;
+    if (pinned) box.scrollTop = box.scrollHeight;
+  }).catch(() => {});
+}
+
+function updateTrainModal(s) {
+  const cur = s.current_epoch || 0;
+  const tot = s.total_epochs || 0;
+  const pct = (tot > 0) ? Math.round(100 * cur / tot) : 0;
+  // The TensorRT export runs AFTER all epochs and has no progress signal.
+  // Show an indeterminate animated bar so the operator can tell it's still
+  // working (the static 100% bar made it look frozen).
+  const wrap = document.getElementById('train-bar-wrap');
+  const exporting = (s.state === 'exporting');
+  if (wrap) wrap.classList.toggle('indeterminate', exporting);
+  if (!exporting) document.getElementById('train-bar').style.width = pct + '%';
+  const stateLine = exporting
+    ? ((s.message || 'Exporting TensorRT engine') + ' — this can take ~2–3 min on Orin Nano…')
+    : ((s.message || s.state || '…') + (tot ? `   (${pct}%)` : ''));
+  document.getElementById('train-state-line').textContent = stateLine;
+  document.getElementById('train-epoch').textContent = cur || '—';
+  document.getElementById('train-total').textContent = tot || '—';
+  document.getElementById('train-elapsed').textContent = fmtSec(s.elapsed_sec);
+  document.getElementById('train-eta').textContent = exporting ? '—' : fmtSec(s.eta_sec);
+  document.getElementById('train-version').textContent = s.version != null ? ('v' + s.version) : '—';
+
+  // Pause / resume the live feed view based on training state.
+  const running = s.running || (s.state === 'training' || s.state === 'starting' || s.state === 'exporting');
+  setFeedDisabled(running);
+
+  if (s.state === 'done') {
+    const engineName = (s.engine_path || s.latest_engine || '').split('/').pop() || 'engine';
+    document.getElementById('train-msg').innerHTML =
+      `✓ Saved <b>${engineName}</b>. ` +
+      `Click <b>Close</b> to resume inference with the new model.`;
+    document.getElementById('train-cancel').style.display = 'none';
+    document.getElementById('train-close').style.display = '';
+    if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
+  } else if (s.state === 'failed') {
+    document.getElementById('train-msg').textContent =
+      '✗ Training failed: ' + (s.message || 'unknown error');
+    document.getElementById('train-cancel').style.display = 'none';
+    document.getElementById('train-close').style.display = '';
+    if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
+  }
+}
+
+function setFeedDisabled(disabled) {
+  const overlay = document.getElementById('feed-disabled');
+  if (overlay) overlay.style.display = disabled ? 'flex' : 'none';
+}
+
+// On page load, see if a training run is already in progress (e.g. user reloaded mid-run).
+fetch('/train/status').then(r => r.json()).then(s => {
+  if (s.running || s.state === 'training' || s.state === 'starting' || s.state === 'exporting') {
+    openTrainModal();
+    startTrainPolling();
+  }
+}).catch(() => {});
 
 // ── 3-minute session limit ──────────────────────────────
 const STREAM_LIMIT_MS = 180000;

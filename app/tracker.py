@@ -28,7 +28,9 @@ from stream import (
     get_model_path,
     get_resolution,
     hat_mode_enabled,
+    inference_should_pause,
     label_should_capture,
+    latest_engine_version,
     push_frame,
     push_stats,
     request_reset,
@@ -64,6 +66,7 @@ class FishTracker:
         os.makedirs(config["output_dir"], exist_ok=True)
         self.model = load_model(config)
         self._applied_model_path = config["model_path"]
+        self._inference_paused = False           # True while training subprocess is running
         # Tell the dashboard which dir to scan and which model is currently active.
         models_dir = os.path.dirname(config["model_path"]) or "models"
         set_models_dir(models_dir)
@@ -355,6 +358,38 @@ class FishTracker:
                 if request_reset():
                     self._reset()
 
+                # ── Training: pause inference until user clicks Close on the modal ───
+                # `inference_should_pause()` covers both subprocess-running and
+                # subprocess-finished-but-not-acknowledged states, so the tracker only
+                # resumes when the user explicitly dismisses the modal.
+                if inference_should_pause():
+                    if not self._inference_paused:
+                        print("[INFO] Training started — releasing inference model + camera")
+                        self._release_model()
+                        self._release_camera()
+                        self._inference_paused = True
+                    self._handle_paused_frame()
+                    continue
+                elif self._inference_paused:
+                    print("[INFO] User closed training modal — reloading inference model + camera")
+                    self._inference_paused = False
+                    prev_path = self._applied_model_path
+                    # Auto-switch to the newest versioned engine if one was produced.
+                    _, latest = latest_engine_version()
+                    candidate = latest or prev_path
+                    self.config["model_path"] = candidate
+                    set_model_path(candidate)
+                    try:
+                        self.model = load_model(self.config)
+                        self._applied_model_path = candidate
+                    except Exception as e:                                  # noqa: BLE001
+                        print(f"[MODEL] Post-train reload failed ({e}); reverting to {prev_path}")
+                        self.config["model_path"] = prev_path
+                        set_model_path(prev_path)
+                        self.model = load_model(self.config)
+                        self._applied_model_path = prev_path
+                    self.cap = init_camera(self.config)
+
                 desired_model = get_model_path()
                 if desired_model != self._applied_model_path:
                     print(f"[MODEL] Reloading: {desired_model}")
@@ -382,7 +417,19 @@ class FishTracker:
                     continue
 
                 self.frame_count += 1
-                annotated = self._infer_and_annotate(raw)
+                try:
+                    annotated = self._infer_and_annotate(raw)
+                except (AssertionError, RuntimeError) as e:
+                    # A bad engine (e.g. shape mismatch from a botched export) would
+                    # otherwise crash the whole tracker. Log, fall back to yolov8s.pt,
+                    # and keep the loop alive.
+                    print(f"[INFER] Inference failed ({type(e).__name__}: {e}); "
+                          f"falling back to yolov8s.pt")
+                    self.config["model_path"] = "yolov8s.pt"
+                    set_model_path("yolov8s.pt")
+                    self.model = load_model(self.config)
+                    self._applied_model_path = "yolov8s.pt"
+                    annotated = raw.copy()
                 if trails_mode_enabled():
                     self._draw_trails(annotated)
 
@@ -415,6 +462,61 @@ class FishTracker:
             print("\n[INFO] Interrupted by user")
         finally:
             self._cleanup()
+
+    # ── Training-pause helpers ────────────────────────────
+
+    def _release_model(self) -> None:
+        """Drop our handle on the model and reclaim GPU memory so training can use it."""
+        try:
+            del self.model
+        except Exception:                                   # noqa: BLE001
+            pass
+        self.model = None
+        try:
+            import gc
+            gc.collect()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def _release_camera(self) -> None:
+        """Release the capture device + driver buffers so training has more RAM headroom."""
+        if hasattr(self, "cap") and self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:                               # noqa: BLE001
+                pass
+        self.cap = None
+
+    def _handle_paused_frame(self) -> None:
+        """Camera is released during training — push a static placeholder frame."""
+        w, h = _RESOLUTIONS.get(self._applied_resolution, (1280, 720))
+        raw = np.zeros((h, w, 3), dtype=np.uint8)
+        msg1 = "Training in progress"
+        msg2 = "Inference + camera paused to free RAM for training"
+        # Centered messages
+        for i, (text, scale, color) in enumerate(
+            [(msg1, 1.1, (245, 197, 24)), (msg2, 0.55, (180, 180, 180))]
+        ):
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+            x = (w - tw) // 2
+            y = h // 2 - 10 + i * (th + 18)
+            cv2.putText(raw, text, (x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
+        if self.config["stream"]:
+            now_t = time.time()
+            stream_interval = 1.0 / self.config.get("stream_fps", 20)
+            if now_t - self._last_stream_push >= stream_interval:
+                _, jpeg = cv2.imencode(".jpg", raw,
+                                       [cv2.IMWRITE_JPEG_QUALITY,
+                                        self.config.get("stream_quality", 60)])
+                push_frame(jpeg.tobytes())
+                self._last_stream_push = now_t
+        # Don't busy-loop the CPU while we're idle.
+        time.sleep(0.2)
+        self._handle_display(raw)
 
     # ── Frame I/O ─────────────────────────────────────────
 
