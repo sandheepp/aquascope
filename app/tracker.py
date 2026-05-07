@@ -8,6 +8,7 @@ draws trails and HUD, handles recording, streaming, and periodic JSON logging.
 import glob
 import json
 import os
+import shutil
 import time
 from collections import defaultdict, deque
 from datetime import datetime
@@ -63,6 +64,10 @@ class FishTracker:
         self._thermal_zones: dict[str, str] = {}   # label → /sys path, built on first call
         self._temps: dict[str, float] = {}          # label → °C, updated each frame
 
+        # Fresh output dir on every dashboard run — stats logs, screenshots,
+        # and recordings from previous runs are not interesting and just
+        # accumulate.
+        shutil.rmtree(config["output_dir"], ignore_errors=True)
         os.makedirs(config["output_dir"], exist_ok=True)
         self.model = load_model(config)
         self._applied_model_path = config["model_path"]
