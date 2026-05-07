@@ -29,8 +29,22 @@ import yaml
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_DATASET  = _PROJECT_ROOT / "dataset"
 _DEFAULT_DISTILL  = _PROJECT_ROOT / "dataset" / "distillation"
+_DEFAULT_USERDATA = _PROJECT_ROOT / "dataset" / "user_recorded"
 _DEFAULT_RUN_NAME = "fish_gpu"
 IMGSZ = 640
+
+
+def _user_data_train_path(user_dir: Path) -> str | None:
+    """Return resolved path to user_recorded/images if it has any images, else None."""
+    if not user_dir.exists():
+        return None
+    images_dir = user_dir / "images"
+    if not images_dir.is_dir():
+        return None
+    has_any = any(images_dir.glob("*.jpg")) or any(images_dir.glob("*.png"))
+    if not has_any:
+        return None
+    return str(images_dir.resolve())
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -55,10 +69,18 @@ def _abs_path(base: Path, rel: str) -> str:
 
 # ── Dataset builders ──────────────────────────────────────────────────────────
 
-def build_merged_yaml(dataset_dir: Path, distill_dir: Path, tmp_dir: Path) -> Path:
+def build_merged_yaml(
+    dataset_dir: Path,
+    distill_dir: Path | None,
+    user_dir: Path | None,
+    tmp_dir: Path,
+) -> Path:
     """
-    Merge Roboflow-labeled dataset with DINO pseudo-labeled distillation images.
-    Validation always uses the ground-truth Roboflow set.
+    Merge Roboflow-labeled dataset with optional DINO pseudo-labels and optional
+    user-recorded labels (from the in-dashboard labeling tab). Validation always
+    uses the ground-truth Roboflow set — user/distill labels are noisier.
+
+    Pass None for distill_dir or user_dir to skip that source.
     """
     orig_yaml = dataset_dir / "data.yaml"
     o_data    = _read_yaml(orig_yaml)
@@ -67,10 +89,18 @@ def build_merged_yaml(dataset_dir: Path, distill_dir: Path, tmp_dir: Path) -> Pa
     orig_train = _abs_path(orig_base, o_data.get("train", "train/images"))
     orig_val   = _abs_path(orig_base, o_data.get("val",   "valid/images"))
 
-    distill_images = str((distill_dir / "images").resolve())
+    train_sources: list[str] = []
+    if distill_dir is not None:
+        distill_images = str((distill_dir / "images").resolve())
+        train_sources.append(distill_images)
+    if user_dir is not None:
+        user_images = _user_data_train_path(user_dir)
+        if user_images:
+            train_sources.append(user_images)
+    train_sources.append(orig_train)
 
     merged = {
-        "train": [distill_images, orig_train],
+        "train": train_sources if len(train_sources) > 1 else train_sources[0],
         "val":   orig_val,
         "nc":    o_data["nc"],
         "names": o_data["names"],
@@ -81,9 +111,10 @@ def build_merged_yaml(dataset_dir: Path, distill_dir: Path, tmp_dir: Path) -> Pa
         yaml.dump(merged, f, default_flow_style=False, sort_keys=False)
 
     print("[DATA] Merged dataset:")
-    print(f"       distill train : {distill_images}")
-    print(f"       orig train    : {orig_train}")
-    print(f"       orig val      : {orig_val}")
+    for src in train_sources[:-1]:
+        print(f"       extra train  : {src}")
+    print(f"       orig train   : {orig_train}")
+    print(f"       orig val     : {orig_val}")
     print(f"       classes ({o_data['nc']}) : {o_data['names']}")
     return merged_yaml
 
@@ -258,6 +289,23 @@ def main() -> None:
         help=f"Distillation output from generate_labels_dino.py (default: {_DEFAULT_DISTILL})",
     )
     parser.add_argument(
+        "--no-distill",
+        action="store_true",
+        help="Skip distillation pseudo-labels (do not include them in training)",
+    )
+    parser.add_argument(
+        "--user-data",
+        type=Path,
+        default=_DEFAULT_USERDATA,
+        help=f"User-recorded labels from the dashboard (default: {_DEFAULT_USERDATA}). "
+             "Silently skipped if the directory is missing or empty.",
+    )
+    parser.add_argument(
+        "--no-user",
+        action="store_true",
+        help="Skip dataset/user_recorded/ even if it has labeled images",
+    )
+    parser.add_argument(
         "--no-merge",
         action="store_true",
         help="Train on distillation pseudo-labels only (skip Roboflow dataset)",
@@ -299,8 +347,9 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    args.dataset     = args.dataset.resolve()
+    args.dataset      = args.dataset.resolve()
     args.distill_data = args.distill_data.resolve()
+    args.user_data    = args.user_data.resolve()
 
     if args.export_only is not None:
         if not args.export_only.exists():
@@ -324,9 +373,17 @@ def main() -> None:
         args.no_merge = True
 
     distill_yaml = args.distill_data / "data.yaml"
-    if not distill_yaml.exists():
-        print(f"ERROR: distillation data.yaml not found at {args.distill_data}")
-        print("       Run: python training/generate_labels_dino.py")
+    distill_available = distill_yaml.exists() and not args.no_distill
+    if not distill_yaml.exists() and not args.no_distill:
+        print(f"[WARN] distillation data.yaml not found at {args.distill_data}; skipping")
+
+    user_train = _user_data_train_path(args.user_data) if not args.no_user else None
+    if user_train:
+        print(f"[DATA] user_recorded labels found: {user_train}")
+
+    if args.no_merge and not distill_available:
+        print("ERROR: --no-merge given but distillation set is unavailable.")
+        print("       Either drop --no-merge or run training/generate_labels_dino.py.")
         sys.exit(1)
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="aquascope_gpu_"))
@@ -337,7 +394,12 @@ def main() -> None:
             except ImportError:
                 data_yaml = distill_yaml
         else:
-            data_yaml = build_merged_yaml(args.dataset, args.distill_data, tmp_dir)
+            data_yaml = build_merged_yaml(
+                dataset_dir=args.dataset,
+                distill_dir=args.distill_data if distill_available else None,
+                user_dir=args.user_data if not args.no_user else None,
+                tmp_dir=tmp_dir,
+            )
 
         best_pt = train(
             data_yaml=data_yaml,
