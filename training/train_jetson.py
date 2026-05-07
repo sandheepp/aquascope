@@ -4,10 +4,11 @@ Jetson-side training launcher for the dashboard 'Train Model' button.
 Designed to be spawned as a subprocess by app/stream.py. Writes a JSON status
 file after each epoch so the dashboard can render progress.
 
-Trains YOLOv8s on dataset/ + dataset/distillation/ + dataset/user_recorded/ with
-Jetson-Orin-Nano-friendly defaults (batch=4, AMP, fewer epochs by default), then
-exports the best weights to TensorRT FP16 as models/best.engine_v<N> with N
-auto-incremented from existing engines under models/.
+Trains YOLOv8s on dataset/user_recorded/ ONLY (90/10 train/val split) with
+the dashboard's two classes (fish, shrimp) and Jetson-Orin-Nano-friendly
+defaults (batch=2, AMP, fewer epochs by default), then exports the best
+weights to TensorRT FP16 as models/best.engine_v<N> with N auto-incremented
+from existing engines under models/.
 
 Usage:
     python training/train_jetson.py
@@ -27,12 +28,16 @@ from pathlib import Path
 # Reuse the merge logic from train_gpu.py
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from train_gpu import (  # noqa: E402
-    _DEFAULT_DATASET,
-    _DEFAULT_DISTILL,
     _DEFAULT_USERDATA,
     _PROJECT_ROOT,
-    build_merged_yaml,
+    build_user_only_yaml,
 )
+
+
+# Dashboard-driven training is locked to the two classes the user actually
+# tracks; the labeling tab never produces anything else, so there's no
+# benefit to mixing in the original 7-class Roboflow set.
+_USER_CLASSES: list[str] = ["fish", "shrimp"]
 
 
 def _write_status(path: str | None, **kwargs) -> None:
@@ -98,13 +103,15 @@ def main() -> None:
 
     tmp_dir = Path(tempfile.mkdtemp(prefix="aq_jetson_"))
     try:
-        # Build merged dataset (Roboflow + distillation + user_recorded if present).
-        distill_yaml = _DEFAULT_DISTILL / "data.yaml"
-        data_yaml = build_merged_yaml(
-            dataset_dir=_DEFAULT_DATASET,
-            distill_dir=_DEFAULT_DISTILL if distill_yaml.exists() else None,
+        # Train ONLY on user-recorded labels (90/10 split), with class names
+        # fixed to the two classes the dashboard tracks. Roboflow + distillation
+        # data is intentionally skipped — the dashboard's labeling tab is the
+        # only label source for fish/shrimp, and mixing in 7-class Roboflow
+        # data would just inject noise from classes the user doesn't care about.
+        data_yaml = build_user_only_yaml(
             user_dir=_DEFAULT_USERDATA,
             tmp_dir=tmp_dir,
+            class_names=_USER_CLASSES,
         )
 
         import torch  # noqa: E402
