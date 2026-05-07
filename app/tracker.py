@@ -29,6 +29,7 @@ from stream import (
     get_resolution,
     hat_mode_enabled,
     label_should_capture,
+    latest_engine_version,
     push_frame,
     push_stats,
     request_reset,
@@ -39,6 +40,7 @@ from stream import (
     start_public_tunnel,
     start_stream,
     trails_mode_enabled,
+    train_running,
 )
 
 
@@ -64,6 +66,7 @@ class FishTracker:
         os.makedirs(config["output_dir"], exist_ok=True)
         self.model = load_model(config)
         self._applied_model_path = config["model_path"]
+        self._inference_paused = False           # True while training subprocess is running
         # Tell the dashboard which dir to scan and which model is currently active.
         models_dir = os.path.dirname(config["model_path"]) or "models"
         set_models_dir(models_dir)
@@ -355,6 +358,25 @@ class FishTracker:
                 if request_reset():
                     self._reset()
 
+                # ── Training subprocess: pause inference, release GPU ─────
+                if train_running():
+                    if not self._inference_paused:
+                        print("[INFO] Training started — releasing inference model")
+                        self._release_model()
+                        self._inference_paused = True
+                    self._handle_paused_frame()
+                    continue
+                elif self._inference_paused:
+                    print("[INFO] Training finished — reloading inference model")
+                    self._inference_paused = False
+                    # Auto-switch to the newest versioned engine if one was produced.
+                    _, latest = latest_engine_version()
+                    if latest:
+                        self.config["model_path"] = latest
+                        set_model_path(latest)
+                    self.model = load_model(self.config)
+                    self._applied_model_path = self.config["model_path"]
+
                 desired_model = get_model_path()
                 if desired_model != self._applied_model_path:
                     print(f"[MODEL] Reloading: {desired_model}")
@@ -415,6 +437,47 @@ class FishTracker:
             print("\n[INFO] Interrupted by user")
         finally:
             self._cleanup()
+
+    # ── Training-pause helpers ────────────────────────────
+
+    def _release_model(self) -> None:
+        """Drop our handle on the model and reclaim GPU memory so training can use it."""
+        try:
+            del self.model
+        except Exception:                                   # noqa: BLE001
+            pass
+        self.model = None
+        try:
+            import gc
+            gc.collect()
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:                                   # noqa: BLE001
+            pass
+
+    def _handle_paused_frame(self) -> None:
+        """While training, just relay a raw camera frame with a small overlay."""
+        raw = self._read_frame()
+        if raw is None:
+            return
+        h, w = raw.shape[:2]
+        overlay = raw.copy()
+        msg = "Training in progress — inference paused"
+        cv2.rectangle(overlay, (0, 0), (w, 36), (10, 10, 10), -1)
+        cv2.addWeighted(overlay, 0.65, raw, 0.35, 0, raw)
+        cv2.putText(raw, msg, (12, 24),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (245, 197, 24), 2, cv2.LINE_AA)
+        if self.config["stream"]:
+            now_t = time.time()
+            stream_interval = 1.0 / self.config.get("stream_fps", 20)
+            if now_t - self._last_stream_push >= stream_interval:
+                _, jpeg = cv2.imencode(".jpg", raw,
+                                       [cv2.IMWRITE_JPEG_QUALITY,
+                                        self.config.get("stream_quality", 75)])
+                push_frame(jpeg.tobytes())
+                self._last_stream_push = now_t
+        self._handle_display(raw)
 
     # ── Frame I/O ─────────────────────────────────────────
 

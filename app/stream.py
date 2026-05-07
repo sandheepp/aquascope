@@ -15,12 +15,17 @@ Endpoints:
   /label/queue       — JSON list of pending candidates
   /label/image/<id>  — JPEG of a pending candidate frame
   /label/decision    — accept/reject a candidate (?id=<id>&keep=0|1)
+  /train/labels      — current user-recorded label count + min required + ETA
+  /train/start       — spawn training subprocess (returns 409 if already running)
+  /train/status      — poll training progress (state/epoch/eta/message/version)
+  /train/cancel      — terminate the running training subprocess
 """
 
 import json
 import os
 import re
 import subprocess
+import sys
 import threading
 import time
 from datetime import datetime
@@ -70,6 +75,14 @@ _label_class_names: list[str] = []             # populated from model.names at s
 _LABEL_THROTTLE_SEC = 2.0                      # min seconds between captures of same track_id
 _LABEL_QUEUE_MAX = 50                          # cap pending queue to avoid disk blow-up
 _label_last_capture: dict[int, float] = {}     # track_id → last capture ts
+
+# ── Training state ────────────────────────────────────────
+_train_proc = None                             # subprocess.Popen | None
+_train_lock = threading.Lock()
+_train_status_file: str = "/tmp/aquascope_train_status.json"
+_TRAIN_MIN_LABELS: int = 100                   # button stays disabled below this
+_TRAIN_DEFAULT_EPOCHS: int = 30
+_TRAIN_DEFAULT_BATCH: int = 4                  # Orin Nano-friendly
 
 _RESOLUTIONS = {
     "480p":  (854,  480),
@@ -220,6 +233,112 @@ def _label_decide(candidate_id: str, keep: bool) -> dict:
         result["queued"] = len(_label_pending)
     return result
 
+
+# ── Training: public API used by tracker.py ──────────────
+def train_running() -> bool:
+    with _train_lock:
+        return _train_proc is not None and _train_proc.poll() is None
+
+
+def get_train_status() -> dict:
+    """Read the JSON status file the subprocess writes; reconcile with proc state."""
+    status: dict = {"state": "idle"}
+    try:
+        with open(_train_status_file) as f:
+            status = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    with _train_lock:
+        if _train_proc is not None:
+            rc = _train_proc.poll()
+            if rc is not None and status.get("state") not in ("done", "failed"):
+                # Process exited but status file wasn't updated.
+                status["state"] = "done" if rc == 0 else "failed"
+                status.setdefault("message", f"subprocess exited rc={rc}")
+    return status
+
+
+def count_user_labels() -> int:
+    labels_dir = os.path.join(_label_output_dir, "labels")
+    if not os.path.isdir(labels_dir):
+        return 0
+    return sum(1 for f in os.listdir(labels_dir) if f.endswith(".txt"))
+
+
+def estimate_training_minutes(label_count: int, epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
+    """
+    Rough ETA for the dashboard to show on the confirm dialog.
+    Real numbers come from the subprocess after epoch 1 (avg_epoch_sec).
+    Heuristic: ~1.5 min/epoch on Orin Nano + ~5ms per extra training sample/epoch.
+    """
+    base_min = epochs * 1.5
+    extra_min = (label_count * epochs * 0.005) / 60.0
+    total = base_min + extra_min
+    return {"low_min": max(15, int(total - 10)),
+            "high_min": int(total + 15),
+            "epochs": epochs}
+
+
+def latest_engine_version() -> tuple[int, str | None]:
+    """Return (version, path) for the highest models/best.engine_v<N>, or (0, None)."""
+    if not os.path.isdir(_models_dir):
+        return 0, None
+    best_n = 0
+    best_path: str | None = None
+    for name in os.listdir(_models_dir):
+        if not name.startswith("best.engine_v"):
+            continue
+        try:
+            n = int(name[len("best.engine_v"):])
+        except ValueError:
+            continue
+        if n > best_n:
+            best_n = n
+            best_path = os.path.join(_models_dir, name)
+    return best_n, best_path
+
+
+def start_training() -> dict:
+    """Spawn the training subprocess if not already running."""
+    global _train_proc
+    with _train_lock:
+        if _train_proc is not None and _train_proc.poll() is None:
+            return {"error": "training already in progress"}
+        # Clear stale status file so /train/status doesn't show old data.
+        try:
+            os.remove(_train_status_file)
+        except OSError:
+            pass
+        cmd = [
+            sys.executable, "training/train_jetson.py",
+            "--status-file", _train_status_file,
+            "--epochs", str(_TRAIN_DEFAULT_EPOCHS),
+            "--batch",  str(_TRAIN_DEFAULT_BATCH),
+        ]
+        try:
+            _train_proc = subprocess.Popen(  # noqa: S603
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                cwd=os.getcwd(),
+            )
+        except OSError as e:
+            return {"error": str(e)}
+        return {"started": True, "pid": _train_proc.pid}
+
+
+def cancel_training() -> dict:
+    global _train_proc
+    with _train_lock:
+        if _train_proc is None or _train_proc.poll() is not None:
+            return {"error": "no training in progress"}
+        _train_proc.terminate()
+        try:
+            _train_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _train_proc.kill()
+    return {"cancelled": True}
+
 _screenshots: list[dict] = []   # [{filename, ts, label}]
 _screenshots_lock = threading.Lock()
 _screenshot_dir = "fish_logs/screenshots"
@@ -290,6 +409,14 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_label_image(p[len("/label/image/"):])
         elif p == "/label/decision":
             self._serve_label_decision()
+        elif p == "/train/labels":
+            self._serve_train_labels()
+        elif p == "/train/start":
+            self._serve_train_start()
+        elif p == "/train/status":
+            self._serve_train_status()
+        elif p == "/train/cancel":
+            self._serve_train_cancel()
         elif p == "/screenshot":
             self._serve_screenshot()
         elif p == "/screenshots":
@@ -450,6 +577,41 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
+
+    # ── Training tab handlers ─────────────────────────────
+
+    def _serve_train_labels(self):
+        count = count_user_labels()
+        body = json.dumps({
+            "count": count,
+            "min_required": _TRAIN_MIN_LABELS,
+            "ready": count >= _TRAIN_MIN_LABELS,
+            "estimate": estimate_training_minutes(count),
+        }).encode()
+        self._json_response(body)
+
+    def _serve_train_start(self):
+        count = count_user_labels()
+        if count < _TRAIN_MIN_LABELS:
+            self._json_response(json.dumps({
+                "error": f"need at least {_TRAIN_MIN_LABELS} labels (have {count})",
+                "count": count,
+                "min_required": _TRAIN_MIN_LABELS,
+            }).encode())
+            return
+        self._json_response(json.dumps(start_training()).encode())
+
+    def _serve_train_status(self):
+        status = get_train_status()
+        # Pin the running flag from proc state so the UI doesn't trust a stale file.
+        status["running"] = train_running()
+        ver, path = latest_engine_version()
+        status["latest_version"] = ver
+        status["latest_engine"] = path
+        self._json_response(json.dumps(status).encode())
+
+    def _serve_train_cancel(self):
+        self._json_response(json.dumps(cancel_training()).encode())
 
     def _serve_label_decision(self):
         qs = self.path.split("?", 1)[1] if "?" in self.path else ""
@@ -724,6 +886,56 @@ body{
 }
 #label-actions .accept:hover, #label-actions .reject:hover, #label-toggle:hover{opacity:0.88}
 
+/* ── Train button ── */
+#train-btn{
+  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);color:#fff;border:none;
+  padding:8px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;
+  margin-left:auto;
+}
+#train-btn:disabled{
+  background:linear-gradient(135deg,#3a3a4a 0%,#2a2a35 100%);color:#666;cursor:not-allowed;
+}
+#train-btn:not(:disabled):hover{opacity:0.88}
+
+/* ── Training modal ── */
+#train-overlay{
+  display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);
+  z-index:400;align-items:center;justify-content:center;backdrop-filter:blur(2px);
+}
+#train-overlay.open{display:flex}
+#train-card{
+  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);
+  border-radius:12px;padding:24px 28px;min-width:360px;max-width:480px;
+  box-shadow:0 16px 48px rgba(0,0,0,0.7);
+}
+#train-title{font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px}
+#train-state-line{color:var(--text);font-size:14px;margin-bottom:14px}
+#train-bar-wrap{background:#0d141d;border:1px solid var(--border);border-radius:4px;height:10px;overflow:hidden;margin-bottom:14px}
+#train-bar{height:100%;width:0%;background:linear-gradient(90deg,#7c4dff,#00d4aa);transition:width 0.4s}
+#train-info{display:grid;grid-template-columns:1fr 1fr;gap:6px 18px;font-size:12px;margin-bottom:14px}
+#train-info .stat-val{font-family:var(--mono)}
+#train-msg{color:var(--dim);font-size:11px;margin-bottom:12px}
+#train-actions{display:flex;gap:10px;justify-content:flex-end}
+#train-actions button{
+  border:1px solid var(--border);background:#1a2130;color:var(--text);
+  padding:7px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:var(--font);
+}
+#train-cancel{color:var(--danger);border-color:rgba(252,92,101,0.4)}
+#train-actions button:hover{opacity:0.85}
+
+/* ── Inference-disabled overlay on the live feed ── */
+#feed-disabled{
+  position:absolute;inset:0;background:rgba(0,0,0,0.78);
+  z-index:5;display:flex;align-items:center;justify-content:center;
+}
+.feed-disabled-card{
+  text-align:center;padding:20px 26px;max-width:300px;
+  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);
+  border:1px solid var(--border);border-radius:10px;
+}
+.feed-disabled-title{font-size:15px;font-weight:700;color:var(--accent);margin-bottom:6px}
+.feed-disabled-msg{color:var(--dim);font-size:11px;line-height:1.5}
+
 /* ── Feed ── */
 #feed-wrap{
   position:relative;
@@ -981,6 +1193,12 @@ body{
     <div class="corner bl"></div>
     <div class="corner br"></div>
     <div class="scanlines"></div>
+    <div id="feed-disabled" style="display:none">
+      <div class="feed-disabled-card">
+        <div class="feed-disabled-title">⏸ Inference paused</div>
+        <div class="feed-disabled-msg">Training is using the GPU. The live feed will resume automatically when training completes.</div>
+      </div>
+    </div>
     <div id="stream-expired">
       <div class="expired-card">
         <div class="expired-title">⏸ Stream paused</div>
@@ -1062,6 +1280,10 @@ body{
       <span class="stat-val" id="label-count">0</span>
     </div>
     <div class="stat-row" style="margin:0">
+      <span class="stat-lbl">Saved</span>
+      <span class="stat-val" id="label-saved">0/100</span>
+    </div>
+    <div class="stat-row" style="margin:0">
       <span class="stat-lbl">Track</span>
       <span class="stat-val" id="label-track">—</span>
     </div>
@@ -1069,6 +1291,7 @@ body{
       <span class="stat-lbl">Class</span>
       <span class="stat-val" id="label-class">—</span>
     </div>
+    <button id="train-btn" disabled onclick="confirmTraining()">🧠 Train model</button>
   </div>
   <div id="label-canvas-wrap">
     <canvas id="label-canvas" style="display:none"></canvas>
@@ -1101,6 +1324,27 @@ body{
   <button id="fs-close" onclick="closeFeed()">✕</button>
   <img id="fs-feed" src="" alt="fullscreen feed">
 </div>
+
+<!-- Training progress modal -->
+<div id="train-overlay">
+  <div id="train-card">
+    <div id="train-title">🧠 Training model</div>
+    <div id="train-state-line">starting…</div>
+    <div id="train-bar-wrap"><div id="train-bar"></div></div>
+    <div id="train-info">
+      <div><span class="stat-lbl">Epoch</span> <span class="stat-val" id="train-epoch">—</span> / <span id="train-total">—</span></div>
+      <div><span class="stat-lbl">Elapsed</span> <span class="stat-val" id="train-elapsed">—</span></div>
+      <div><span class="stat-lbl">ETA</span> <span class="stat-val" id="train-eta">—</span></div>
+      <div><span class="stat-lbl">Version</span> <span class="stat-val" id="train-version">—</span></div>
+    </div>
+    <div id="train-msg">Inference is paused while training runs.</div>
+    <div id="train-actions">
+      <button id="train-cancel" onclick="cancelTraining()">Cancel</button>
+      <button id="train-close" onclick="closeTrainModal()" style="display:none">Close</button>
+    </div>
+  </div>
+</div>
+
 
 <script>
 let startTime = Date.now();
@@ -1446,6 +1690,137 @@ fetch('/label/state').then(r => r.json()).then(d => {
     document.getElementById('label-state').textContent = 'on';
   }
 });
+
+// ── Training: label count + Train button ─────────────────
+let trainEstimate = null;
+function refreshTrainLabels() {
+  fetch('/train/labels').then(r => r.json()).then(d => {
+    document.getElementById('label-saved').textContent =
+      d.count + '/' + d.min_required;
+    const btn = document.getElementById('train-btn');
+    btn.disabled = !d.ready || trainModalOpen;
+    trainEstimate = d.estimate;
+  }).catch(() => {});
+}
+setInterval(refreshTrainLabels, 3000);
+refreshTrainLabels();
+
+// ── Training: confirm + start + poll progress ────────────
+let trainPollInterval = null;
+let trainModalOpen = false;
+
+function fmtSec(s) {
+  if (s == null || isNaN(s)) return '—';
+  s = Math.max(0, Math.round(s));
+  const m = Math.floor(s / 60), r = s % 60;
+  return m ? `${m}m ${r}s` : `${r}s`;
+}
+
+function confirmTraining() {
+  if (!trainEstimate) return;
+  const e = trainEstimate;
+  const ok = window.confirm(
+    `Train a new model on your labeled data?\n\n` +
+    `• Estimated time: ~${e.low_min}–${e.high_min} minutes (${e.epochs} epochs)\n` +
+    `• Inference will pause while the GPU is in use\n` +
+    `• On success a new models/best.engine_v<N> appears in the Model dropdown\n\n` +
+    `Continue?`
+  );
+  if (!ok) return;
+  fetch('/train/start').then(r => r.json()).then(d => {
+    if (d.error) { alert('Could not start training: ' + d.error); return; }
+    openTrainModal();
+    startTrainPolling();
+  });
+}
+
+function openTrainModal() {
+  trainModalOpen = true;
+  document.getElementById('train-overlay').classList.add('open');
+  document.getElementById('train-cancel').style.display = '';
+  document.getElementById('train-close').style.display = 'none';
+  // Disable model dropdown + train button
+  const ms = document.getElementById('model-select');
+  if (ms) ms.disabled = true;
+  document.getElementById('train-btn').disabled = true;
+}
+
+function closeTrainModal() {
+  trainModalOpen = false;
+  document.getElementById('train-overlay').classList.remove('open');
+  if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
+  const ms = document.getElementById('model-select');
+  if (ms) ms.disabled = false;
+  refreshTrainLabels();
+}
+
+function cancelTraining() {
+  if (!confirm('Cancel training? Progress will be lost.')) return;
+  fetch('/train/cancel').then(r => r.json()).then(() => {
+    // The poller will see state=failed and switch to Close.
+  });
+}
+
+function startTrainPolling() {
+  if (trainPollInterval) clearInterval(trainPollInterval);
+  pollTrainStatus();
+  trainPollInterval = setInterval(pollTrainStatus, 2000);
+}
+
+function pollTrainStatus() {
+  fetch('/train/status').then(r => r.json()).then(updateTrainModal).catch(() => {});
+}
+
+function updateTrainModal(s) {
+  const cur = s.current_epoch || 0;
+  const tot = s.total_epochs || 0;
+  const pct = (tot > 0) ? Math.round(100 * cur / tot) : 0;
+  document.getElementById('train-bar').style.width = pct + '%';
+  document.getElementById('train-state-line').textContent =
+    (s.message || s.state || '…') + (tot ? `   (${pct}%)` : '');
+  document.getElementById('train-epoch').textContent = cur || '—';
+  document.getElementById('train-total').textContent = tot || '—';
+  document.getElementById('train-elapsed').textContent = fmtSec(s.elapsed_sec);
+  document.getElementById('train-eta').textContent = fmtSec(s.eta_sec);
+  document.getElementById('train-version').textContent = s.version != null ? ('v' + s.version) : '—';
+
+  // Pause / resume the live feed view based on training state.
+  const running = s.running || (s.state === 'training' || s.state === 'starting' || s.state === 'exporting');
+  setFeedDisabled(running);
+
+  if (s.state === 'done') {
+    document.getElementById('train-msg').innerHTML =
+      `✓ Saved <b>${(s.engine_path || '').split('/').pop() || 'engine'}</b>. ` +
+      `Switching to the new model…`;
+    document.getElementById('train-cancel').style.display = 'none';
+    document.getElementById('train-close').style.display = '';
+    if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
+    // Auto-switch the active model to the new versioned engine.
+    if (s.latest_engine) {
+      const base = s.latest_engine.split('/').pop();
+      fetch('/model?v=' + encodeURIComponent(base)).finally(() => loadModels());
+    }
+  } else if (s.state === 'failed') {
+    document.getElementById('train-msg').textContent =
+      '✗ Training failed: ' + (s.message || 'unknown error');
+    document.getElementById('train-cancel').style.display = 'none';
+    document.getElementById('train-close').style.display = '';
+    if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
+  }
+}
+
+function setFeedDisabled(disabled) {
+  const overlay = document.getElementById('feed-disabled');
+  if (overlay) overlay.style.display = disabled ? 'flex' : 'none';
+}
+
+// On page load, see if a training run is already in progress (e.g. user reloaded mid-run).
+fetch('/train/status').then(r => r.json()).then(s => {
+  if (s.running || s.state === 'training' || s.state === 'starting' || s.state === 'exporting') {
+    openTrainModal();
+    startTrainPolling();
+  }
+}).catch(() => {});
 
 // ── 3-minute session limit ──────────────────────────────
 const STREAM_LIMIT_MS = 180000;
