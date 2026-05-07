@@ -28,6 +28,7 @@ from stream import (
     get_model_path,
     get_resolution,
     hat_mode_enabled,
+    inference_should_pause,
     label_should_capture,
     latest_engine_version,
     push_frame,
@@ -40,7 +41,6 @@ from stream import (
     start_public_tunnel,
     start_stream,
     trails_mode_enabled,
-    train_running,
 )
 
 
@@ -358,8 +358,11 @@ class FishTracker:
                 if request_reset():
                     self._reset()
 
-                # ── Training subprocess: pause inference, release GPU + camera ───
-                if train_running():
+                # ── Training: pause inference until user clicks Close on the modal ───
+                # `inference_should_pause()` covers both subprocess-running and
+                # subprocess-finished-but-not-acknowledged states, so the tracker only
+                # resumes when the user explicitly dismisses the modal.
+                if inference_should_pause():
                     if not self._inference_paused:
                         print("[INFO] Training started — releasing inference model + camera")
                         self._release_model()
@@ -368,15 +371,23 @@ class FishTracker:
                     self._handle_paused_frame()
                     continue
                 elif self._inference_paused:
-                    print("[INFO] Training finished — reloading inference model + camera")
+                    print("[INFO] User closed training modal — reloading inference model + camera")
                     self._inference_paused = False
+                    prev_path = self._applied_model_path
                     # Auto-switch to the newest versioned engine if one was produced.
                     _, latest = latest_engine_version()
-                    if latest:
-                        self.config["model_path"] = latest
-                        set_model_path(latest)
-                    self.model = load_model(self.config)
-                    self._applied_model_path = self.config["model_path"]
+                    candidate = latest or prev_path
+                    self.config["model_path"] = candidate
+                    set_model_path(candidate)
+                    try:
+                        self.model = load_model(self.config)
+                        self._applied_model_path = candidate
+                    except Exception as e:                                  # noqa: BLE001
+                        print(f"[MODEL] Post-train reload failed ({e}); reverting to {prev_path}")
+                        self.config["model_path"] = prev_path
+                        set_model_path(prev_path)
+                        self.model = load_model(self.config)
+                        self._applied_model_path = prev_path
                     self.cap = init_camera(self.config)
 
                 desired_model = get_model_path()
@@ -406,7 +417,19 @@ class FishTracker:
                     continue
 
                 self.frame_count += 1
-                annotated = self._infer_and_annotate(raw)
+                try:
+                    annotated = self._infer_and_annotate(raw)
+                except (AssertionError, RuntimeError) as e:
+                    # A bad engine (e.g. shape mismatch from a botched export) would
+                    # otherwise crash the whole tracker. Log, fall back to yolov8s.pt,
+                    # and keep the loop alive.
+                    print(f"[INFER] Inference failed ({type(e).__name__}: {e}); "
+                          f"falling back to yolov8s.pt")
+                    self.config["model_path"] = "yolov8s.pt"
+                    set_model_path("yolov8s.pt")
+                    self.model = load_model(self.config)
+                    self._applied_model_path = "yolov8s.pt"
+                    annotated = raw.copy()
                 if trails_mode_enabled():
                     self._draw_trails(annotated)
 

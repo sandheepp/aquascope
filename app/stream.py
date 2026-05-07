@@ -20,6 +20,7 @@ Endpoints:
   /train/status      — poll training progress (state/epoch/eta/message/version)
   /train/cancel      — terminate the running training subprocess
   /train/log         — tail of training subprocess stdout/stderr (text)
+  /train/acknowledge — user dismissed the training modal; resume inference
 """
 
 import json
@@ -83,6 +84,10 @@ _train_lock = threading.Lock()
 _train_status_file: str = "/tmp/aquascope_train_status.json"
 _train_log_file: str = "/tmp/aquascope_train.log"
 _train_log_fh = None                           # open file handle for the running subprocess
+# Set True when user starts training; cleared when user clicks "Close" on the modal.
+# The tracker keeps inference paused while this is True — so the user controls when
+# inference resumes (via /train/acknowledge), not the subprocess exit.
+_train_unacked: bool = False
 _TRAIN_MIN_LABELS: int = 100                   # button stays disabled below this
 _TRAIN_DEFAULT_EPOCHS: int = 30
 _TRAIN_DEFAULT_BATCH: int = 2                  # Orin Nano unified-memory friendly
@@ -244,6 +249,26 @@ def train_running() -> bool:
         return _train_proc is not None and _train_proc.poll() is None
 
 
+def inference_should_pause() -> bool:
+    """Tracker pauses while training is running OR while the finished-modal hasn't been
+    acknowledged by the user (Close button). This keeps inference off the GPU until the
+    user explicitly hands control back."""
+    with _train_lock:
+        if _train_proc is not None and _train_proc.poll() is None:
+            return True
+        return _train_unacked
+
+
+def acknowledge_training() -> dict:
+    """Called by the dashboard when user clicks Close on the training modal.
+    Clears the 'unacknowledged' flag so the tracker resumes inference."""
+    global _train_unacked
+    with _train_lock:
+        was = _train_unacked
+        _train_unacked = False
+    return {"acknowledged": True, "was_pending": was}
+
+
 def get_train_status() -> dict:
     """Read the JSON status file the subprocess writes; reconcile with proc state."""
     status: dict = {"state": "idle"}
@@ -304,10 +329,11 @@ def latest_engine_version() -> tuple[int, str | None]:
 
 def start_training() -> dict:
     """Spawn the training subprocess if not already running."""
-    global _train_proc, _train_log_fh
+    global _train_proc, _train_log_fh, _train_unacked
     with _train_lock:
         if _train_proc is not None and _train_proc.poll() is None:
             return {"error": "training already in progress"}
+        _train_unacked = True
         # Clear stale status + log so the dashboard doesn't show old data.
         for path in (_train_status_file, _train_log_file):
             try:
@@ -459,6 +485,8 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_train_cancel()
         elif p == "/train/log":
             self._serve_train_log()
+        elif p == "/train/acknowledge":
+            self._serve_train_acknowledge()
         elif p == "/screenshot":
             self._serve_screenshot()
         elif p == "/screenshots":
@@ -658,6 +686,9 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
     def _serve_train_log(self):
         log_text = get_train_log()
         self._json_response(json.dumps({"log": log_text}).encode())
+
+    def _serve_train_acknowledge(self):
+        self._json_response(json.dumps(acknowledge_training()).encode())
 
     def _serve_label_decision(self):
         qs = self.path.split("?", 1)[1] if "?" in self.path else ""
@@ -1806,6 +1837,9 @@ function openTrainModal() {
 }
 
 function closeTrainModal() {
+  // Tell the tracker the user has acknowledged the training-finished modal —
+  // this is what triggers inference to actually resume on the Jetson side.
+  fetch('/train/acknowledge').catch(() => {});
   trainModalOpen = false;
   document.getElementById('train-overlay').classList.remove('open');
   if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
@@ -1870,7 +1904,7 @@ function updateTrainModal(s) {
   if (s.state === 'done') {
     document.getElementById('train-msg').innerHTML =
       `✓ Saved <b>${(s.engine_path || '').split('/').pop() || 'engine'}</b>. ` +
-      `Switching to the new model…`;
+      `Click <b>Close</b> to resume inference with the new model.`;
     document.getElementById('train-cancel').style.display = 'none';
     document.getElementById('train-close').style.display = '';
     if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
