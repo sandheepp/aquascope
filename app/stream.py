@@ -2,12 +2,19 @@
 MJPEG HTTP streaming server + Cloudflare public tunnel.
 
 Endpoints:
-  /           — dashboard UI
-  /stream     — MJPEG video stream
-  /stats      — JSON live stats
-  /reset      — reset tracker trails
-  /screenshot — save current frame, return JSON {filename}
-  /screenshots/<file> — serve saved screenshot
+  /                  — dashboard UI
+  /stream            — MJPEG video stream
+  /stats             — JSON live stats
+  /reset             — reset tracker trails
+  /screenshot        — save current frame, return JSON {filename}
+  /screenshots/<f>   — serve saved screenshot
+  /models            — JSON list of model files in the models dir
+  /model             — set the active model (?v=<basename>)
+  /label/state       — labeling enabled flag + queue depth
+  /label/toggle      — toggle (or set ?v=0|1) labeling capture
+  /label/queue       — JSON list of pending candidates
+  /label/image/<id>  — JPEG of a pending candidate frame
+  /label/decision    — accept/reject a candidate (?id=<id>&keep=0|1)
 """
 
 import json
@@ -19,6 +26,7 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+from urllib.parse import unquote
 
 # ── Shared state ──────────────────────────────────────────
 _frame: bytes = b""
@@ -44,6 +52,24 @@ _conf_lock = threading.Lock()
 
 _resolution = "1080p"
 _resolution_lock = threading.Lock()
+
+_models_dir: str = "models"
+_model_path: str = "models/best.engine"
+_model_lock = threading.Lock()
+_MODEL_EXTS = (".pt", ".engine", ".onnx")
+
+# ── Labeling tab state ────────────────────────────────────
+import uuid
+
+_label_enabled: bool = False
+_label_lock = threading.Lock()
+_label_pending: list[dict] = []                # candidates awaiting decision
+_label_pending_dir: str = "/tmp/aquascope_label_pending"
+_label_output_dir: str = "dataset/user_recorded"
+_label_class_names: list[str] = []             # populated from model.names at startup
+_LABEL_THROTTLE_SEC = 2.0                      # min seconds between captures of same track_id
+_LABEL_QUEUE_MAX = 50                          # cap pending queue to avoid disk blow-up
+_label_last_capture: dict[int, float] = {}     # track_id → last capture ts
 
 _RESOLUTIONS = {
     "480p":  (854,  480),
@@ -75,6 +101,124 @@ def get_conf_threshold() -> float:
 def get_resolution() -> str:
     with _resolution_lock:
         return _resolution
+
+
+def set_models_dir(path: str) -> None:
+    global _models_dir
+    _models_dir = path
+
+
+def set_model_path(path: str) -> None:
+    global _model_path
+    with _model_lock:
+        _model_path = path
+
+
+def get_model_path() -> str:
+    with _model_lock:
+        return _model_path
+
+
+# ── Labeling: public API used by tracker.py ──────────────
+def set_label_output_dir(path: str) -> None:
+    global _label_output_dir
+    _label_output_dir = path
+
+
+def set_label_pending_dir(path: str) -> None:
+    global _label_pending_dir
+    _label_pending_dir = path
+
+
+def set_label_class_names(names) -> None:
+    """Accept list/dict from Ultralytics (`model.names` is a dict id→name)."""
+    global _label_class_names
+    if isinstance(names, dict):
+        _label_class_names = [names[k] for k in sorted(names)]
+    else:
+        _label_class_names = list(names) if names else []
+
+
+def label_enabled() -> bool:
+    with _label_lock:
+        return _label_enabled
+
+
+def label_should_capture(track_id: int) -> bool:
+    """True iff capture is on AND this track_id hasn't been queued recently AND queue isn't full."""
+    with _label_lock:
+        if not _label_enabled or len(_label_pending) >= _LABEL_QUEUE_MAX:
+            return False
+        now = time.time()
+        last = _label_last_capture.get(int(track_id), 0.0)
+        if now - last < _LABEL_THROTTLE_SEC:
+            return False
+        _label_last_capture[int(track_id)] = now
+        return True
+
+
+def enqueue_label_candidate(jpeg_bytes: bytes, bbox, img_w: int, img_h: int,
+                            class_idx: int, track_id: int) -> str:
+    """Persist the JPEG and queue a candidate dict. Returns the candidate id."""
+    os.makedirs(_label_pending_dir, exist_ok=True)
+    cid = uuid.uuid4().hex[:12]
+    path = os.path.join(_label_pending_dir, f"{cid}.jpg")
+    with open(path, "wb") as f:
+        f.write(jpeg_bytes)
+    candidate = {
+        "id": cid,
+        "frame_path": path,
+        "bbox": [int(v) for v in bbox],
+        "img_w": int(img_w),
+        "img_h": int(img_h),
+        "class_idx": int(class_idx),
+        "track_id": int(track_id),
+        "ts": time.time(),
+    }
+    with _label_lock:
+        _label_pending.append(candidate)
+    return cid
+
+
+def _label_decide(candidate_id: str, keep: bool) -> dict:
+    """Persist (if keep=True) or just discard. Always removes the pending JPEG."""
+    with _label_lock:
+        idx = next((i for i, c in enumerate(_label_pending) if c["id"] == candidate_id), -1)
+        if idx < 0:
+            return {"error": "candidate not found", "id": candidate_id}
+        candidate = _label_pending.pop(idx)
+        out_dir = _label_output_dir
+
+    result: dict = {"saved": False}
+    if keep:
+        os.makedirs(os.path.join(out_dir, "images"), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, "labels"), exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = f"{ts}_{candidate['id']}"
+        img_dst = os.path.join(out_dir, "images", f"{base}.jpg")
+        lbl_dst = os.path.join(out_dir, "labels", f"{base}.txt")
+        with open(candidate["frame_path"], "rb") as f:
+            data = f.read()
+        with open(img_dst, "wb") as f:
+            f.write(data)
+        x1, y1, x2, y2 = candidate["bbox"]
+        w, h = candidate["img_w"], candidate["img_h"]
+        cx = (x1 + x2) / 2 / w
+        cy = (y1 + y2) / 2 / h
+        bw = (x2 - x1) / w
+        bh = (y2 - y1) / h
+        with open(lbl_dst, "w") as f:
+            f.write(f"{candidate['class_idx']} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+        result = {"saved": True, "image": img_dst, "label": lbl_dst}
+
+    try:
+        os.remove(candidate["frame_path"])
+    except OSError:
+        pass
+
+    with _label_lock:
+        result["queued"] = len(_label_pending)
+    return result
 
 _screenshots: list[dict] = []   # [{filename, ts, label}]
 _screenshots_lock = threading.Lock()
@@ -132,6 +276,20 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_conf()
         elif p == "/resolution":
             self._serve_resolution()
+        elif p == "/models":
+            self._serve_models_list()
+        elif p == "/model":
+            self._serve_model_select()
+        elif p == "/label/state":
+            self._serve_label_state()
+        elif p == "/label/toggle":
+            self._serve_label_toggle()
+        elif p == "/label/queue":
+            self._serve_label_queue()
+        elif p.startswith("/label/image/"):
+            self._serve_label_image(p[len("/label/image/"):])
+        elif p == "/label/decision":
+            self._serve_label_decision()
         elif p == "/screenshot":
             self._serve_screenshot()
         elif p == "/screenshots":
@@ -209,6 +367,100 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         with _conf_lock:
             _conf_threshold = val
         self._json_response(json.dumps({"conf": round(val, 2)}).encode())
+
+    def _serve_models_list(self):
+        models_dir = _models_dir
+        models: list[str] = []
+        if os.path.isdir(models_dir):
+            for name in sorted(os.listdir(models_dir)):
+                if name.endswith(_MODEL_EXTS):
+                    models.append(os.path.join(models_dir, name))
+        body = json.dumps({"models": models, "current": get_model_path()}).encode()
+        self._json_response(body)
+
+    def _serve_model_select(self):
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        raw = unquote(params.get("v", ""))
+        # Reject path traversal: only the basename is honored, resolved under _models_dir.
+        name = os.path.basename(raw)
+        if not name or not name.endswith(_MODEL_EXTS):
+            self._json_response(b'{"error":"invalid model"}')
+            return
+        full = os.path.join(_models_dir, name)
+        if not os.path.isfile(full):
+            self._json_response(json.dumps({"error": "not found", "path": full}).encode())
+            return
+        set_model_path(full)
+        self._json_response(json.dumps({"model": full}).encode())
+
+    # ── Labeling tab handlers ─────────────────────────────
+
+    def _serve_label_state(self):
+        with _label_lock:
+            body = json.dumps({"enabled": _label_enabled, "queued": len(_label_pending)}).encode()
+        self._json_response(body)
+
+    def _serve_label_toggle(self):
+        global _label_enabled
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        val = params.get("v")
+        with _label_lock:
+            if val == "1":
+                _label_enabled = True
+            elif val == "0":
+                _label_enabled = False
+            else:
+                _label_enabled = not _label_enabled
+            state = _label_enabled
+        self._json_response(json.dumps({"enabled": state}).encode())
+
+    def _serve_label_queue(self):
+        with _label_lock:
+            pub = []
+            for c in _label_pending:
+                cls = (_label_class_names[c["class_idx"]]
+                       if 0 <= c["class_idx"] < len(_label_class_names)
+                       else f"class_{c['class_idx']}")
+                pub.append({
+                    "id": c["id"],
+                    "bbox": c["bbox"],
+                    "img_w": c["img_w"],
+                    "img_h": c["img_h"],
+                    "class_idx": c["class_idx"],
+                    "class_name": cls,
+                    "track_id": c["track_id"],
+                    "image_url": f"/label/image/{c['id']}",
+                })
+        self._json_response(json.dumps({"queue": pub, "count": len(pub)}).encode())
+
+    def _serve_label_image(self, candidate_id: str):
+        candidate_id = os.path.basename(candidate_id)   # safety
+        with _label_lock:
+            cand = next((c for c in _label_pending if c["id"] == candidate_id), None)
+        if cand is None or not os.path.exists(cand["frame_path"]):
+            self.send_response(404)
+            self.end_headers()
+            return
+        with open(cand["frame_path"], "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_label_decision(self):
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        cid = unquote(params.get("id", ""))
+        keep = params.get("keep") == "1"
+        if not cid:
+            self._json_response(b'{"error":"missing id"}')
+            return
+        result = _label_decide(cid, keep)
+        self._json_response(json.dumps(result).encode())
 
     def _serve_screenshot(self):
         with _lock:
@@ -440,6 +692,38 @@ body{
   overflow:hidden;
 }
 
+/* ── Label panel (Training tab) ── */
+#label-panel{
+  grid-area:main;
+  display:flex;flex-direction:column;gap:10px;padding:14px;
+  overflow:auto;
+}
+#label-controls{
+  display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+}
+#label-toggle{
+  background:linear-gradient(135deg,var(--accent) 0%,#d4a017 100%);color:#111;border:none;
+  padding:8px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;
+}
+#label-toggle.on{background:linear-gradient(135deg,var(--danger) 0%,#c73e4a 100%);color:#fff}
+#label-canvas-wrap{
+  flex:1;min-height:300px;
+  background:#000;border:1px solid var(--border);border-radius:10px;
+  display:flex;align-items:center;justify-content:center;overflow:hidden;
+}
+#label-canvas{max-width:100%;max-height:70vh}
+#label-empty{color:var(--dim);font-size:13px;padding:30px;text-align:center}
+#label-actions{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+#label-actions .accept{
+  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;border:none;
+  padding:10px 22px;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;
+}
+#label-actions .reject{
+  background:linear-gradient(135deg,var(--danger) 0%,#c73e4a 100%);color:#fff;border:none;
+  padding:10px 22px;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;
+}
+#label-actions .accept:hover, #label-actions .reject:hover, #label-toggle:hover{opacity:0.88}
+
 /* ── Feed ── */
 #feed-wrap{
   position:relative;
@@ -537,8 +821,8 @@ body{
 .conf-title-row .card-title{margin-bottom:0}
 #conf-val{font-family:var(--mono);font-size:12px;color:var(--accent)}
 .conf-row{display:flex;align-items:center;gap:6px}
-/* Resolution dropdown */
-#res-select{
+/* Resolution + Model dropdowns */
+#res-select, #model-select{
   width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);
   background:linear-gradient(135deg,#1a2130 0%,#141c26 100%);color:var(--text);
   font-size:12px;font-family:var(--font);cursor:pointer;outline:none;
@@ -651,9 +935,12 @@ body{
   <div class="logo"><span class="logo-icon">🐟</span>AquaScope</div>
 
   <div class="nav-section">Monitor</div>
-  <div class="nav-item active"><span class="nav-icon">📹</span>Live Feed</div>
+  <div class="nav-item active" id="nav-live" onclick="switchTab('live')"><span class="nav-icon">📹</span>Live Feed</div>
   <div class="nav-item"><span class="nav-icon">📊</span>Analytics</div>
   <div class="nav-item"><span class="nav-icon">🖼️</span>Snapshots</div>
+
+  <div class="nav-section">Training</div>
+  <div class="nav-item" id="nav-train" onclick="switchTab('train')"><span class="nav-icon">🏷️</span>Label Fish</div>
 
   <div class="nav-section">System</div>
   <div class="nav-item"><span class="nav-icon">⚙️</span>Settings</div>
@@ -739,6 +1026,13 @@ body{
       </select>
     </div>
 
+    <div class="card">
+      <div class="card-title">Model</div>
+      <select id="model-select" onchange="setModel(this.value)">
+        <option>loading…</option>
+      </select>
+    </div>
+
     <div class="card" id="conf-card">
       <div class="conf-title-row">
         <div class="card-title">Confidence</div>
@@ -752,6 +1046,38 @@ body{
     <button id="enhance-btn" class="on" onclick="toggleEnhance()">✨ Enhance: ON</button>
     <button id="hat-btn" onclick="toggleHat()">🎩 Party Hats: OFF</button>
     <button id="reset-btn" onclick="doReset()">↺ Reset Trails</button>
+  </div>
+</main>
+
+<!-- Label panel (Training tab) -->
+<main id="label-panel" style="display:none">
+  <div class="card" id="label-controls">
+    <button id="label-toggle" onclick="toggleLabeling()">▶ Start labeling</button>
+    <div class="stat-row" style="margin:0">
+      <span class="stat-lbl">Status</span>
+      <span class="stat-val" id="label-state">off</span>
+    </div>
+    <div class="stat-row" style="margin:0">
+      <span class="stat-lbl">Queued</span>
+      <span class="stat-val" id="label-count">0</span>
+    </div>
+    <div class="stat-row" style="margin:0">
+      <span class="stat-lbl">Track</span>
+      <span class="stat-val" id="label-track">—</span>
+    </div>
+    <div class="stat-row" style="margin:0">
+      <span class="stat-lbl">Class</span>
+      <span class="stat-val" id="label-class">—</span>
+    </div>
+  </div>
+  <div id="label-canvas-wrap">
+    <canvas id="label-canvas" style="display:none"></canvas>
+    <div id="label-empty">No candidates yet — press <b>▶ Start labeling</b> and let the tracker collect detections.</div>
+  </div>
+  <div class="card" id="label-actions">
+    <button class="reject" onclick="labelDecision(0)">✗ Not a fish</button>
+    <button class="accept" onclick="labelDecision(1)">✓ Yes, fish</button>
+    <span class="stat-lbl" style="margin-left:auto">Shortcuts: <span class="stat-val">y</span> / <span class="stat-val">n</span></span>
   </div>
 </main>
 
@@ -796,6 +1122,35 @@ function toggleTrails() {
 // ── Resolution dropdown ──────────────────────────────────
 function setResolution(val) {
   fetch('/resolution?v=' + encodeURIComponent(val));
+}
+
+// ── Model dropdown ───────────────────────────────────────
+function setModel(val) {
+  fetch('/model?v=' + encodeURIComponent(val));
+}
+
+function loadModels() {
+  fetch('/models').then(r => r.json()).then(d => {
+    const sel = document.getElementById('model-select');
+    sel.innerHTML = '';
+    const models = d.models || [];
+    if (!models.length) {
+      const opt = document.createElement('option');
+      opt.textContent = '(no models found)';
+      opt.disabled = true;
+      sel.appendChild(opt);
+      return;
+    }
+    const currentBase = (d.current || '').split('/').pop();
+    models.forEach(m => {
+      const base = m.split('/').pop();
+      const opt = document.createElement('option');
+      opt.value = base;
+      opt.textContent = m;
+      if (base === currentBase) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  });
 }
 
 // ── Confidence slider ────────────────────────────────────
@@ -989,6 +1344,108 @@ setInterval(tick, 1000);
 setInterval(loadSnapshots, 2000);
 tick();
 loadSnapshots();
+loadModels();
+
+// ── Training / Label tab ─────────────────────────────────
+let labelCurrent = null;
+let labelTabActive = false;
+
+function switchTab(tab) {
+  labelTabActive = (tab === 'train');
+  document.getElementById('main').style.display      = labelTabActive ? 'none' : '';
+  document.getElementById('label-panel').style.display = labelTabActive ? 'flex' : 'none';
+  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+  const navId = labelTabActive ? 'nav-train' : 'nav-live';
+  const el = document.getElementById(navId);
+  if (el) el.classList.add('active');
+  if (labelTabActive) labelTick();
+}
+
+function toggleLabeling() {
+  fetch('/label/toggle').then(r => r.json()).then(d => {
+    const btn = document.getElementById('label-toggle');
+    btn.textContent = d.enabled ? '⏸ Stop labeling' : '▶ Start labeling';
+    btn.classList.toggle('on', d.enabled);
+    document.getElementById('label-state').textContent = d.enabled ? 'on' : 'off';
+  });
+}
+
+function labelTick() {
+  fetch('/label/queue').then(r => r.json()).then(d => {
+    document.getElementById('label-count').textContent = d.count;
+    if (!d.count) {
+      labelCurrent = null;
+      document.getElementById('label-empty').style.display = '';
+      document.getElementById('label-canvas').style.display = 'none';
+      document.getElementById('label-track').textContent = '—';
+      document.getElementById('label-class').textContent = '—';
+      return;
+    }
+    const next = d.queue[0];
+    if (labelCurrent && labelCurrent.id === next.id) return;   // already showing
+    labelCurrent = next;
+    document.getElementById('label-empty').style.display = 'none';
+    document.getElementById('label-canvas').style.display = '';
+    document.getElementById('label-class').textContent = next.class_name;
+    document.getElementById('label-track').textContent = '#' + next.track_id;
+    drawLabelCanvas(next);
+  });
+}
+
+function drawLabelCanvas(c) {
+  const cv = document.getElementById('label-canvas');
+  const ctx = cv.getContext('2d');
+  const img = new Image();
+  img.onload = () => {
+    cv.width = c.img_w;
+    cv.height = c.img_h;
+    ctx.drawImage(img, 0, 0);
+    const [x1, y1, x2, y2] = c.bbox;
+    ctx.lineWidth = Math.max(3, Math.round(c.img_w / 400));
+    ctx.strokeStyle = '#f5c518';
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    // Filled label tag
+    ctx.fillStyle = 'rgba(245,197,24,0.85)';
+    const tag = `${c.class_name}  #${c.track_id}`;
+    ctx.font = `${Math.max(14, Math.round(c.img_w / 60))}px sans-serif`;
+    const m = ctx.measureText(tag);
+    const th = parseInt(ctx.font, 10) + 4;
+    ctx.fillRect(x1, Math.max(0, y1 - th - 2), m.width + 12, th + 2);
+    ctx.fillStyle = '#111';
+    ctx.fillText(tag, x1 + 6, Math.max(th, y1 - 6));
+  };
+  img.src = c.image_url + '?t=' + Date.now();
+}
+
+function labelDecision(keep) {
+  if (!labelCurrent) return;
+  const cid = labelCurrent.id;
+  fetch(`/label/decision?id=${encodeURIComponent(cid)}&keep=${keep}`)
+    .then(r => r.json()).then(() => {
+      labelCurrent = null;
+      labelTick();
+    });
+}
+
+document.addEventListener('keydown', e => {
+  if (!labelTabActive) return;
+  if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
+  if (e.key === 'y' || e.key === 'Y' || e.key === 'ArrowRight') labelDecision(1);
+  if (e.key === 'n' || e.key === 'N' || e.key === 'ArrowLeft')  labelDecision(0);
+});
+
+// Poll the queue while the Training tab is open.
+setInterval(() => { if (labelTabActive) labelTick(); }, 1000);
+
+// Initial label state sync (so the toggle button reflects server-side state on reload).
+fetch('/label/state').then(r => r.json()).then(d => {
+  if (d.enabled) {
+    const btn = document.getElementById('label-toggle');
+    btn.textContent = '⏸ Stop labeling';
+    btn.classList.add('on');
+    document.getElementById('label-state').textContent = 'on';
+  }
+});
 
 // ── 3-minute session limit ──────────────────────────────
 const STREAM_LIMIT_MS = 180000;

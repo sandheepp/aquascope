@@ -23,12 +23,19 @@ from model import load_model, run_inference
 from stream import (
     _RESOLUTIONS,
     enhance_mode_enabled,
+    enqueue_label_candidate,
     get_conf_threshold,
+    get_model_path,
     get_resolution,
     hat_mode_enabled,
+    label_should_capture,
     push_frame,
     push_stats,
     request_reset,
+    set_label_class_names,
+    set_label_output_dir,
+    set_model_path,
+    set_models_dir,
     start_public_tunnel,
     start_stream,
     trails_mode_enabled,
@@ -56,6 +63,17 @@ class FishTracker:
 
         os.makedirs(config["output_dir"], exist_ok=True)
         self.model = load_model(config)
+        self._applied_model_path = config["model_path"]
+        # Tell the dashboard which dir to scan and which model is currently active.
+        models_dir = os.path.dirname(config["model_path"]) or "models"
+        set_models_dir(models_dir)
+        set_model_path(config["model_path"])
+        # Labeling tab wiring (dataset/user_recorded by default).
+        set_label_output_dir(config.get("label_output_dir", "dataset/user_recorded"))
+        try:
+            set_label_class_names(getattr(self.model, "names", None))
+        except Exception:
+            set_label_class_names([])
         self.sv_tracker = sv.ByteTrack()
         self.cap = init_camera(config)
         self.writer = self._init_writer()
@@ -337,6 +355,19 @@ class FishTracker:
                 if request_reset():
                     self._reset()
 
+                desired_model = get_model_path()
+                if desired_model != self._applied_model_path:
+                    print(f"[MODEL] Reloading: {desired_model}")
+                    prev = self._applied_model_path
+                    self.config["model_path"] = desired_model
+                    try:
+                        self.model = load_model(self.config)
+                        self._applied_model_path = desired_model
+                    except Exception as e:
+                        print(f"[MODEL] Reload failed ({e}); reverting to {prev}")
+                        self.config["model_path"] = prev
+                        set_model_path(prev)
+
                 desired_res = get_resolution()
                 if desired_res != self._applied_resolution:
                     w, h = _RESOLUTIONS[desired_res]
@@ -406,6 +437,9 @@ class FishTracker:
         tracked = self.sv_tracker.update_with_detections(detections)
 
         annotated = frame.copy()
+        h, w = frame.shape[:2]
+        encoded_jpeg: bytes | None = None    # lazily encoded if any detection wants labeling
+
         for i in range(len(tracked)):
             x1, y1, x2, y2 = map(int, tracked.xyxy[i])
             track_id = int(tracked.tracker_id[i])
@@ -414,6 +448,18 @@ class FishTracker:
             color = self._color(track_id)
 
             self._update_trail(track_id, (cx, cy))
+
+            # Feed the labeling tab if the user has it open and we haven't queued
+            # this track recently.
+            if label_should_capture(track_id):
+                if encoded_jpeg is None:
+                    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+                    encoded_jpeg = buf.tobytes() if ok else b""
+                if encoded_jpeg:
+                    cls_id = (int(tracked.class_id[i])
+                              if tracked.class_id is not None else 0)
+                    enqueue_label_candidate(encoded_jpeg, (x1, y1, x2, y2),
+                                            w, h, cls_id, track_id)
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2, cv2.LINE_AA)
             label = f"Fish #{track_id} ({det_conf:.0%})"
