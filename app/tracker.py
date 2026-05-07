@@ -24,11 +24,14 @@ from stream import (
     _RESOLUTIONS,
     enhance_mode_enabled,
     get_conf_threshold,
+    get_model_path,
     get_resolution,
     hat_mode_enabled,
     push_frame,
     push_stats,
     request_reset,
+    set_model_path,
+    set_models_dir,
     start_public_tunnel,
     start_stream,
     trails_mode_enabled,
@@ -56,6 +59,11 @@ class FishTracker:
 
         os.makedirs(config["output_dir"], exist_ok=True)
         self.model = load_model(config)
+        self._applied_model_path = config["model_path"]
+        # Tell the dashboard which dir to scan and which model is currently active.
+        models_dir = os.path.dirname(config["model_path"]) or "models"
+        set_models_dir(models_dir)
+        set_model_path(config["model_path"])
         self.sv_tracker = sv.ByteTrack()
         self.cap = init_camera(config)
         self.writer = self._init_writer()
@@ -336,6 +344,19 @@ class FishTracker:
             while True:
                 if request_reset():
                     self._reset()
+
+                desired_model = get_model_path()
+                if desired_model != self._applied_model_path:
+                    print(f"[MODEL] Reloading: {desired_model}")
+                    prev = self._applied_model_path
+                    self.config["model_path"] = desired_model
+                    try:
+                        self.model = load_model(self.config)
+                        self._applied_model_path = desired_model
+                    except Exception as e:
+                        print(f"[MODEL] Reload failed ({e}); reverting to {prev}")
+                        self.config["model_path"] = prev
+                        set_model_path(prev)
 
                 desired_res = get_resolution()
                 if desired_res != self._applied_resolution:

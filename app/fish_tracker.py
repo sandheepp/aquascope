@@ -4,11 +4,14 @@ AquaScope — CLI entry point.
 
 Jetson Orin Nano + Logitech C920 + YOLOv8s + supervision ByteTrack.
 
+Streaming is on by default; pass --no-stream to disable.
+
 Usage:
-    python3 fish_tracker.py                                    # local display
-    python3 fish_tracker.py --no-display --stream              # headless + browser stream
-    python3 fish_tracker.py --no-display --stream --public     # + public URL
-    python3 fish_tracker.py --model yolov8s.engine             # TensorRT engine
+    python3 fish_tracker.py                                    # local display + browser stream
+    python3 fish_tracker.py --no-display                       # headless + browser stream
+    python3 fish_tracker.py --no-display --public              # + public URL
+    python3 fish_tracker.py --no-stream                        # local display only, no MJPEG
+    python3 fish_tracker.py --model models/best.pt             # override default models/best.engine
     python3 fish_tracker.py --sahi                             # sliced inference (lower FPS)
     python3 fish_tracker.py --sahi --resolution 720p           # SAHI at 4 tiles (~2× faster)
     python3 fish_tracker.py --exposure -6                      # manual exposure
@@ -32,14 +35,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--camera", type=int, default=0, help="Camera device ID (default 0)")
     p.add_argument("--resolution", default="720p", choices=["480p", "720p", "1080p"],
                    help="Capture resolution (default 1080p)")
-    p.add_argument("--model", default="yolov8s.pt", help="YOLOv8 model path (.pt or .engine)")
+    p.add_argument("--model", default="models/best.engine",
+                   help="YOLOv8 model path (.pt or .engine). Default: models/best.engine")
     p.add_argument("--conf", type=float, default=0.35, help="Detection confidence threshold")
     p.add_argument("--imgsz", type=int, default=640, help="Inference image size")
     p.add_argument("--exposure", type=int, default=None,
                    help="Manual V4L2 exposure (e.g. -6). Omit for auto.")
     p.add_argument("--record", action="store_true", help="Record annotated video to file")
     p.add_argument("--no-display", action="store_true", help="Headless mode (no GUI window)")
-    p.add_argument("--stream", action="store_true", help="Serve MJPEG stream in browser")
+    p.add_argument("--no-stream", action="store_true",
+                   help="Disable browser MJPEG stream (on by default)")
     p.add_argument("--stream-port", type=int, default=8080, help="MJPEG server port (default 8080)")
     p.add_argument("--public", action="store_true",
                    help="Expose stream publicly via Cloudflare tunnel")
@@ -66,7 +71,7 @@ def build_config(args: argparse.Namespace) -> dict:
     config["exposure"] = args.exposure
     config["record"] = args.record
     config["display"] = not args.no_display
-    config["stream"] = args.stream
+    config["stream"] = not args.no_stream
     config["stream_port"] = args.stream_port
     config["public"] = args.public
     config["sahi"] = args.sahi

@@ -240,6 +240,67 @@ Screenshots taken via the dashboard are saved to `fish_logs/screenshots/`.
 - Increase `track_buffer` in `app/bytetrack.yaml`
 - A fine-tuned model produces more stable detections
 
+## Roadmap / TODO
+
+### In-dashboard labeling tab (planned)
+
+Goal: turn the live tracker into its own data-collection loop, so the model can be
+fine-tuned on the user's actual aquarium without leaving the dashboard.
+
+1. **Add the sidebar tab.** Add a new tab (e.g. **Training** / **Label**)
+   alongside Live Feed, Analytics, Snapshots, Settings in
+   [app/stream.py](app/stream.py).
+2. **Capture detections to a queue.** When the tab is opened (or a
+   "Start labeling" button is pressed), the tracker starts saving cropped
+   screenshots of every detection — one image per detected bounding box — into
+   a queue.
+3. **Tick / cross triage UI.** The tab shows the queued crops one at a time:
+    - **Tick** → it's a fish (or whichever class). Persist the bounding box as
+      a YOLO-format label.
+    - **Cross** → it's a false positive. Discard, but optionally persist as a
+      negative example.
+    - Optional: keyboard shortcuts (`y` / `n` / `←` / `→`) for fast triage.
+4. **Persist approved samples** to:
+    - `dataset/user_recorded/images/<timestamp>.jpg` — the full annotated frame
+      (or just the crop, TBD).
+    - `dataset/user_recorded/labels/<timestamp>.txt` — YOLO label lines
+      (`class_idx cx cy w h` normalized to image size).
+5. **Backend wiring** ([app/tracker.py](app/tracker.py) /
+   [app/stream.py](app/stream.py)):
+    - New endpoints: `/label/queue` (GET pending crops), `/label/decision`
+      (POST accept/reject for a given crop id).
+    - Keep a small ring buffer of recent `(frame, detections)` pairs so labels
+      are bound to the actual frame they came from, not the latest one.
+6. **Wire `dataset/user_recorded/` into the training pipeline.** Update
+   [training/train_gpu.py](training/train_gpu.py) so it can merge the
+   user-labeled set alongside the existing Roboflow + DINO-distillation sets:
+    - **New CLI flag:** `--user-data PATH` (default: `dataset/user_recorded`).
+    - **New CLI flag:** `--no-user` to skip the user set when not desired.
+    - Extend `build_merged_yaml()` to accept a third source and concatenate
+      `<user_data>/images/` into the `train:` list (validation should still use
+      the ground-truth Roboflow `valid/` split — user labels are noisy).
+    - Skip the user set silently if `<user_data>/images/` is empty or missing
+      so the script still works on a fresh clone.
+    - Example invocations once shipped:
+
+      ```bash
+      # Default — merges Roboflow + distillation + user_recorded if present
+      python training/train_gpu.py
+
+      # Train only on user-labeled data (e.g. for fast iteration)
+      python training/train_gpu.py --no-merge --no-distill \
+          --user-data dataset/user_recorded
+
+      # Custom user-data path
+      python training/train_gpu.py --user-data /path/to/my_labels
+      ```
+    - Mirror the same flags in [training/mac_train.py](training/mac_train.py)
+      for the MPS path.
+
+This closes the loop: detect → user verifies → retrain (with `--user-data`
+auto-included) → deploy a better model via the existing Model dropdown — all
+without leaving the browser.
+
 ## License
 
 This project is provided as-is for personal/educational use.

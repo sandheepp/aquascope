@@ -18,7 +18,7 @@ DEFAULT_CONFIG: dict = {
     "exposure": None,                # None = auto; int = manual V4L2 value (e.g. -6)
     "record": False,
     "record_path": "fish_recording.mp4",
-    "stream": False,
+    "stream": True,
     "stream_port": 8080,
     "stream_quality": 75,            # JPEG quality 1-100; 75 = fast encode with good quality
     "stream_fps": 20,                # Max stream push rate (fps); caps encode overhead

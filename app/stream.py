@@ -8,6 +8,8 @@ Endpoints:
   /reset      — reset tracker trails
   /screenshot — save current frame, return JSON {filename}
   /screenshots/<file> — serve saved screenshot
+  /models     — JSON list of model files in the models dir
+  /model      — set the active model (?v=<basename>)
 """
 
 import json
@@ -19,6 +21,7 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
+from urllib.parse import unquote
 
 # ── Shared state ──────────────────────────────────────────
 _frame: bytes = b""
@@ -44,6 +47,11 @@ _conf_lock = threading.Lock()
 
 _resolution = "1080p"
 _resolution_lock = threading.Lock()
+
+_models_dir: str = "models"
+_model_path: str = "models/best.engine"
+_model_lock = threading.Lock()
+_MODEL_EXTS = (".pt", ".engine", ".onnx")
 
 _RESOLUTIONS = {
     "480p":  (854,  480),
@@ -75,6 +83,22 @@ def get_conf_threshold() -> float:
 def get_resolution() -> str:
     with _resolution_lock:
         return _resolution
+
+
+def set_models_dir(path: str) -> None:
+    global _models_dir
+    _models_dir = path
+
+
+def set_model_path(path: str) -> None:
+    global _model_path
+    with _model_lock:
+        _model_path = path
+
+
+def get_model_path() -> str:
+    with _model_lock:
+        return _model_path
 
 _screenshots: list[dict] = []   # [{filename, ts, label}]
 _screenshots_lock = threading.Lock()
@@ -132,6 +156,10 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_conf()
         elif p == "/resolution":
             self._serve_resolution()
+        elif p == "/models":
+            self._serve_models_list()
+        elif p == "/model":
+            self._serve_model_select()
         elif p == "/screenshot":
             self._serve_screenshot()
         elif p == "/screenshots":
@@ -209,6 +237,32 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         with _conf_lock:
             _conf_threshold = val
         self._json_response(json.dumps({"conf": round(val, 2)}).encode())
+
+    def _serve_models_list(self):
+        models_dir = _models_dir
+        models: list[str] = []
+        if os.path.isdir(models_dir):
+            for name in sorted(os.listdir(models_dir)):
+                if name.endswith(_MODEL_EXTS):
+                    models.append(os.path.join(models_dir, name))
+        body = json.dumps({"models": models, "current": get_model_path()}).encode()
+        self._json_response(body)
+
+    def _serve_model_select(self):
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        raw = unquote(params.get("v", ""))
+        # Reject path traversal: only the basename is honored, resolved under _models_dir.
+        name = os.path.basename(raw)
+        if not name or not name.endswith(_MODEL_EXTS):
+            self._json_response(b'{"error":"invalid model"}')
+            return
+        full = os.path.join(_models_dir, name)
+        if not os.path.isfile(full):
+            self._json_response(json.dumps({"error": "not found", "path": full}).encode())
+            return
+        set_model_path(full)
+        self._json_response(json.dumps({"model": full}).encode())
 
     def _serve_screenshot(self):
         with _lock:
@@ -537,8 +591,8 @@ body{
 .conf-title-row .card-title{margin-bottom:0}
 #conf-val{font-family:var(--mono);font-size:12px;color:var(--accent)}
 .conf-row{display:flex;align-items:center;gap:6px}
-/* Resolution dropdown */
-#res-select{
+/* Resolution + Model dropdowns */
+#res-select, #model-select{
   width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);
   background:linear-gradient(135deg,#1a2130 0%,#141c26 100%);color:var(--text);
   font-size:12px;font-family:var(--font);cursor:pointer;outline:none;
@@ -739,6 +793,13 @@ body{
       </select>
     </div>
 
+    <div class="card">
+      <div class="card-title">Model</div>
+      <select id="model-select" onchange="setModel(this.value)">
+        <option>loading…</option>
+      </select>
+    </div>
+
     <div class="card" id="conf-card">
       <div class="conf-title-row">
         <div class="card-title">Confidence</div>
@@ -796,6 +857,35 @@ function toggleTrails() {
 // ── Resolution dropdown ──────────────────────────────────
 function setResolution(val) {
   fetch('/resolution?v=' + encodeURIComponent(val));
+}
+
+// ── Model dropdown ───────────────────────────────────────
+function setModel(val) {
+  fetch('/model?v=' + encodeURIComponent(val));
+}
+
+function loadModels() {
+  fetch('/models').then(r => r.json()).then(d => {
+    const sel = document.getElementById('model-select');
+    sel.innerHTML = '';
+    const models = d.models || [];
+    if (!models.length) {
+      const opt = document.createElement('option');
+      opt.textContent = '(no models found)';
+      opt.disabled = true;
+      sel.appendChild(opt);
+      return;
+    }
+    const currentBase = (d.current || '').split('/').pop();
+    models.forEach(m => {
+      const base = m.split('/').pop();
+      const opt = document.createElement('option');
+      opt.value = base;
+      opt.textContent = m;
+      if (base === currentBase) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  });
 }
 
 // ── Confidence slider ────────────────────────────────────
@@ -989,6 +1079,7 @@ setInterval(tick, 1000);
 setInterval(loadSnapshots, 2000);
 tick();
 loadSnapshots();
+loadModels();
 
 // ── 3-minute session limit ──────────────────────────────
 const STREAM_LIMIT_MS = 180000;
