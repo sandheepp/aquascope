@@ -2079,6 +2079,15 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 # ── Public API ────────────────────────────────────────────
 def start_stream(port: int) -> None:
+    # Clear stale training artifacts from a previous dashboard process so the
+    # page loads straight into inference instead of replaying a stale modal.
+    # (If the prior run was killed mid-training, /tmp/aquascope_train_status.json
+    # could still say state=exporting, which would pop the modal on connect.)
+    for path in (_train_status_file, _train_log_file):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
     server = _ThreadingHTTPServer(("0.0.0.0", port), _MJPEGHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
