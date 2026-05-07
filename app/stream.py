@@ -84,6 +84,7 @@ _train_lock = threading.Lock()
 _train_status_file: str = "/tmp/aquascope_train_status.json"
 _train_log_file: str = "/tmp/aquascope_train.log"
 _train_log_fh = None                           # open file handle for the running subprocess
+_train_log_thread = None                       # daemon thread that tees subprocess output
 # Set True when user starts training; cleared when user clicks "Close" on the modal.
 # The tracker keeps inference paused while this is True — so the user controls when
 # inference resumes (via /train/acknowledge), not the subprocess exit.
@@ -327,9 +328,42 @@ def latest_engine_version() -> tuple[int, str | None]:
     return best_n, best_path
 
 
-def start_training() -> dict:
+def _tee_train_output(proc: subprocess.Popen, log_fh) -> None:
+    """Background pump: copy each subprocess output line to BOTH the log file
+    (for /train/log polling) AND the parent's stdout (so the operator sees the
+    same stream in the terminal that launched the dashboard)."""
+    try:
+        for raw in iter(proc.stdout.readline, b""):
+            try:
+                line = raw.decode("utf-8", errors="replace")
+            except Exception:
+                line = repr(raw)
+            try:
+                log_fh.write(line)
+                log_fh.flush()
+            except (OSError, ValueError):
+                pass
+            try:
+                sys.stdout.write("[TRAIN] " + line)
+                sys.stdout.flush()
+            except (OSError, ValueError):
+                pass
+    finally:
+        try:
+            proc.stdout.close()
+        except (OSError, ValueError):
+            pass
+        try:
+            log_fh.close()
+        except (OSError, ValueError):
+            pass
+
+
+def start_training(epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
     """Spawn the training subprocess if not already running."""
-    global _train_proc, _train_log_fh, _train_unacked
+    global _train_proc, _train_log_fh, _train_log_thread, _train_unacked
+    if epochs not in _TRAIN_EPOCH_CHOICES:
+        return {"error": f"epochs must be one of {list(_TRAIN_EPOCH_CHOICES)}"}
     with _train_lock:
         if _train_proc is not None and _train_proc.poll() is None:
             return {"error": "training already in progress"}
@@ -340,8 +374,6 @@ def start_training() -> dict:
                 os.remove(path)
             except OSError:
                 pass
-        # Open log file for the subprocess to write into. We unbuffer (line-buffered text mode)
-        # so the dashboard can tail it in near-real-time.
         try:
             _train_log_fh = open(_train_log_file, "w", buffering=1)
         except OSError as e:
@@ -349,16 +381,17 @@ def start_training() -> dict:
         cmd = [
             sys.executable, "-u", "training/train_jetson.py",
             "--status-file", _train_status_file,
-            "--epochs", str(_TRAIN_DEFAULT_EPOCHS),
+            "--epochs", str(epochs),
             "--batch",  str(_TRAIN_DEFAULT_BATCH),
         ]
         try:
             _train_proc = subprocess.Popen(  # noqa: S603
                 cmd,
-                stdout=_train_log_fh,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 cwd=os.getcwd(),
                 env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                bufsize=0,
             )
         except OSError as e:
             try:
@@ -367,6 +400,12 @@ def start_training() -> dict:
                 pass
             _train_log_fh = None
             return {"error": str(e)}
+        _train_log_thread = threading.Thread(
+            target=_tee_train_output,
+            args=(_train_proc, _train_log_fh),
+            daemon=True,
+        )
+        _train_log_thread.start()
         return {"started": True, "pid": _train_proc.pid}
 
 
@@ -999,8 +1038,19 @@ body{
 }
 #train-title{font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px}
 #train-state-line{color:var(--text);font-size:14px;margin-bottom:14px}
-#train-bar-wrap{background:#0d141d;border:1px solid var(--border);border-radius:4px;height:10px;overflow:hidden;margin-bottom:14px}
+#train-bar-wrap{background:#0d141d;border:1px solid var(--border);border-radius:4px;height:10px;overflow:hidden;margin-bottom:14px;position:relative}
 #train-bar{height:100%;width:0%;background:linear-gradient(90deg,#7c4dff,#00d4aa);transition:width 0.4s}
+/* Indeterminate animation used during the TensorRT export phase (no % known) */
+#train-bar-wrap.indeterminate #train-bar{
+  width:100% !important;
+  background:linear-gradient(90deg,
+    rgba(124,77,255,0.15) 0%, rgba(124,77,255,0.85) 25%,
+    rgba(0,212,170,0.85) 50%, rgba(124,77,255,0.85) 75%,
+    rgba(124,77,255,0.15) 100%);
+  background-size:200% 100%;
+  animation:train-stripes 1.4s linear infinite;
+}
+@keyframes train-stripes{0%{background-position:200% 0}100%{background-position:-200% 0}}
 #train-info{display:grid;grid-template-columns:1fr 1fr;gap:6px 18px;font-size:12px;margin-bottom:14px}
 #train-info .stat-val{font-family:var(--mono)}
 #train-msg{color:var(--dim);font-size:11px;margin-bottom:12px}
@@ -1888,13 +1938,21 @@ function updateTrainModal(s) {
   const cur = s.current_epoch || 0;
   const tot = s.total_epochs || 0;
   const pct = (tot > 0) ? Math.round(100 * cur / tot) : 0;
-  document.getElementById('train-bar').style.width = pct + '%';
-  document.getElementById('train-state-line').textContent =
-    (s.message || s.state || '…') + (tot ? `   (${pct}%)` : '');
+  // The TensorRT export runs AFTER all epochs and has no progress signal.
+  // Show an indeterminate animated bar so the operator can tell it's still
+  // working (the static 100% bar made it look frozen).
+  const wrap = document.getElementById('train-bar-wrap');
+  const exporting = (s.state === 'exporting');
+  if (wrap) wrap.classList.toggle('indeterminate', exporting);
+  if (!exporting) document.getElementById('train-bar').style.width = pct + '%';
+  const stateLine = exporting
+    ? ((s.message || 'Exporting TensorRT engine') + ' — this can take ~2–3 min on Orin Nano…')
+    : ((s.message || s.state || '…') + (tot ? `   (${pct}%)` : ''));
+  document.getElementById('train-state-line').textContent = stateLine;
   document.getElementById('train-epoch').textContent = cur || '—';
   document.getElementById('train-total').textContent = tot || '—';
   document.getElementById('train-elapsed').textContent = fmtSec(s.elapsed_sec);
-  document.getElementById('train-eta').textContent = fmtSec(s.eta_sec);
+  document.getElementById('train-eta').textContent = exporting ? '—' : fmtSec(s.eta_sec);
   document.getElementById('train-version').textContent = s.version != null ? ('v' + s.version) : '—';
 
   // Pause / resume the live feed view based on training state.
@@ -1902,17 +1960,13 @@ function updateTrainModal(s) {
   setFeedDisabled(running);
 
   if (s.state === 'done') {
+    const engineName = (s.engine_path || s.latest_engine || '').split('/').pop() || 'engine';
     document.getElementById('train-msg').innerHTML =
-      `✓ Saved <b>${(s.engine_path || '').split('/').pop() || 'engine'}</b>. ` +
+      `✓ Saved <b>${engineName}</b>. ` +
       `Click <b>Close</b> to resume inference with the new model.`;
     document.getElementById('train-cancel').style.display = 'none';
     document.getElementById('train-close').style.display = '';
     if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
-    // Auto-switch the active model to the new versioned engine.
-    if (s.latest_engine) {
-      const base = s.latest_engine.split('/').pop();
-      fetch('/model?v=' + encodeURIComponent(base)).finally(() => loadModels());
-    }
   } else if (s.state === 'failed') {
     document.getElementById('train-msg').textContent =
       '✗ Training failed: ' + (s.message || 'unknown error');
