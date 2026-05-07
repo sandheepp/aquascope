@@ -90,7 +90,8 @@ _train_log_thread = None                       # daemon thread that tees subproc
 # inference resumes (via /train/acknowledge), not the subprocess exit.
 _train_unacked: bool = False
 _TRAIN_MIN_LABELS: int = 100                   # button stays disabled below this
-_TRAIN_DEFAULT_EPOCHS: int = 30
+_TRAIN_DEFAULT_EPOCHS: int = 5
+_TRAIN_EPOCH_CHOICES: tuple[int, ...] = (5, 10, 15, 20, 30, 50)
 _TRAIN_DEFAULT_BATCH: int = 2                  # Orin Nano unified-memory friendly
 _TRAIN_LOG_TAIL_BYTES: int = 16384             # how much of the tail /train/log returns
 # Wall-clock anchor for the elapsed-timer the dashboard shows. The subprocess
@@ -385,6 +386,8 @@ def start_training(epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
     """Spawn the training subprocess if not already running."""
     global _train_proc, _train_log_fh, _train_log_thread, _train_unacked
     global _train_started_at, _train_label_count_at_start, _train_epochs_used
+    if epochs not in _TRAIN_EPOCH_CHOICES:
+        return {"error": f"epochs must be one of {list(_TRAIN_EPOCH_CHOICES)}"}
     with _train_lock:
         if _train_proc is not None and _train_proc.poll() is None:
             return {"error": "training already in progress"}
@@ -759,13 +762,27 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
 
     # ── Training tab handlers ─────────────────────────────
 
+    def _parse_epochs(self) -> int:
+        """Read ?epochs=N from the query string, snapping to the allowed choices."""
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        try:
+            n = int(params.get("epochs", _TRAIN_DEFAULT_EPOCHS))
+        except ValueError:
+            n = _TRAIN_DEFAULT_EPOCHS
+        return n if n in _TRAIN_EPOCH_CHOICES else _TRAIN_DEFAULT_EPOCHS
+
     def _serve_train_labels(self):
         count = count_user_labels()
+        epochs = self._parse_epochs()
         body = json.dumps({
             "count": count,
             "min_required": _TRAIN_MIN_LABELS,
             "ready": count >= _TRAIN_MIN_LABELS,
-            "estimate": estimate_training_minutes(count),
+            "epochs": epochs,
+            "epoch_choices": list(_TRAIN_EPOCH_CHOICES),
+            "default_epochs": _TRAIN_DEFAULT_EPOCHS,
+            "estimate": estimate_training_minutes(count, epochs),
         }).encode()
         self._json_response(body)
 
@@ -778,7 +795,8 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
                 "min_required": _TRAIN_MIN_LABELS,
             }).encode())
             return
-        self._json_response(json.dumps(start_training()).encode())
+        epochs = self._parse_epochs()
+        self._json_response(json.dumps(start_training(epochs=epochs)).encode())
 
     def _serve_train_status(self):
         status = get_train_status()
@@ -1072,11 +1090,17 @@ body{
 }
 #label-actions .accept:hover, #label-actions .reject:hover, #label-toggle:hover{opacity:0.88}
 
-/* ── Train button ── */
+/* ── Train button + epochs dropdown ── */
+#train-controls{display:flex;align-items:center;gap:8px;margin-left:auto}
+#train-epochs{
+  background:#1a2130;color:var(--fg);border:1px solid var(--border);
+  padding:6px 8px;border-radius:6px;font-size:12px;cursor:pointer;
+}
+#train-epochs:disabled{opacity:0.55;cursor:not-allowed}
+#train-eta-hint{color:var(--dim);font-size:11px;white-space:nowrap}
 #train-btn{
   background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);color:#fff;border:none;
   padding:8px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;
-  margin-left:auto;
 }
 #train-btn:disabled{
   background:linear-gradient(135deg,#3a3a4a 0%,#2a2a35 100%);color:#666;cursor:not-allowed;
@@ -1500,7 +1524,18 @@ body{
       <span class="stat-lbl">Class</span>
       <span class="stat-val" id="label-class">—</span>
     </div>
-    <button id="train-btn" disabled onclick="confirmTraining()">🧠 Train model</button>
+    <div id="train-controls">
+      <select id="train-epochs" onchange="onEpochsChange()" title="Number of training epochs">
+        <option value="5" selected>5 epochs</option>
+        <option value="10">10 epochs</option>
+        <option value="15">15 epochs</option>
+        <option value="20">20 epochs</option>
+        <option value="30">30 epochs</option>
+        <option value="50">50 epochs</option>
+      </select>
+      <span id="train-eta-hint">—</span>
+      <button id="train-btn" disabled onclick="confirmTraining()">🧠 Train model</button>
+    </div>
   </div>
   <div id="label-canvas-wrap">
     <canvas id="label-canvas" style="display:none"></canvas>
@@ -1904,15 +1939,25 @@ fetch('/label/state').then(r => r.json()).then(d => {
 
 // ── Training: label count + Train button ─────────────────
 let trainEstimate = null;
+function selectedEpochs() {
+  const sel = document.getElementById('train-epochs');
+  return sel ? parseInt(sel.value, 10) : 5;
+}
 function refreshTrainLabels() {
-  fetch('/train/labels').then(r => r.json()).then(d => {
+  const ep = selectedEpochs();
+  fetch('/train/labels?epochs=' + ep).then(r => r.json()).then(d => {
     document.getElementById('label-saved').textContent =
       d.count + '/' + d.min_required;
     const btn = document.getElementById('train-btn');
     btn.disabled = !d.ready || trainModalOpen;
     trainEstimate = d.estimate;
+    const hint = document.getElementById('train-eta-hint');
+    if (hint && d.estimate) {
+      hint.textContent = `~${d.estimate.low_min}–${d.estimate.high_min} min`;
+    }
   }).catch(() => {});
 }
+function onEpochsChange() { refreshTrainLabels(); }
 setInterval(refreshTrainLabels, 3000);
 refreshTrainLabels();
 
@@ -1930,15 +1975,16 @@ function fmtSec(s) {
 function confirmTraining() {
   if (!trainEstimate) return;
   const e = trainEstimate;
+  const ep = selectedEpochs();
   const ok = window.confirm(
     `Train a new model on your labeled data?\n\n` +
-    `• Estimated time: ~${e.low_min}–${e.high_min} minutes (${e.epochs} epochs)\n` +
+    `• Estimated time: ~${e.low_min}–${e.high_min} minutes (${ep} epochs)\n` +
     `• Inference will pause while the GPU is in use\n` +
     `• On success a new models/best.engine_v<N> appears in the Model dropdown\n\n` +
     `Continue?`
   );
   if (!ok) return;
-  fetch('/train/start').then(r => r.json()).then(d => {
+  fetch('/train/start?epochs=' + ep).then(r => r.json()).then(d => {
     if (d.error) { alert('Could not start training: ' + d.error); return; }
     openTrainModal();
     startTrainPolling();
@@ -1953,9 +1999,11 @@ function openTrainModal() {
   cancelBtn.disabled = false;
   cancelBtn.textContent = 'Cancel';
   document.getElementById('train-close').style.display = 'none';
-  // Disable model dropdown + train button
+  // Disable model dropdown, epochs dropdown, and train button
   const ms = document.getElementById('model-select');
   if (ms) ms.disabled = true;
+  const es = document.getElementById('train-epochs');
+  if (es) es.disabled = true;
   document.getElementById('train-btn').disabled = true;
 }
 
@@ -1968,6 +2016,8 @@ function closeTrainModal() {
   if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
   const ms = document.getElementById('model-select');
   if (ms) ms.disabled = false;
+  const es = document.getElementById('train-epochs');
+  if (es) es.disabled = false;
   refreshTrainLabels();
 }
 
