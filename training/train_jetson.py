@@ -65,9 +65,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="AquaScope dashboard-triggered training (Jetson)")
     parser.add_argument("--epochs", type=int, default=30,
                         help="Total epochs (default: 30; reduce for faster iteration)")
-    parser.add_argument("--batch", type=int, default=4,
-                        help="Batch size (default: 4 for 8GB Orin Nano)")
-    parser.add_argument("--imgsz", type=int, default=640)
+    parser.add_argument("--batch", type=int, default=2,
+                        help="Batch size (default: 2 for 8GB Orin Nano unified memory)")
+    parser.add_argument("--imgsz", type=int, default=512,
+                        help="Train resolution (default: 512; lower → less RAM)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="Dataloader workers (default: 0 — avoids RAM duplication on Jetson)")
+    parser.add_argument("--mosaic", type=float, default=0.0,
+                        help="Mosaic aug prob (default: 0.0 on Jetson — mosaic 4x's per-sample RAM)")
+    parser.add_argument("--mixup", type=float, default=0.0,
+                        help="MixUp aug prob (default: 0.0 on Jetson)")
     parser.add_argument("--base-model", default="models/best.pt",
                         help="Starting weights — set to current best.pt to fine-tune")
     parser.add_argument("--name", default="fish_train_jetson",
@@ -143,7 +150,7 @@ def main() -> None:
             imgsz=args.imgsz,
             device=0,
             batch=args.batch,
-            workers=2,                 # Orin Nano: keep dataloader workers low
+            workers=args.workers,
             amp=True,                  # FP16 — saves memory
             cache=False,
             project=str(_PROJECT_ROOT / "runs" / "detect"),
@@ -154,8 +161,10 @@ def main() -> None:
             optimizer="AdamW",
             lr0=0.001,
             lrf=0.01,
-            mosaic=1.0,
-            mixup=0.1,
+            mosaic=args.mosaic,
+            mixup=args.mixup,
+            close_mosaic=0,
+            rect=True,                 # rectangular batching — lower padding RAM
         )
 
         _write_status(args.status_file,

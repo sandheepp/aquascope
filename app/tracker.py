@@ -358,16 +358,17 @@ class FishTracker:
                 if request_reset():
                     self._reset()
 
-                # ── Training subprocess: pause inference, release GPU ─────
+                # ── Training subprocess: pause inference, release GPU + camera ───
                 if train_running():
                     if not self._inference_paused:
-                        print("[INFO] Training started — releasing inference model")
+                        print("[INFO] Training started — releasing inference model + camera")
                         self._release_model()
+                        self._release_camera()
                         self._inference_paused = True
                     self._handle_paused_frame()
                     continue
                 elif self._inference_paused:
-                    print("[INFO] Training finished — reloading inference model")
+                    print("[INFO] Training finished — reloading inference model + camera")
                     self._inference_paused = False
                     # Auto-switch to the newest versioned engine if one was produced.
                     _, latest = latest_engine_version()
@@ -376,6 +377,7 @@ class FishTracker:
                         set_model_path(latest)
                     self.model = load_model(self.config)
                     self._applied_model_path = self.config["model_path"]
+                    self.cap = init_camera(self.config)
 
                 desired_model = get_model_path()
                 if desired_model != self._applied_model_path:
@@ -456,27 +458,41 @@ class FishTracker:
         except Exception:                                   # noqa: BLE001
             pass
 
+    def _release_camera(self) -> None:
+        """Release the capture device + driver buffers so training has more RAM headroom."""
+        if hasattr(self, "cap") and self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:                               # noqa: BLE001
+                pass
+        self.cap = None
+
     def _handle_paused_frame(self) -> None:
-        """While training, just relay a raw camera frame with a small overlay."""
-        raw = self._read_frame()
-        if raw is None:
-            return
-        h, w = raw.shape[:2]
-        overlay = raw.copy()
-        msg = "Training in progress — inference paused"
-        cv2.rectangle(overlay, (0, 0), (w, 36), (10, 10, 10), -1)
-        cv2.addWeighted(overlay, 0.65, raw, 0.35, 0, raw)
-        cv2.putText(raw, msg, (12, 24),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.62, (245, 197, 24), 2, cv2.LINE_AA)
+        """Camera is released during training — push a static placeholder frame."""
+        w, h = _RESOLUTIONS.get(self._applied_resolution, (1280, 720))
+        raw = np.zeros((h, w, 3), dtype=np.uint8)
+        msg1 = "Training in progress"
+        msg2 = "Inference + camera paused to free RAM for training"
+        # Centered messages
+        for i, (text, scale, color) in enumerate(
+            [(msg1, 1.1, (245, 197, 24)), (msg2, 0.55, (180, 180, 180))]
+        ):
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
+            x = (w - tw) // 2
+            y = h // 2 - 10 + i * (th + 18)
+            cv2.putText(raw, text, (x, y),
+                        cv2.FONT_HERSHEY_SIMPLEX, scale, color, 2, cv2.LINE_AA)
         if self.config["stream"]:
             now_t = time.time()
             stream_interval = 1.0 / self.config.get("stream_fps", 20)
             if now_t - self._last_stream_push >= stream_interval:
                 _, jpeg = cv2.imencode(".jpg", raw,
                                        [cv2.IMWRITE_JPEG_QUALITY,
-                                        self.config.get("stream_quality", 75)])
+                                        self.config.get("stream_quality", 60)])
                 push_frame(jpeg.tobytes())
                 self._last_stream_push = now_t
+        # Don't busy-loop the CPU while we're idle.
+        time.sleep(0.2)
         self._handle_display(raw)
 
     # ── Frame I/O ─────────────────────────────────────────

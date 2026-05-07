@@ -19,6 +19,7 @@ Endpoints:
   /train/start       — spawn training subprocess (returns 409 if already running)
   /train/status      — poll training progress (state/epoch/eta/message/version)
   /train/cancel      — terminate the running training subprocess
+  /train/log         — tail of training subprocess stdout/stderr (text)
 """
 
 import json
@@ -80,9 +81,12 @@ _label_last_capture: dict[int, float] = {}     # track_id → last capture ts
 _train_proc = None                             # subprocess.Popen | None
 _train_lock = threading.Lock()
 _train_status_file: str = "/tmp/aquascope_train_status.json"
+_train_log_file: str = "/tmp/aquascope_train.log"
+_train_log_fh = None                           # open file handle for the running subprocess
 _TRAIN_MIN_LABELS: int = 100                   # button stays disabled below this
 _TRAIN_DEFAULT_EPOCHS: int = 30
-_TRAIN_DEFAULT_BATCH: int = 4                  # Orin Nano-friendly
+_TRAIN_DEFAULT_BATCH: int = 2                  # Orin Nano unified-memory friendly
+_TRAIN_LOG_TAIL_BYTES: int = 16384             # how much of the tail /train/log returns
 
 _RESOLUTIONS = {
     "480p":  (854,  480),
@@ -300,17 +304,24 @@ def latest_engine_version() -> tuple[int, str | None]:
 
 def start_training() -> dict:
     """Spawn the training subprocess if not already running."""
-    global _train_proc
+    global _train_proc, _train_log_fh
     with _train_lock:
         if _train_proc is not None and _train_proc.poll() is None:
             return {"error": "training already in progress"}
-        # Clear stale status file so /train/status doesn't show old data.
+        # Clear stale status + log so the dashboard doesn't show old data.
+        for path in (_train_status_file, _train_log_file):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        # Open log file for the subprocess to write into. We unbuffer (line-buffered text mode)
+        # so the dashboard can tail it in near-real-time.
         try:
-            os.remove(_train_status_file)
-        except OSError:
-            pass
+            _train_log_fh = open(_train_log_file, "w", buffering=1)
+        except OSError as e:
+            return {"error": f"could not open log file: {e}"}
         cmd = [
-            sys.executable, "training/train_jetson.py",
+            sys.executable, "-u", "training/train_jetson.py",
             "--status-file", _train_status_file,
             "--epochs", str(_TRAIN_DEFAULT_EPOCHS),
             "--batch",  str(_TRAIN_DEFAULT_BATCH),
@@ -318,17 +329,23 @@ def start_training() -> dict:
         try:
             _train_proc = subprocess.Popen(  # noqa: S603
                 cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+                stdout=_train_log_fh,
+                stderr=subprocess.STDOUT,
                 cwd=os.getcwd(),
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
             )
         except OSError as e:
+            try:
+                _train_log_fh.close()
+            except OSError:
+                pass
+            _train_log_fh = None
             return {"error": str(e)}
         return {"started": True, "pid": _train_proc.pid}
 
 
 def cancel_training() -> dict:
-    global _train_proc
+    global _train_proc, _train_log_fh
     with _train_lock:
         if _train_proc is None or _train_proc.poll() is not None:
             return {"error": "no training in progress"}
@@ -337,7 +354,30 @@ def cancel_training() -> dict:
             _train_proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             _train_proc.kill()
+        if _train_log_fh is not None:
+            try:
+                _train_log_fh.close()
+            except OSError:
+                pass
+            _train_log_fh = None
     return {"cancelled": True}
+
+
+def get_train_log(max_bytes: int = _TRAIN_LOG_TAIL_BYTES) -> str:
+    """Return the tail of the training subprocess log (max_bytes from the end)."""
+    try:
+        size = os.path.getsize(_train_log_file)
+    except OSError:
+        return ""
+    try:
+        with open(_train_log_file, "rb") as f:
+            if size > max_bytes:
+                f.seek(-max_bytes, 2)
+                f.readline()  # discard partial first line
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except OSError:
+        return ""
 
 _screenshots: list[dict] = []   # [{filename, ts, label}]
 _screenshots_lock = threading.Lock()
@@ -417,6 +457,8 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_train_status()
         elif p == "/train/cancel":
             self._serve_train_cancel()
+        elif p == "/train/log":
+            self._serve_train_log()
         elif p == "/screenshot":
             self._serve_screenshot()
         elif p == "/screenshots":
@@ -612,6 +654,10 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
 
     def _serve_train_cancel(self):
         self._json_response(json.dumps(cancel_training()).encode())
+
+    def _serve_train_log(self):
+        log_text = get_train_log()
+        self._json_response(json.dumps({"log": log_text}).encode())
 
     def _serve_label_decision(self):
         qs = self.path.split("?", 1)[1] if "?" in self.path else ""
@@ -905,8 +951,20 @@ body{
 #train-overlay.open{display:flex}
 #train-card{
   background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);
-  border-radius:12px;padding:24px 28px;min-width:360px;max-width:480px;
+  border-radius:12px;padding:24px 28px;min-width:360px;max-width:680px;width:min(680px,92vw);
   box-shadow:0 16px 48px rgba(0,0,0,0.7);
+  display:flex;flex-direction:column;max-height:88vh;
+}
+#train-log-wrap{
+  background:#0a0f15;border:1px solid var(--border);border-radius:6px;
+  margin-bottom:14px;padding:8px 10px;
+  font-family:var(--mono);font-size:11px;line-height:1.45;color:#9fb3c8;
+  height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+}
+#train-log-wrap.empty{color:var(--dim);font-style:italic}
+#train-log-label{
+  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);
+  margin-bottom:5px;
 }
 #train-title{font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px}
 #train-state-line{color:var(--text);font-size:14px;margin-bottom:14px}
@@ -1338,6 +1396,8 @@ body{
       <div><span class="stat-lbl">Version</span> <span class="stat-val" id="train-version">—</span></div>
     </div>
     <div id="train-msg">Inference is paused while training runs.</div>
+    <div id="train-log-label">Training output</div>
+    <div id="train-log-wrap" class="empty">waiting for training subprocess output…</div>
     <div id="train-actions">
       <button id="train-cancel" onclick="cancelTraining()">Cancel</button>
       <button id="train-close" onclick="closeTrainModal()" style="display:none">Close</button>
@@ -1764,11 +1824,30 @@ function cancelTraining() {
 function startTrainPolling() {
   if (trainPollInterval) clearInterval(trainPollInterval);
   pollTrainStatus();
-  trainPollInterval = setInterval(pollTrainStatus, 2000);
+  pollTrainLog();
+  trainPollInterval = setInterval(() => { pollTrainStatus(); pollTrainLog(); }, 2000);
 }
 
 function pollTrainStatus() {
   fetch('/train/status').then(r => r.json()).then(updateTrainModal).catch(() => {});
+}
+
+function pollTrainLog() {
+  fetch('/train/log').then(r => r.json()).then(d => {
+    const box = document.getElementById('train-log-wrap');
+    if (!box) return;
+    const txt = (d && d.log) || '';
+    if (!txt) {
+      box.classList.add('empty');
+      box.textContent = 'waiting for training subprocess output…';
+      return;
+    }
+    box.classList.remove('empty');
+    // Pin to bottom only if user is already at the bottom.
+    const pinned = (box.scrollHeight - box.clientHeight - box.scrollTop) < 24;
+    box.textContent = txt;
+    if (pinned) box.scrollTop = box.scrollHeight;
+  }).catch(() => {});
 }
 
 function updateTrainModal(s) {
