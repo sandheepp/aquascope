@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import shutil
 import sys
 import tempfile
@@ -25,13 +26,105 @@ import time
 import traceback
 from pathlib import Path
 
-# Reuse the merge logic from train_gpu.py
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train_gpu import (  # noqa: E402
-    _DEFAULT_USERDATA,
-    _PROJECT_ROOT,
-    build_user_only_yaml,
-)
+import yaml
+
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent
+_DEFAULT_USERDATA = _PROJECT_ROOT / "dataset" / "user_recorded"
+
+
+def build_user_only_yaml(
+    user_dir: Path,
+    tmp_dir: Path,
+    class_names: list[str],
+    val_split: float = 0.10,
+) -> Path:
+    """90/10 train/val split over user-recorded labels only, with a caller-
+    supplied class list (so the trained model only knows the classes the user
+    actually cares about, regardless of what the labeling-time inference model
+    happened to predict).
+
+    Labels with a class index outside the new range are dropped from the
+    label file before training — keeps stale labels from a previous N-class
+    inference model from breaking the new run.
+    """
+    images_dir = user_dir / "images"
+    labels_dir = user_dir / "labels"
+    all_images = sorted(images_dir.glob("*.jpg")) + sorted(images_dir.glob("*.png"))
+    if not all_images:
+        print(f"ERROR: no images in {images_dir}")
+        sys.exit(1)
+
+    # YOLO finds labels by replacing the LAST '/images/' with '/labels/' in
+    # an image's path, so the filtered set must live at tmp/images/ + tmp/labels/.
+    images_link_dir = tmp_dir / "images"
+    labels_filter_dir = tmp_dir / "labels"
+    images_link_dir.mkdir(exist_ok=True)
+    labels_filter_dir.mkdir(exist_ok=True)
+
+    nc = len(class_names)
+    kept_images: list[Path] = []
+    dropped = 0
+    for img in all_images:
+        lbl_src = labels_dir / (img.stem + ".txt")
+        if not lbl_src.exists():
+            continue
+        kept_lines: list[str] = []
+        for line in lbl_src.read_text().splitlines():
+            parts = line.strip().split()
+            if not parts:
+                continue
+            try:
+                cid = int(parts[0])
+            except ValueError:
+                continue
+            if 0 <= cid < nc:
+                kept_lines.append(line)
+            else:
+                dropped += 1
+        if not kept_lines:
+            continue
+        (labels_filter_dir / lbl_src.name).write_text("\n".join(kept_lines) + "\n")
+        link = images_link_dir / img.name
+        if not link.exists():
+            try:
+                link.symlink_to(img.resolve())
+            except OSError:
+                shutil.copy2(img, link)
+        kept_images.append(img)
+    if not kept_images:
+        print(f"ERROR: no labels in [0, {nc}) range under {labels_dir}")
+        sys.exit(1)
+    if dropped:
+        print(f"[DATA] Dropped {dropped} labels with class_idx outside [0, {nc}).")
+
+    if len(kept_images) < 10:
+        train_imgs = val_imgs = kept_images
+    else:
+        rng = random.Random(42)
+        shuffled = list(kept_images)
+        rng.shuffle(shuffled)
+        n_val = max(1, int(round(len(shuffled) * val_split)))
+        val_imgs = shuffled[:n_val]
+        train_imgs = shuffled[n_val:]
+
+    train_txt = tmp_dir / "train.txt"
+    val_txt   = tmp_dir / "val.txt"
+    train_txt.write_text("\n".join(str(images_link_dir / p.name) for p in train_imgs))
+    val_txt.write_text("\n".join(str(images_link_dir / p.name) for p in val_imgs))
+
+    data_yaml = tmp_dir / "user_only_data.yaml"
+    with open(data_yaml, "w") as f:
+        yaml.dump({
+            "path":  str(tmp_dir),
+            "train": str(train_txt),
+            "val":   str(val_txt),
+            "nc":    nc,
+            "names": list(class_names),
+        }, f, default_flow_style=False, sort_keys=False)
+
+    print(f"[DATA] User-only: {len(train_imgs)} train / {len(val_imgs)} val "
+          f"| classes ({nc}): {class_names}")
+    return data_yaml
 
 
 # Dashboard-driven training is locked to the two classes the user actually
