@@ -7,7 +7,7 @@ file after each epoch so the dashboard can render progress.
 Trains YOLOv8s on dataset/user_recorded/ ONLY (90/10 train/val split) with
 the dashboard's two classes (fish, shrimp) and Jetson-Orin-Nano-friendly
 defaults (batch=2, AMP, fewer epochs by default), then exports the best
-weights to TensorRT FP16 as models/best.engine_v<N> with N auto-incremented
+weights to TensorRT FP16 as models/best_v<N>.engine with N auto-incremented
 from existing engines under models/.
 
 Usage:
@@ -56,13 +56,19 @@ def _write_status(path: str | None, **kwargs) -> None:
 
 
 def _next_version(models_dir: Path) -> int:
-    nums = []
-    for p in models_dir.glob("best.engine_v*"):
-        suffix = p.name.replace("best.engine_v", "")
-        try:
-            nums.append(int(suffix))
-        except ValueError:
-            pass
+    """Highest existing engine version + 1, looking at both naming styles
+    so the version counter doesn't collide with old engines on disk:
+      - new: best_v<N>.engine   (preferred — .engine extension makes it loadable)
+      - old: best.engine_v<N>   (legacy)
+    """
+    import re
+    nums: list[int] = []
+    new_pat = re.compile(r"^best_v(\d+)\.engine$")
+    old_pat = re.compile(r"^best\.engine_v(\d+)$")
+    for p in models_dir.iterdir():
+        m = new_pat.match(p.name) or old_pat.match(p.name)
+        if m:
+            nums.append(int(m.group(1)))
     return (max(nums) if nums else 0) + 1
 
 
@@ -207,7 +213,7 @@ def main() -> None:
             simplify=True,
             workspace=2,           # GiB; conservative for Orin Nano
         )
-        out_engine = models_dir / f"best.engine_v{version}"
+        out_engine = models_dir / f"best_v{version}.engine"
         try:
             shutil.move(str(export_path), str(out_engine))
         except OSError:
