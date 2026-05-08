@@ -985,11 +985,26 @@ body{
 
 /* ── Mobile ── */
 @media (max-width: 700px) {
-  html,body{ overflow-x:hidden;width:100% }
+  /* Let <html> scroll, NOT <body>. Putting overflow-y:auto on body breaks
+     position:fixed children on iOS Safari — fixed elements end up
+     positioned relative to body's scroll container instead of the
+     viewport, which made the training/manual modals render below the
+     live feed instead of overlaying it. */
+  html{ overflow-y:auto;overflow-x:hidden;width:100% }
   body{
     display:flex;flex-direction:column;
     height:auto;min-height:100vh;
-    overflow-y:auto;overflow-x:hidden;
+    overflow-x:hidden;width:100%;
+  }
+  /* Anchor the fixed overlays to the viewport with explicit width/height
+     and a high z-index so nothing in the mobile flex layout wins. */
+  #train-overlay,
+  #manual-overlay,
+  #fs-overlay,
+  #modal{
+    position:fixed !important;top:0 !important;left:0 !important;
+    width:100vw !important;height:100vh !important;height:100dvh !important;
+    z-index:1000 !important;
   }
   /* Sidebar slides in from the left as an overlay drawer; #nav-toggle
      button (only visible on mobile) flips a body.nav-open class. */
@@ -1198,8 +1213,16 @@ body{
 #manual-card{
   background:var(--card);border:1px solid var(--border);border-radius:12px;
   padding:14px 16px;width:min(960px, 95vw);max-height:92vh;
-  display:flex;flex-direction:column;gap:10px;
+  display:flex;flex-direction:column;gap:10px;position:relative;
 }
+#manual-close{
+  position:absolute;top:8px;right:10px;
+  background:transparent;color:var(--dim);border:1px solid var(--border);
+  width:30px;height:30px;border-radius:6px;font-size:14px;cursor:pointer;
+  z-index:2;
+}
+#manual-close:hover{color:var(--danger);border-color:rgba(252,92,101,0.5)}
+#manual-streak{color:var(--dim);font-weight:500;font-size:11px;margin-left:8px}
 #manual-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
 #manual-title{font-size:14px;font-weight:700;color:var(--accent)}
 #manual-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
@@ -1702,21 +1725,22 @@ body{
      box, then save it as a YOLO label under dataset/user_recorded. -->
 <div id="manual-overlay">
   <div id="manual-card">
+    <button id="manual-close" onclick="closeManualLabel()" aria-label="Exit manual labeling">✕</button>
     <div id="manual-header">
-      <div id="manual-title">✏️ Manual label</div>
+      <div id="manual-title">✏️ Manual labeling <span id="manual-streak"></span></div>
       <div id="manual-controls">
         <select id="manual-class" title="Class for this box">
           <option value="0">fish</option>
           <option value="1">shrimp</option>
         </select>
         <button id="manual-clear" onclick="clearManualBox()">Clear</button>
-        <button id="manual-cancel" onclick="closeManualLabel()">Cancel</button>
-        <button id="manual-save" onclick="saveManualLabel()">Save</button>
+        <button id="manual-skip" onclick="manualNextFrame()">Skip frame</button>
+        <button id="manual-save" onclick="saveManualLabel()">Save &amp; next</button>
       </div>
     </div>
     <div id="manual-hint">
-      <span class="manual-hint-mouse">Click and drag to draw a box. Drag corners to resize, the ✋ in the center to move.</span>
-      <span class="manual-hint-touch">Tap on the image to drop a box. Drag corners to resize, ✋ to move.</span>
+      <span class="manual-hint-mouse">Click and drag to draw a box. Drag corners to resize, ✋ to move. Save loads the next frame; ✕ exits back to auto labeling.</span>
+      <span class="manual-hint-touch">Tap to drop a box. Drag corners to resize, ✋ to move. Save loads the next frame; ✕ exits back to auto labeling.</span>
     </div>
     <div id="manual-canvas-wrap">
       <canvas id="manual-canvas"></canvas>
@@ -2155,14 +2179,20 @@ let manualImg  = null;     // Image() of the snapped frame
 let manualBox  = null;     // {x, y, w, h} in image-pixel coords (px on naturalWidth/Height)
 let manualMode = 'idle';   // 'drawing' | 'moving' | 'tl' | 'tr' | 'bl' | 'br' | 'idle'
 let manualLast = null;     // last pointer pos (img-coords) used by 'moving'
+let manualSavedCount = 0;  // labels saved during this manual session — reset on close
 const MANUAL_HANDLE_PX = 18;  // hit radius around corner handles in canvas-coords
 const MANUAL_HAND_PX   = 28;  // hit radius around the center ✋ handle
 
-function openManualLabel() {
-  fetch('/label/snap?t=' + Date.now()).then(r => {
+// Snap the latest live frame onto the manual-label canvas. Used both to open
+// the modal and to advance to the next frame after each save (the modal stays
+// open until the user clicks ✕ — that's the "manual labeling stays default
+// for consecutive frames" behavior).
+function manualLoadFrame(opts) {
+  opts = opts || {};
+  return fetch('/label/snap?t=' + Date.now()).then(r => {
     if (!r.ok) throw new Error('no frame');
     return r.blob();
-  }).then(blob => {
+  }).then(blob => new Promise((resolve, reject) => {
     const url = URL.createObjectURL(blob);
     const img = new Image();
     img.onload = () => {
@@ -2173,19 +2203,42 @@ function openManualLabel() {
       cv.width  = img.naturalWidth;
       cv.height = img.naturalHeight;
       drawManualCanvas();
-      document.getElementById('manual-overlay').classList.add('open');
       URL.revokeObjectURL(url);
+      resolve();
     };
-    img.onerror = () => alert('Could not load the live frame.');
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
     img.src = url;
-  }).catch(() => alert('No frame available yet — wait a moment and try again.'));
+  }));
+}
+
+function manualUpdateStreak() {
+  const el = document.getElementById('manual-streak');
+  if (!el) return;
+  el.textContent = manualSavedCount > 0 ? `(${manualSavedCount} saved this session)` : '';
+}
+
+function openManualLabel() {
+  manualSavedCount = 0;
+  manualUpdateStreak();
+  manualLoadFrame()
+    .then(() => document.getElementById('manual-overlay').classList.add('open'))
+    .catch(() => alert('No frame available yet — wait a moment and try again.'));
+}
+
+function manualNextFrame() {
+  // Skip the current frame without saving — useful when the snapped frame
+  // has nothing worth labeling.
+  manualLoadFrame().catch(() => {});
 }
 
 function closeManualLabel() {
+  // Exits manual mode and returns the labeling tab to the auto-candidate flow.
   document.getElementById('manual-overlay').classList.remove('open');
   manualImg = null;
   manualBox = null;
   manualMode = 'idle';
+  manualSavedCount = 0;
+  manualUpdateStreak();
 }
 
 function clearManualBox() {
@@ -2348,11 +2401,18 @@ function saveManualLabel() {
   const wn = w / W, hn = h / H;
   const cls = parseInt(document.getElementById('manual-class').value, 10) || 0;
   const url = `/label/manual?class=${cls}&cx=${cx.toFixed(6)}&cy=${cy.toFixed(6)}&w=${wn.toFixed(6)}&h=${hn.toFixed(6)}`;
+  const saveBtn = document.getElementById('manual-save');
+  if (saveBtn) saveBtn.disabled = true;
   fetch(url).then(r => r.json()).then(d => {
     if (d.error) { alert('Could not save: ' + d.error); return; }
-    closeManualLabel();
+    manualSavedCount += 1;
+    manualUpdateStreak();
     refreshTrainLabels();
-  }).catch(() => alert('Save failed.'));
+    // Stay in manual mode for consecutive frames — the user clicks ✕ to exit
+    // back to auto labeling.
+    return manualLoadFrame();
+  }).catch(() => alert('Save failed.'))
+   .finally(() => { if (saveBtn) saveBtn.disabled = false; });
 }
 
 // Poll the queue while the Training tab is open.
