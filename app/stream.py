@@ -1157,6 +1157,16 @@ body{
 #train-actions button:hover{opacity:0.85}
 
 /* ── Inference-disabled overlay on the live feed ── */
+#start-inference-btn{
+  position:absolute;top:14px;right:14px;z-index:14;
+  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;
+  border:none;border-radius:6px;padding:10px 16px;
+  font-size:13px;font-weight:700;cursor:pointer;
+  box-shadow:0 4px 14px rgba(0,212,170,0.35);
+}
+#start-inference-btn:hover{opacity:0.92}
+#start-inference-btn:disabled{opacity:0.55;cursor:not-allowed}
+
 #feed-disabled{
   position:absolute;inset:0;background:rgba(0,0,0,0.78);
   z-index:5;display:flex;align-items:center;justify-content:center;
@@ -1439,6 +1449,12 @@ body{
         <button onclick="location.reload()">↻ Refresh</button>
       </div>
     </div>
+    <!-- Shown after the user toggles labeling off — one tap to kill any
+         lingering training process and snap inference back to the user-tuned
+         confidence threshold. -->
+    <button id="start-inference-btn" onclick="startInferencing(event)" style="display:none">
+      ▶ Start inferencing
+    </button>
   </div>
 
   <!-- Stats -->
@@ -1857,6 +1873,31 @@ function toggleLabeling() {
     btn.textContent = d.enabled ? '⏸ Stop labeling' : '▶ Start labeling';
     btn.classList.toggle('on', d.enabled);
     document.getElementById('label-state').textContent = d.enabled ? 'on' : 'off';
+    // After labeling stops, surface a one-tap "Start inferencing" button on
+    // the live feed so the user can explicitly tear down any leftover
+    // training subprocess and reset inference back to clean state.
+    const sib = document.getElementById('start-inference-btn');
+    if (sib) sib.style.display = d.enabled ? 'none' : '';
+  });
+}
+
+function startInferencing(e) {
+  if (e && e.stopPropagation) e.stopPropagation();   // don't open fullscreen feed
+  const btn = document.getElementById('start-inference-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+  // Cancel any leftover trainer subprocess (no-op if none), then ack the
+  // post-training pause so the tracker re-acquires camera + model.
+  fetch('/train/cancel').catch(() => {}).finally(() => {
+    fetch('/train/acknowledge').catch(() => {}).finally(() => {
+      setFeedDisabled(false);
+      const feed = document.getElementById('feed');
+      if (feed && !streamExpired) feed.src = '/stream?t=' + Date.now();
+      if (btn) {
+        btn.style.display = 'none';
+        btn.disabled = false;
+        btn.textContent = '▶ Start inferencing';
+      }
+    });
   });
 }
 
