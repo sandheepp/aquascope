@@ -89,7 +89,7 @@ _train_log_thread = None                       # daemon thread that tees subproc
 # The tracker keeps inference paused while this is True — so the user controls when
 # inference resumes (via /train/acknowledge), not the subprocess exit.
 _train_unacked: bool = False
-_TRAIN_MIN_LABELS: int = 100                   # button stays disabled below this
+_TRAIN_MIN_LABELS: int = 25                    # button stays disabled below this
 _TRAIN_DEFAULT_EPOCHS: int = 5
 _TRAIN_EPOCH_CHOICES: tuple[int, ...] = (5, 10, 15, 20, 30, 50)
 _TRAIN_DEFAULT_BATCH: int = 2                  # Orin Nano unified-memory friendly
@@ -1174,9 +1174,20 @@ body{
   background:#000;border:1px solid var(--border);border-radius:10px;
   display:flex;align-items:center;justify-content:center;overflow:hidden;
 }
-#label-canvas{max-width:100%;max-height:70vh}
+/* The candidate frame fills the wrap and respects its bounds, so the
+   image stays fully visible regardless of how tall the surrounding panels
+   are. (Old max-height:70vh let the canvas be taller than its wrap when
+   the labeling tab had a lot of stats above, so the wrap's overflow:hidden
+   clipped the bottom of the frame.) */
+#label-canvas{max-width:100%;max-height:100%;object-fit:contain}
 #label-empty{color:var(--dim);font-size:13px;padding:30px;text-align:center}
-#label-actions{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+/* Centered action row. The shortcut hint floats to the right on desktop
+   and drops below the buttons on mobile so it never crowds them. */
+#label-actions{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;position:relative}
+#label-actions .shortcut-hint{position:absolute;right:14px}
+@media (max-width: 700px) {
+  #label-actions .shortcut-hint{position:static;width:100%;text-align:center}
+}
 #label-actions .accept{
   background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;border:none;
   padding:10px 22px;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;
@@ -1717,7 +1728,7 @@ body{
     <button class="reject" onclick="labelDecision(0)">✗ Not a fish</button>
     <button class="accept" onclick="labelDecision(1)">✓ Yes, fish</button>
     <button id="manual-label-btn" onclick="openManualLabel()">✏️ Manual label</button>
-    <span class="stat-lbl" style="margin-left:auto">Shortcuts: <span class="stat-val">y</span> / <span class="stat-val">n</span></span>
+    <span class="stat-lbl shortcut-hint">Shortcuts: <span class="stat-val">y</span> / <span class="stat-val">n</span></span>
   </div>
 </main>
 
