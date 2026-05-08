@@ -333,18 +333,26 @@ def estimate_training_minutes(label_count: int, epochs: int = _TRAIN_DEFAULT_EPO
 
 
 def latest_engine_version() -> tuple[int, str | None]:
-    """Return (version, path) for the highest models/best.engine_v<N>, or (0, None)."""
+    """Return (version, path) for the highest versioned engine in models/.
+
+    New format: best_v<N>.engine  (the .engine extension is what TensorRT
+    inference loaders detect, so files MUST end in .engine).
+    Old format: best.engine_v<N>  (still recognized so pre-rename engines
+    keep working — but these files don't load with the .engine extension
+    handler, so they'll fall back to PyTorch path. Re-train to migrate.)
+    """
+    import re
     if not os.path.isdir(_models_dir):
         return 0, None
     best_n = 0
     best_path: str | None = None
+    new_pat = re.compile(r"^best_v(\d+)\.engine$")
+    old_pat = re.compile(r"^best\.engine_v(\d+)$")
     for name in os.listdir(_models_dir):
-        if not name.startswith("best.engine_v"):
+        m = new_pat.match(name) or old_pat.match(name)
+        if not m:
             continue
-        try:
-            n = int(name[len("best.engine_v"):])
-        except ValueError:
-            continue
+        n = int(m.group(1))
         if n > best_n:
             best_n = n
             best_path = os.path.join(_models_dir, name)
@@ -1023,6 +1031,7 @@ body{
   /* Anchor the fixed overlays to the viewport with explicit width/height
      and a high z-index so nothing in the mobile flex layout wins. */
   #train-overlay,
+  #train-confirm-overlay,
   #manual-overlay,
   #fs-overlay,
   #modal{
@@ -1188,6 +1197,9 @@ body{
 #label-controls{
   display:flex;align-items:center;gap:18px;flex-wrap:wrap;
 }
+.label-model-wrap{display:flex;align-items:center;gap:8px;min-width:240px}
+.label-model-wrap .stat-lbl{white-space:nowrap}
+.label-model-wrap select{flex:1;min-width:160px}
 #label-toggle{
   background:linear-gradient(135deg,var(--accent) 0%,#d4a017 100%);color:#111;border:none;
   padding:8px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;
@@ -1302,6 +1314,36 @@ body{
 #manual-label-btn:hover{background:rgba(255,255,255,0.04)}
 
 /* ── Training modal ── */
+/* ── Training-confirm modal ── */
+#train-confirm-overlay{
+  display:none;position:fixed;inset:0;background:rgba(0,0,0,0.78);
+  align-items:center;justify-content:center;z-index:300;padding:16px;
+}
+#train-confirm-overlay.open{display:flex}
+#train-confirm-card{
+  background:var(--card);border:1px solid var(--border);border-radius:12px;
+  padding:18px 20px;width:min(460px, 95vw);
+  display:flex;flex-direction:column;gap:12px;
+}
+#train-confirm-title{font-size:15px;font-weight:700;color:var(--accent)}
+#train-confirm-body{font-size:13px;color:var(--text);line-height:1.55}
+#train-confirm-body ul{margin:0;padding-left:20px}
+#train-confirm-body li{margin-bottom:4px}
+#train-confirm-body code{
+  background:#0d141d;border:1px solid var(--border);border-radius:4px;
+  padding:1px 5px;font-size:12px;color:var(--teal);
+}
+#train-confirm-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:4px}
+#train-confirm-actions button{
+  padding:8px 16px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;
+}
+#tc-cancel{background:#1a2130;color:var(--fg);border:1px solid var(--border)}
+#tc-cancel:hover{background:rgba(255,255,255,0.04)}
+#tc-go{
+  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);color:#fff;border:none;
+}
+#tc-go:hover{opacity:0.9}
+
 #train-overlay{
   display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);
   z-index:400;align-items:center;justify-content:center;backdrop-filter:blur(2px);
@@ -1471,7 +1513,7 @@ body{
 #conf-val{font-family:var(--mono);font-size:12px;color:var(--accent)}
 .conf-row{display:flex;align-items:center;gap:6px}
 /* Resolution + Model dropdowns */
-#res-select, #model-select{
+#res-select, #model-select, #label-model-select{
   width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);
   background:linear-gradient(135deg,#1a2130 0%,#141c26 100%);color:var(--text);
   font-size:12px;font-family:var(--font);cursor:pointer;outline:none;
@@ -1715,6 +1757,12 @@ body{
 <main id="label-panel" style="display:none">
   <div class="card" id="label-controls">
     <button id="label-toggle" onclick="toggleLabeling()">▶ Start labeling</button>
+    <div class="label-model-wrap">
+      <span class="stat-lbl">Detection model</span>
+      <select id="label-model-select" onchange="setModel(this.value)">
+        <option>loading…</option>
+      </select>
+    </div>
     <div class="stat-row" style="margin:0">
       <span class="stat-lbl">Status</span>
       <span class="stat-val" id="label-state">off</span>
@@ -1809,6 +1857,29 @@ body{
   <img id="fs-feed" src="" alt="fullscreen feed">
 </div>
 
+<!-- Training-confirm modal: replaces the native window.confirm() so the
+     details (label count, ETA band, epochs, output path) get a real card
+     instead of an OS-styled alert that's hard to read on mobile. -->
+<div id="train-confirm-overlay">
+  <div id="train-confirm-card">
+    <div id="train-confirm-title">🧠 Train a new model?</div>
+    <div id="train-confirm-body">
+      <ul>
+        <li>Labels saved: <b id="tc-labels">—</b></li>
+        <li>Epochs: <b id="tc-epochs">—</b></li>
+        <li>Estimated time: <b id="tc-eta">—</b></li>
+        <li>Inference will pause on the GPU while training runs.</li>
+        <li>On success, <code>models/best_v&lt;N&gt;.engine</code> appears
+            in the Model dropdown.</li>
+      </ul>
+    </div>
+    <div id="train-confirm-actions">
+      <button id="tc-cancel" onclick="closeTrainConfirm()">Cancel</button>
+      <button id="tc-go" onclick="startTrainingConfirmed()">Start training</button>
+    </div>
+  </div>
+</div>
+
 <!-- Training progress modal -->
 <div id="train-overlay">
   <div id="train-card">
@@ -1856,29 +1927,35 @@ function setResolution(val) {
 
 // ── Model dropdown ───────────────────────────────────────
 function setModel(val) {
-  fetch('/model?v=' + encodeURIComponent(val));
+  fetch('/model?v=' + encodeURIComponent(val))
+    .finally(() => loadModels());   // re-sync both dropdowns to the same value
 }
 
 function loadModels() {
   fetch('/models').then(r => r.json()).then(d => {
-    const sel = document.getElementById('model-select');
-    sel.innerHTML = '';
+    // Populate every model dropdown on the page (live feed + labeling tab)
+    // from the same /models response so they stay in sync.
+    const selects = document.querySelectorAll('#model-select, #label-model-select');
+    if (!selects.length) return;
     const models = d.models || [];
-    if (!models.length) {
-      const opt = document.createElement('option');
-      opt.textContent = '(no models found)';
-      opt.disabled = true;
-      sel.appendChild(opt);
-      return;
-    }
     const currentBase = (d.current || '').split('/').pop();
-    models.forEach(m => {
-      const base = m.split('/').pop();
-      const opt = document.createElement('option');
-      opt.value = base;
-      opt.textContent = m;
-      if (base === currentBase) opt.selected = true;
-      sel.appendChild(opt);
+    selects.forEach(sel => {
+      sel.innerHTML = '';
+      if (!models.length) {
+        const opt = document.createElement('option');
+        opt.textContent = '(no models found)';
+        opt.disabled = true;
+        sel.appendChild(opt);
+        return;
+      }
+      models.forEach(m => {
+        const base = m.split('/').pop();
+        const opt = document.createElement('option');
+        opt.value = base;
+        opt.textContent = m;
+        if (base === currentBase) opt.selected = true;
+        sel.appendChild(opt);
+      });
     });
   });
 }
@@ -2576,14 +2653,24 @@ function confirmTraining() {
   if (!trainEstimate) return;
   const e = trainEstimate;
   const ep = selectedEpochs();
-  const ok = window.confirm(
-    `Train a new model on your labeled data?\n\n` +
-    `• Estimated time: ~${e.low_min}–${e.high_min} minutes (${ep} epochs)\n` +
-    `• Inference will pause while the GPU is in use\n` +
-    `• On success a new models/best.engine_v<N> appears in the Model dropdown\n\n` +
-    `Continue?`
-  );
-  if (!ok) return;
+  // Populate the in-page confirm modal with live numbers from the most recent
+  // /train/labels poll, then show it. Replaces window.confirm() so the dialog
+  // is styled, scrollable on mobile, and shows real label counts.
+  const labelsEl = document.getElementById('label-saved');
+  document.getElementById('tc-labels').textContent = labelsEl ? labelsEl.textContent : '—';
+  document.getElementById('tc-epochs').textContent = ep;
+  document.getElementById('tc-eta').textContent =
+    (e && e.low_min != null) ? `~${e.low_min}–${e.high_min} min` : '—';
+  document.getElementById('train-confirm-overlay').classList.add('open');
+}
+
+function closeTrainConfirm() {
+  document.getElementById('train-confirm-overlay').classList.remove('open');
+}
+
+function startTrainingConfirmed() {
+  closeTrainConfirm();
+  const ep = selectedEpochs();
   fetch('/train/start?epochs=' + ep).then(r => r.json()).then(d => {
     if (d.error) { alert('Could not start training: ' + d.error); return; }
     openTrainModal();
@@ -2599,9 +2686,8 @@ function openTrainModal() {
   cancelBtn.disabled = false;
   cancelBtn.textContent = 'Cancel';
   document.getElementById('train-close').style.display = 'none';
-  // Disable model dropdown, epochs dropdown, and train button
-  const ms = document.getElementById('model-select');
-  if (ms) ms.disabled = true;
+  // Disable both model dropdowns, the epochs dropdown, and the train button
+  document.querySelectorAll('#model-select, #label-model-select').forEach(s => s.disabled = true);
   const es = document.getElementById('train-epochs');
   if (es) es.disabled = true;
   document.getElementById('train-btn').disabled = true;
@@ -2614,8 +2700,7 @@ function closeTrainModal() {
   trainModalOpen = false;
   document.getElementById('train-overlay').classList.remove('open');
   if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
-  const ms = document.getElementById('model-select');
-  if (ms) ms.disabled = false;
+  document.querySelectorAll('#model-select, #label-model-select').forEach(s => s.disabled = false);
   const es = document.getElementById('train-epochs');
   if (es) es.disabled = false;
   refreshTrainLabels();

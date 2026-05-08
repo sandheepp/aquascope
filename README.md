@@ -1,203 +1,216 @@
 # AquaScope
 
-Real-time fish detection and tracking for home aquariums using **NVIDIA Jetson Orin Nano** and a **Logitech C920** webcam.
+Real-time fish & shrimp detection, tracking, and on-device fine-tuning for
+home aquariums. Runs on an **NVIDIA Jetson Orin Nano** with a **Logitech
+C920** webcam and a browser dashboard for viewing the stream, labeling
+detections, and retraining the model — all without leaving the page.
 
 ## Project Structure
 
 ```
 aquascope/
 ├── app/                        # Core tracker application
-│   ├── fish_tracker.py         # Entry point (CLI)
-│   ├── tracker.py              # Main tracking loop (YOLOv8s + ByteTrack)
-│   ├── stream.py               # MJPEG HTTP server + dashboard UI
-│   ├── camera.py               # Camera initialisation (V4L2)
-│   ├── config.py               # Default config & constants
-│   ├── jetson_compat.py        # torchvision NMS patch for Jetson
+│   ├── fish_tracker.py         # CLI entry point
+│   ├── tracker.py              # Capture + inference + ByteTrack loop
+│   ├── stream.py               # MJPEG server + dashboard UI + labeling/training endpoints
+│   ├── model.py                # Model loader (ultralytics .pt / TensorRT .engine)
+│   ├── camera.py               # V4L2 camera initialisation
+│   ├── enhancer.py             # CLAHE frame enhancer (toggleable from dashboard)
+│   ├── config.py               # Default config + trail colour palette
+│   ├── jetson_compat.py        # torchvision NMS shim for JetPack
 │   └── bytetrack.yaml          # ByteTrack tuning reference
-├── training/                   # Model fine-tuning & analysis
-│   ├── quick_train.py          # Quick YOLOv8s training script
-│   ├── train_fish_model.py     # Roboflow download + full training pipeline
-│   └── analyse_training.py     # Analyse training_mem.csv + plot graphs
-├── monitoring/                 # Jetson resource monitoring
-│   └── jetson_monitor.py       # Logs CPU/GPU/RAM/temp to CSV during training
-├── scripts/                    # Deployment & setup
-│   ├── setup_jetson.sh         # One-shot Jetson setup (run once after flash)
-│   └── deploy_to_jetson.sh     # rsync project to Jetson over LAN
-├── requirements.txt
-├── .env                        # Local secrets (gitignored)
-└── fish_logs/                  # Runtime output: JSON stats + screenshots
+├── training/
+│   ├── train_jetson.py         # Jetson trainer (used by the dashboard "Train Model" button)
+│   ├── mac_train.py            # Mac trainer (Apple Silicon / MPS, exports CoreML)
+│   └── analyse_training.py     # Plot CPU/GPU/RAM curves from a monitor CSV
+├── monitoring/
+│   └── jetson_monitor.py       # Logs CPU/GPU/RAM/temp to CSV during long runs
+├── scripts/
+│   ├── setup_jetson.sh         # One-shot Jetson setup (after JetPack flash)
+│   ├── deploy_to_jetson.sh     # rsync project to Jetson over LAN
+│   ├── run_dashboard.sh        # Launch the dashboard via the project venv
+│   └── requirements.txt        # pip deps (see header for Jetson-only steps)
+├── models/                     # Weights & engines (best.engine, best_v<N>.engine, …)
+├── dataset/user_recorded/      # Labels produced by the dashboard's labeling tab
+├── fish_logs/                  # Runtime output: JSON stats + screenshots
+└── .env                        # JETSON_HOST / JETSON_USER / JETSON_PASSWORD (gitignored)
 ```
 
 ## Architecture
 
 ```
 ┌──────────────┐     USB      ┌──────────────────┐     TensorRT      ┌──────────────┐
-│ Logitech C920 │ ──────────▶ │  Jetson Orin Nano │ ───────────────▶  │  YOLOv8s     │
-│   (1280×720)  │             │  (JetPack 6.1)   │                   │  Detection   │
-└──────────────┘              └────────┬─────────┘                   └──────┬───────┘
+│ Logitech C920│ ──────────▶ │  Jetson Orin Nano │ ───────────────▶  │  YOLOv8s     │
+│  (1280×720)  │             │   (JetPack 6.1)   │                   │  Detection   │
+└──────────────┘              └────────┬──────────┘                   └──────┬───────┘
                                        │                                     │
                                        │              ┌──────────────────────┘
                                        │              ▼
                                        │       ┌──────────────┐
                                        │       │  ByteTrack   │
-                                       │       │  (supervision)│
+                                       │       │ (supervision)│
                                        │       └──────┬───────┘
-                                       │              │
                                        ▼              ▼
-                                ┌─────────────────────────────┐
-                                │  Dashboard (MJPEG stream)   │
-                                │  • Fish trails & IDs        │
-                                │  • Count & activity stats   │
-                                │  • Screenshots / filmstrip  │
-                                │  • Cloudflare public URL    │
-                                └─────────────────────────────┘
+                              ┌────────────────────────────────────┐
+                              │   Dashboard (MJPEG @ :8080)        │
+                              │   • Live trails, IDs, counts       │
+                              │   • Snapshots / filmstrip          │
+                              │   • Labeling tab → user_recorded/  │
+                              │   • Train Model → train_jetson.py  │
+                              │   • Cloudflare public URL          │
+                              └────────────────────────────────────┘
 ```
 
-## Hardware Setup
+## Hardware
 
-### What you need
-- NVIDIA Jetson Orin Nano Developer Kit (8GB recommended)
+- NVIDIA Jetson Orin Nano Developer Kit (8 GB recommended)
 - Logitech C920 HD Pro webcam
-- MicroSD card (64GB+ recommended)
-- USB-A to USB-A cable (for C920)
-- Monitor + keyboard for initial setup (or SSH)
-- Power supply (included with Jetson kit)
+- 64 GB+ microSD card
+- USB-A ↔ USB-A data cable for the C920
+- Power supply (included with the Jetson kit)
+- Monitor + keyboard for first boot, or SSH access
 
-### Camera mounting
-1. Position the C920 facing the front glass of your aquarium
-2. Distance: 30–60 cm from the glass works best
-3. Avoid reflections: angle slightly downward (5–10°) and use a matte background
-4. Ensure even lighting — avoid direct overhead lights causing glare
+**Camera mounting tips**
 
-## Software Setup
+1. Face the C920 at the front glass, 30–60 cm out.
+2. Tilt 5–10° downward to reduce reflections; matte background helps too.
+3. Diffuse, even lighting beats bright overhead lights (which cause glare).
 
-### Step 1: Flash JetPack
+## Setup
 
-If not already done, flash JetPack 6.1 (or 5.1.3+) to your Jetson:
-- Download from: https://developer.nvidia.com/jetson-orin-nano-developer-kit
-- Use NVIDIA SDK Manager or balenaEtcher with the SD card image
+### 1. Flash JetPack
 
-### Step 2: Deploy code to Jetson
+Flash JetPack 6.1 (or 5.1.3+) to the Jetson via NVIDIA SDK Manager or
+balenaEtcher. Image and instructions:
+https://developer.nvidia.com/jetson-orin-nano-developer-kit
 
-From your **host machine** (Mac/Linux):
+### 2. Deploy code to the Jetson
+
+From your host machine:
 
 ```bash
-# Configure connection in .env (copy from .env.example)
-cp .env.example .env
-# Edit: JETSON_HOST, JETSON_USER, JETSON_PASSWORD, JETSON_PATH
-
-# Deploy project files to Jetson
+cp .env.example .env   # then fill in JETSON_HOST / JETSON_USER / JETSON_PASSWORD / JETSON_PATH
 bash scripts/deploy_to_jetson.sh
 ```
 
-### Step 3: Run setup on Jetson
+### 3. One-shot Jetson setup
 
-SSH into the Jetson, then:
+SSH in and run the setup script — it installs system & Python deps, sets
+max-performance mode, downloads YOLOv8s, and exports the baseline TensorRT
+engine to `models/`:
 
 ```bash
 ssh jetson@<jetson-ip>
 cd ~/projects/aquascope
-
-# One-time setup: installs all dependencies, downloads YOLOv8s, exports TensorRT engine
 bash scripts/setup_jetson.sh
 ```
 
-This installs all Python packages, sets max performance mode, downloads YOLOv8s,
-and exports it to a TensorRT FP16 engine.
+Note the requirements file ([scripts/requirements.txt](scripts/requirements.txt))
+has a header listing the Jetson-only manual steps (PyTorch wheel, cuSPARSELt,
+torchvision-from-source, apt OpenCV) — `setup_jetson.sh` handles them for you.
 
-### Step 4: Run the tracker
+### 4. Run the dashboard
 
-All commands are run from the **project root** (`~/projects/aquascope`):
-
-```bash
-# Local display (requires monitor)
-python3 app/fish_tracker.py
-
-# Headless + browser dashboard (recommended for SSH)
-python3 app/fish_tracker.py --no-display --stream
-
-# With TensorRT engine (~2× faster)
-python3 app/fish_tracker.py --model yolov8s.engine --no-display --stream
-
-# Public URL via Cloudflare tunnel
-python3 app/fish_tracker.py --model yolov8s.engine --no-display --stream --public
-
-# SAHI sliced inference (better small-fish recall, lower FPS)
-python3 app/fish_tracker.py --sahi --no-display --stream
-
-# Custom confidence + resolution
-python3 app/fish_tracker.py --conf 0.3 --resolution 1080p --no-display --stream
-
-# Manual camera exposure (e.g. dimly lit tank)
-python3 app/fish_tracker.py --exposure -6 --no-display --stream
-```
-
-Open the dashboard at `http://<jetson-ip>:8080` in your browser.
-
-### Keyboard controls (local display mode only)
-- `q` — Quit
-- `r` — Reset all trails
-
-## Training (Optional)
-
-Fine-tuning on aquarium data dramatically improves detection accuracy
-over the default COCO-trained YOLOv8s.
-
-### Option A: Quick train (Roboflow dataset)
+From the project root on the Jetson:
 
 ```bash
-# Download dataset (get free API key from https://app.roboflow.com)
-python3 training/train_fish_model.py download --api-key YOUR_KEY
-
-# Fine-tune (~2–4 hours on Jetson for 50 epochs)
-python3 training/quick_train.py
-
-# Export best weights to TensorRT after training
-python3 -c "
-from ultralytics import YOLO
-YOLO('runs/detect/train/weights/best.pt') \
-  .export(format='engine', device=0, half=True, imgsz=640)
-"
-
-# Run with custom model
-python3 app/fish_tracker.py --model runs/detect/train/weights/best.engine \
-  --no-display --stream
+scripts/run_dashboard.sh                       # local display + browser stream
+scripts/run_dashboard.sh --no-display          # headless + browser stream (recommended over SSH)
+scripts/run_dashboard.sh --no-display --public # + public URL via Cloudflare tunnel
+scripts/run_dashboard.sh --sahi                # sliced inference (better small-fish recall)
+scripts/run_dashboard.sh --conf 0.3 --resolution 1080p
+scripts/run_dashboard.sh --exposure -6         # manual V4L2 exposure for a dim tank
 ```
 
-### Option B: Label your own fish
+Anything you pass is forwarded to `app/fish_tracker.py`. Open the dashboard
+at `http://<jetson-ip>:8080`.
+
+**Local-display keys:** `q` quit, `r` reset trails.
+
+## Dashboard
+
+The dashboard is a single page served from `app/stream.py` with these tabs:
+
+- **Live Feed** — MJPEG stream, fish/shrimp counts, current FPS, and toggles
+  for trails, the CLAHE enhancer, and the "hat" overlay.
+- **Analytics** — per-track activity stats from the JSON log files.
+- **Snapshots** — screenshots taken from the dashboard, stored under
+  [fish_logs/screenshots/](fish_logs/screenshots/).
+- **Labeling** — turns the live tracker into a data-collection loop. Each
+  detection becomes a candidate crop; tick to keep it as a YOLO label
+  (saved under [dataset/user_recorded/](dataset/user_recorded/)) or cross
+  to discard. Manual multi-box drawing is also supported.
+- **Settings** — model dropdown (lists every `models/best*.engine`
+  on disk), confidence threshold, resolution, exposure.
+
+### Train a new model from the dashboard
+
+When `dataset/user_recorded/` has enough labels (the *Train Model* button
+shows the current count + minimum), clicking it spawns
+[training/train_jetson.py](training/train_jetson.py) as a subprocess. The
+modal polls `/train/status` for live epoch + ETA, and on success the new
+engine is written to `models/best_v<N>.engine` and appears in the model
+dropdown.
+
+The endpoints are documented in the docstring at the top of
+[app/stream.py](app/stream.py).
+
+## Training (manual / off-dashboard)
+
+Both trainers consume the labels produced by the dashboard's Labeling tab
+(`dataset/user_recorded/`) and produce class-locked weights for **fish**
+and **shrimp**.
+
+### On the Jetson
 
 ```bash
-# Capture images from your tank
-python3 training/train_fish_model.py capture --num 200
+# What the dashboard's "Train Model" button runs:
+python3 training/train_jetson.py --epochs 30 --batch 2
 
-# Upload to https://app.roboflow.com, label bounding boxes, download YOLOv8 format
-# Then train:
-python3 training/train_fish_model.py train --data path/to/data.yaml
+# Custom run name + status file (mirrors what the dashboard uses):
+python3 training/train_jetson.py --epochs 50 --batch 2 \
+    --status-file /tmp/aq_train.json
 ```
 
-### Monitor Jetson resources during training
+90/10 train/val split over `dataset/user_recorded/`, AMP FP16, rectangular
+batching, mosaic/mixup off (Jetson RAM headroom). On success it copies the
+best weights to `models/best_v<N>.pt`, exports them to
+`models/best_v<N>.engine` (TensorRT FP16), and wipes the user-recorded set
+so the next labeling round starts clean.
+
+### On a Mac (Apple Silicon / MPS)
 
 ```bash
-# In a separate terminal — logs CPU/GPU/RAM/temp to CSV
-python3 monitoring/jetson_monitor.py --interval 2 --output training_mem.csv
-
-# After training, analyse the log and generate graphs
-python3 training/analyse_training.py --csv training_mem.csv
+python3 training/mac_train.py --epochs 50 --batch 8
 ```
 
-## Output & Logs
+Uses MPS, full augmentation, and exports to CoreML (`.mlpackage`). If you
+want the model on the Jetson, copy the `.pt` over and re-export to
+TensorRT there (the engine format is hardware-specific).
 
-The tracker saves JSON stats to `fish_logs/` every 60 seconds:
+### Resource monitoring
+
+```bash
+# Separate terminal — logs CPU/GPU/RAM/temp every 2 s
+python3 monitoring/jetson_monitor.py --interval 2 --output training_log.csv
+
+# Plot the result
+python3 training/analyse_training.py --csv training_log.csv
+```
+
+## Output
+
+`fish_logs/` accumulates JSON stats every 60 seconds:
 
 ```json
 {
-  "timestamp": "20260403_143022",
+  "timestamp": "20260508_143022",
   "total_frames": 1800,
   "unique_fish": 5,
   "fish": {
     "1": {
-      "first_seen": "2026-04-03T14:29:22",
-      "last_seen": "2026-04-03T14:30:22",
+      "first_seen": "2026-05-08T14:29:22",
+      "last_seen":  "2026-05-08T14:30:22",
       "total_distance_px": 4521.7,
       "frame_count": 1650
     }
@@ -205,103 +218,42 @@ The tracker saves JSON stats to `fish_logs/` every 60 seconds:
 }
 ```
 
-Screenshots taken via the dashboard are saved to `fish_logs/screenshots/`.
+Snapshots taken from the dashboard live in `fish_logs/screenshots/`.
 
 ## Performance Tuning
 
-| Setting                        | Command / Action                              | Effect              |
-|-------------------------------|-----------------------------------------------|---------------------|
-| Max Jetson performance        | `sudo nvpmodel -m 0 && sudo jetson_clocks`    | +20–40% FPS         |
-| Use TensorRT FP16             | `--model yolov8s.engine`                      | ~2× faster          |
-| Reduce input size             | `--imgsz 416`                                 | +30% FPS            |
-| Lower resolution              | `--resolution 480p`                           | Less CPU overhead   |
-| Higher confidence threshold   | `--conf 0.5`                                  | Fewer false positives|
-| Stream quality                | `--stream-quality 70`                         | Lower bandwidth     |
+| Setting                       | Command / Action                              | Effect                |
+|-------------------------------|-----------------------------------------------|-----------------------|
+| Max Jetson performance        | `sudo nvpmodel -m 0 && sudo jetson_clocks`    | +20–40% FPS           |
+| Use TensorRT FP16             | `--model models/best.engine`                  | ~2× faster than `.pt` |
+| Smaller inference size        | `--imgsz 416`                                 | +30% FPS              |
+| Lower capture resolution      | `--resolution 720p` (or `480p`)               | Less CPU overhead     |
+| Higher confidence threshold   | `--conf 0.5`                                  | Fewer false positives |
+| Cheaper JPEG stream           | `--stream-quality 60 --stream-fps 15`         | Lower bandwidth       |
 
 ## Troubleshooting
 
-**Low FPS (<15)?**
-- Ensure `nvpmodel -m 0` and `jetson_clocks` are active
-- Use TensorRT engine (`--model yolov8s.engine`), not PyTorch `.pt`
-- Close other GPU-intensive apps
+**Low FPS (<15)**
+- Ensure `nvpmodel -m 0` and `jetson_clocks` are active.
+- Use the TensorRT engine (`--model models/best.engine`), not a `.pt`.
+- Close other GPU-intensive apps.
 
-**Camera not detected?**
-- Run `v4l2-ctl --list-devices` to check
-- Try `--camera 1` if video0 is taken
-- Ensure USB cable supports data (not charge-only)
+**Camera not detected**
+- `v4l2-ctl --list-devices` to check.
+- Try `--camera 1` if `/dev/video0` is taken.
+- Confirm the USB cable carries data, not just power.
 
-**Fish not being detected?**
-- Lower confidence: `--conf 0.2`
-- Try SAHI: `--sahi` (better recall for small fish)
-- Fine-tune on your specific aquarium (see Training section above)
-- Check lighting — too dark or too much glare hurts detection
+**Detections look bad**
+- Lower the confidence (`--conf 0.2`) or try `--sahi` for small fish.
+- Fine-tune on your tank — capture a few hundred labels via the Labeling
+  tab and click *Train Model*.
+- Check lighting: too dark or strong glare both hurt detection.
 
-**ID switches (fish swapping IDs)?**
-- Increase `track_buffer` in `app/bytetrack.yaml`
-- A fine-tuned model produces more stable detections
-
-## Roadmap / TODO
-
-### In-dashboard labeling tab (planned)
-
-Goal: turn the live tracker into its own data-collection loop, so the model can be
-fine-tuned on the user's actual aquarium without leaving the dashboard.
-
-1. **Add the sidebar tab.** Add a new tab (e.g. **Training** / **Label**)
-   alongside Live Feed, Analytics, Snapshots, Settings in
-   [app/stream.py](app/stream.py).
-2. **Capture detections to a queue.** When the tab is opened (or a
-   "Start labeling" button is pressed), the tracker starts saving cropped
-   screenshots of every detection — one image per detected bounding box — into
-   a queue.
-3. **Tick / cross triage UI.** The tab shows the queued crops one at a time:
-    - **Tick** → it's a fish (or whichever class). Persist the bounding box as
-      a YOLO-format label.
-    - **Cross** → it's a false positive. Discard, but optionally persist as a
-      negative example.
-    - Optional: keyboard shortcuts (`y` / `n` / `←` / `→`) for fast triage.
-4. **Persist approved samples** to:
-    - `dataset/user_recorded/images/<timestamp>.jpg` — the full annotated frame
-      (or just the crop, TBD).
-    - `dataset/user_recorded/labels/<timestamp>.txt` — YOLO label lines
-      (`class_idx cx cy w h` normalized to image size).
-5. **Backend wiring** ([app/tracker.py](app/tracker.py) /
-   [app/stream.py](app/stream.py)):
-    - New endpoints: `/label/queue` (GET pending crops), `/label/decision`
-      (POST accept/reject for a given crop id).
-    - Keep a small ring buffer of recent `(frame, detections)` pairs so labels
-      are bound to the actual frame they came from, not the latest one.
-6. **Wire `dataset/user_recorded/` into the training pipeline.** Update
-   [training/train_gpu.py](training/train_gpu.py) so it can merge the
-   user-labeled set alongside the existing Roboflow + DINO-distillation sets:
-    - **New CLI flag:** `--user-data PATH` (default: `dataset/user_recorded`).
-    - **New CLI flag:** `--no-user` to skip the user set when not desired.
-    - Extend `build_merged_yaml()` to accept a third source and concatenate
-      `<user_data>/images/` into the `train:` list (validation should still use
-      the ground-truth Roboflow `valid/` split — user labels are noisy).
-    - Skip the user set silently if `<user_data>/images/` is empty or missing
-      so the script still works on a fresh clone.
-    - Example invocations once shipped:
-
-      ```bash
-      # Default — merges Roboflow + distillation + user_recorded if present
-      python training/train_gpu.py
-
-      # Train only on user-labeled data (e.g. for fast iteration)
-      python training/train_gpu.py --no-merge --no-distill \
-          --user-data dataset/user_recorded
-
-      # Custom user-data path
-      python training/train_gpu.py --user-data /path/to/my_labels
-      ```
-    - Mirror the same flags in [training/mac_train.py](training/mac_train.py)
-      for the MPS path.
-
-This closes the loop: detect → user verifies → retrain (with `--user-data`
-auto-included) → deploy a better model via the existing Model dropdown — all
-without leaving the browser.
+**ID switches**
+- Increase `track_buffer` in [app/bytetrack.yaml](app/bytetrack.yaml).
+- A fine-tuned model produces much more stable detections.
 
 ## License
 
-This project is provided as-is for personal/educational use.
-YOLOv8 is licensed under AGPL-3.0 by Ultralytics.
+Provided as-is for personal/educational use. YOLOv8 is licensed under
+AGPL-3.0 by Ultralytics.
