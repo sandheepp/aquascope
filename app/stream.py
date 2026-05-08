@@ -1213,18 +1213,17 @@ body{
 #manual-card{
   background:var(--card);border:1px solid var(--border);border-radius:12px;
   padding:14px 16px;width:min(960px, 95vw);max-height:92vh;
-  display:flex;flex-direction:column;gap:10px;position:relative;
+  display:flex;flex-direction:column;gap:10px;
 }
 #manual-close{
-  position:absolute;top:8px;right:10px;
   background:transparent;color:var(--dim);border:1px solid var(--border);
   width:30px;height:30px;border-radius:6px;font-size:14px;cursor:pointer;
-  z-index:2;
+  flex:0 0 auto;
 }
 #manual-close:hover{color:var(--danger);border-color:rgba(252,92,101,0.5)}
 #manual-streak{color:var(--dim);font-weight:500;font-size:11px;margin-left:8px}
-#manual-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-#manual-title{font-size:14px;font-weight:700;color:var(--accent)}
+#manual-header{display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+#manual-title{font-size:14px;font-weight:700;color:var(--accent);flex:1 1 auto;min-width:120px}
 #manual-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
 #manual-class{
   background:#1a2130;color:var(--fg);border:1px solid var(--border);
@@ -1725,8 +1724,8 @@ body{
      box, then save it as a YOLO label under dataset/user_recorded. -->
 <div id="manual-overlay">
   <div id="manual-card">
-    <button id="manual-close" onclick="closeManualLabel()" aria-label="Exit manual labeling">✕</button>
     <div id="manual-header">
+      <button id="manual-close" onclick="closeManualLabel()" aria-label="Exit manual labeling">✕</button>
       <div id="manual-title">✏️ Manual labeling <span id="manual-streak"></span></div>
       <div id="manual-controls">
         <select id="manual-class" title="Class for this box">
