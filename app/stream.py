@@ -33,7 +33,7 @@ import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
-from urllib.parse import unquote
+from urllib.parse import parse_qs, unquote
 
 # ── Shared state ──────────────────────────────────────────
 _frame: bytes = b""
@@ -853,25 +853,47 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def _serve_label_manual(self):
-        """Save a hand-drawn box from the manual-label modal as a YOLO label.
+        """Save one or more hand-drawn boxes from the manual-label modal as
+        a YOLO label file.
 
-        Query params (all required except `class`, default 0):
-          class=<int>   class index in _label_class_names
-          cx,cy,w,h     bounding box in normalized [0, 1] image coordinates
-        The current _frame is captured as the image, so the label always
-        matches what the user saw when they drew the box.
+        Query params:
+          box=cls,cx,cy,w,h   (repeatable; one per box). Coordinates are
+                              normalized to [0, 1] of the captured frame.
+          # Backwards-compat fallback for the single-box callers:
+          class=<int>, cx,cy,w,h
+
+        The current _frame is captured once and shared by all boxes, so the
+        saved image always matches what the user saw when they drew them.
         """
         qs = self.path.split("?", 1)[1] if "?" in self.path else ""
-        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
-        try:
-            cls_idx = int(params.get("class", 0))
-            cx = float(params["cx"]); cy = float(params["cy"])
-            bw = float(params["w"]);  bh = float(params["h"])
-        except (KeyError, ValueError):
-            self._json_response(b'{"error":"missing or invalid params"}')
+        params = parse_qs(qs, keep_blank_values=False)
+        raw_boxes = list(params.get("box", []))
+        # Backwards compat: original single-box callers used class=&cx=&cy=&w=&h=
+        if not raw_boxes and {"cx", "cy", "w", "h"} <= params.keys():
+            cls = params.get("class", ["0"])[0]
+            raw_boxes = [f'{cls},{params["cx"][0]},{params["cy"][0]},'
+                         f'{params["w"][0]},{params["h"][0]}']
+        if not raw_boxes:
+            self._json_response(b'{"error":"no boxes given"}')
             return
-        cx = max(0.0, min(1.0, cx)); cy = max(0.0, min(1.0, cy))
-        bw = max(0.001, min(1.0, bw)); bh = max(0.001, min(1.0, bh))
+
+        boxes: list[tuple[int, float, float, float, float]] = []
+        for raw in raw_boxes:
+            parts = raw.split(",")
+            if len(parts) != 5:
+                self._json_response(b'{"error":"box must be cls,cx,cy,w,h"}')
+                return
+            try:
+                cls_idx = int(parts[0])
+                cx = float(parts[1]); cy = float(parts[2])
+                bw = float(parts[3]); bh = float(parts[4])
+            except ValueError:
+                self._json_response(b'{"error":"invalid number in box"}')
+                return
+            cx = max(0.0, min(1.0, cx)); cy = max(0.0, min(1.0, cy))
+            bw = max(0.001, min(1.0, bw)); bh = max(0.001, min(1.0, bh))
+            boxes.append((cls_idx, cx, cy, bw, bh))
+
         with _lock:
             frame_jpeg = _frame
         if not frame_jpeg:
@@ -887,9 +909,11 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         with open(img_path, "wb") as f:
             f.write(frame_jpeg)
         with open(lbl_path, "w") as f:
-            f.write(f"{cls_idx} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+            for cls_idx, cx, cy, bw, bh in boxes:
+                f.write(f"{cls_idx} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
         self._json_response(json.dumps({"saved": True, "image": img_path,
-                                        "label": lbl_path}).encode())
+                                        "label": lbl_path,
+                                        "n_boxes": len(boxes)}).encode())
 
     def _serve_screenshot(self):
         with _lock:
@@ -1236,6 +1260,10 @@ body{
 }
 #manual-controls #manual-save{
   background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;
+  border:none;
+}
+#manual-controls #manual-add{
+  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);color:#fff;
   border:none;
 }
 #manual-controls #manual-cancel{color:var(--danger);border-color:rgba(252,92,101,0.4)}
@@ -1725,22 +1753,23 @@ body{
      box, then save it as a YOLO label under dataset/user_recorded. -->
 <div id="manual-overlay">
   <div id="manual-card">
-    <button id="manual-close" onclick="closeManualLabel()" aria-label="Exit manual labeling">✕</button>
     <div id="manual-header">
+      <button id="manual-close" onclick="closeManualLabel()" aria-label="Exit manual labeling">✕</button>
       <div id="manual-title">✏️ Manual labeling <span id="manual-streak"></span></div>
       <div id="manual-controls">
-        <select id="manual-class" title="Class for this box">
+        <select id="manual-class" title="Class for the box you're currently drawing">
           <option value="0">fish</option>
           <option value="1">shrimp</option>
         </select>
+        <button id="manual-add" onclick="manualAddBox()">+ Add another</button>
         <button id="manual-clear" onclick="clearManualBox()">Clear</button>
         <button id="manual-skip" onclick="manualNextFrame()">Skip frame</button>
         <button id="manual-save" onclick="saveManualLabel()">Save &amp; next</button>
       </div>
     </div>
     <div id="manual-hint">
-      <span class="manual-hint-mouse">Click and drag to draw a box. Drag corners to resize, ✋ to move. Save loads the next frame; ✕ exits back to auto labeling.</span>
-      <span class="manual-hint-touch">Tap to drop a box. Drag corners to resize, ✋ to move. Save loads the next frame; ✕ exits back to auto labeling.</span>
+      <span class="manual-hint-mouse">Click-drag to draw a box. Drag corners to resize, ✋ to move. <b>+ Add another</b> saves the current box locally and starts a fresh one — repeat for multiple fish in the same frame. <b>Save &amp; next</b> writes them all to a single label and loads the next frame; ✕ exits.</span>
+      <span class="manual-hint-touch">Tap to drop a box. Drag corners to resize, ✋ to move. <b>+ Add another</b> for multiple boxes per frame. <b>Save &amp; next</b> writes them all and advances; ✕ exits.</span>
     </div>
     <div id="manual-canvas-wrap">
       <canvas id="manual-canvas"></canvas>
@@ -2175,11 +2204,14 @@ document.addEventListener('keydown', e => {
 //   - Saving issues GET /label/manual?class=…&cx,cy,w,h=… and the backend
 //     captures the *current* _frame as the image, so the saved label always
 //     matches what the user sees.
-let manualImg  = null;     // Image() of the snapped frame
-let manualBox  = null;     // {x, y, w, h} in image-pixel coords (px on naturalWidth/Height)
-let manualMode = 'idle';   // 'drawing' | 'moving' | 'tl' | 'tr' | 'bl' | 'br' | 'idle'
-let manualLast = null;     // last pointer pos (img-coords) used by 'moving'
-let manualSavedCount = 0;  // labels saved during this manual session — reset on close
+let manualImg    = null;   // Image() of the snapped frame
+let manualBoxes  = [];     // frozen boxes for the CURRENT frame: [{x,y,w,h,cls}, ...]
+let manualBox    = null;   // ACTIVE editable box {x,y,w,h} or null (no class yet —
+                           // class is taken from the dropdown when it's frozen)
+let manualMode   = 'idle'; // 'drawing' | 'moving' | 'tl' | 'tr' | 'bl' | 'br' | 'idle'
+let manualLast   = null;   // last pointer pos (img-coords) used by 'moving'
+let manualSavedCount = 0;  // images saved during this manual session — reset on close
+const MANUAL_CLASS_NAMES = ['fish', 'shrimp'];
 const MANUAL_HANDLE_PX = 18;  // hit radius around corner handles in canvas-coords
 const MANUAL_HAND_PX   = 28;  // hit radius around the center ✋ handle
 
@@ -2197,6 +2229,7 @@ function manualLoadFrame(opts) {
     const img = new Image();
     img.onload = () => {
       manualImg = img;
+      manualBoxes = [];
       manualBox = null;
       manualMode = 'idle';
       const cv = document.getElementById('manual-canvas');
@@ -2235,13 +2268,43 @@ function closeManualLabel() {
   // Exits manual mode and returns the labeling tab to the auto-candidate flow.
   document.getElementById('manual-overlay').classList.remove('open');
   manualImg = null;
+  manualBoxes = [];
   manualBox = null;
   manualMode = 'idle';
   manualSavedCount = 0;
   manualUpdateStreak();
 }
 
+// "Clear" pops what the user drew most recently:
+//   - active box first (the one with handles), or
+//   - if there's no active box, the last frozen box from manualBoxes.
+// This lets the user undo step-by-step without nuking everything.
 function clearManualBox() {
+  if (manualBox) {
+    manualBox = null;
+  } else if (manualBoxes.length > 0) {
+    manualBoxes.pop();
+  }
+  manualMode = 'idle';
+  drawManualCanvas();
+}
+
+// Validate the active box and freeze it into manualBoxes with the currently
+// selected class, then reset the active box so the user can draw the next one.
+function manualAddBox() {
+  if (!manualBox) {
+    alert('Draw a box first, then tap "+ Add another".');
+    return;
+  }
+  let {x, y, w, h} = manualBox;
+  if (w < 0) { x += w; w = -w; }
+  if (h < 0) { y += h; h = -h; }
+  if (w < 6 || h < 6) {
+    alert('Box too small — draw a bigger one before adding.');
+    return;
+  }
+  const cls = parseInt(document.getElementById('manual-class').value, 10) || 0;
+  manualBoxes.push({ x, y, w, h, cls });
   manualBox = null;
   manualMode = 'idle';
   drawManualCanvas();
@@ -2252,28 +2315,46 @@ function drawManualCanvas() {
   if (!cv || !manualImg) return;
   const ctx = cv.getContext('2d');
   ctx.drawImage(manualImg, 0, 0);
+  const lineW = Math.max(2, Math.round(cv.width / 480));
+  // 1) Frozen boxes — drawn dimmer, with class label, no handles.
+  for (const b of manualBoxes) {
+    ctx.lineWidth = lineW;
+    ctx.strokeStyle = '#7c4dff';
+    ctx.fillStyle = 'rgba(124, 77, 255, 0.10)';
+    ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.strokeRect(b.x, b.y, b.w, b.h);
+    // Class label tag in the top-left corner of the box.
+    const name = MANUAL_CLASS_NAMES[b.cls] || ('class_' + b.cls);
+    const fontPx = Math.max(14, Math.round(cv.width / 80));
+    ctx.font = `bold ${fontPx}px sans-serif`;
+    ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';
+    const padX = 6, padY = 4;
+    const textW = ctx.measureText(name).width;
+    ctx.fillStyle = '#7c4dff';
+    ctx.fillRect(b.x, b.y, textW + padX * 2, fontPx + padY * 2);
+    ctx.fillStyle = '#fff';
+    ctx.fillText(name, b.x + padX, b.y + padY);
+  }
+  // 2) Active box (the one with handles) on top.
   if (!manualBox) return;
   let {x, y, w, h} = manualBox;
-  // Render even with negative w/h while user is dragging.
-  ctx.lineWidth = Math.max(2, Math.round(cv.width / 480));
+  ctx.lineWidth = lineW;
   ctx.strokeStyle = '#00d4aa';
   ctx.fillStyle = 'rgba(0, 212, 170, 0.10)';
   ctx.fillRect(x, y, w, h);
   ctx.strokeRect(x, y, w, h);
-  // Corner handles (only once the box is "real" — i.e. not in active drawing)
   if (manualMode !== 'drawing') {
     const hs = MANUAL_HANDLE_PX;
     ctx.fillStyle = '#00d4aa';
     [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].forEach(([cx, cy]) => {
       ctx.fillRect(cx - hs / 2, cy - hs / 2, hs, hs);
     });
-    // Center ✋ move handle
     const cx = x + w / 2, cy = y + h / 2;
     const fontPx = Math.max(28, Math.round(cv.width / 28));
     ctx.font = `${fontPx}px serif`;
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    // Soft halo so the emoji stays visible on busy backgrounds
     ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
     ctx.fillText('✋', cx + 1, cy + 1);
     ctx.fillStyle = '#fff';
@@ -2380,27 +2461,45 @@ function manualHitTest(x, y) {
 })();
 
 function saveManualLabel() {
-  if (!manualBox || !manualImg) {
-    alert('Draw a box first.');
-    return;
-  }
-  let {x, y, w, h} = manualBox;
-  if (w < 0) { x += w; w = -w; }
-  if (h < 0) { y += h; h = -h; }
-  if (w < 6 || h < 6) {
-    alert('Box too small — draw a bigger one.');
-    return;
-  }
+  if (!manualImg) return;
   const W = manualImg.naturalWidth, H = manualImg.naturalHeight;
-  // Clamp the box inside the image just in case the user dragged past the edge.
-  x = Math.max(0, Math.min(W, x));
-  y = Math.max(0, Math.min(H, y));
-  w = Math.min(W - x, w);
-  h = Math.min(H - y, h);
-  const cx = (x + w / 2) / W, cy = (y + h / 2) / H;
-  const wn = w / W, hn = h / H;
-  const cls = parseInt(document.getElementById('manual-class').value, 10) || 0;
-  const url = `/label/manual?class=${cls}&cx=${cx.toFixed(6)}&cy=${cy.toFixed(6)}&w=${wn.toFixed(6)}&h=${hn.toFixed(6)}`;
+  // Snapshot all boxes the user has staged for this frame, including the
+  // active one if it's drawn and big enough — saves them a tap when the user
+  // forgets to hit "+ Add another" before "Save & next".
+  const all = manualBoxes.slice();
+  if (manualBox) {
+    let {x, y, w, h} = manualBox;
+    if (w < 0) { x += w; w = -w; }
+    if (h < 0) { y += h; h = -h; }
+    if (w >= 6 && h >= 6) {
+      const cls = parseInt(document.getElementById('manual-class').value, 10) || 0;
+      all.push({ x, y, w, h, cls });
+    }
+  }
+  if (all.length === 0) {
+    alert('Draw at least one box before saving.');
+    return;
+  }
+  // Build a multi-box query string. Each box=cls,cx,cy,w,h with normalized
+  // [0, 1] coords clamped to the image bounds.
+  const params = ['t=' + Date.now()];
+  for (const b of all) {
+    let {x, y, w, h, cls} = b;
+    x = Math.max(0, Math.min(W, x));
+    y = Math.max(0, Math.min(H, y));
+    w = Math.min(W - x, w);
+    h = Math.min(H - y, h);
+    if (w < 1 || h < 1) continue;
+    const cx = (x + w / 2) / W;
+    const cy = (y + h / 2) / H;
+    const wn = w / W, hn = h / H;
+    params.push(`box=${cls},${cx.toFixed(6)},${cy.toFixed(6)},${wn.toFixed(6)},${hn.toFixed(6)}`);
+  }
+  if (params.length === 1) {  // only the cachebuster
+    alert('No valid boxes to save.');
+    return;
+  }
+  const url = '/label/manual?' + params.join('&');
   const saveBtn = document.getElementById('manual-save');
   if (saveBtn) saveBtn.disabled = true;
   fetch(url).then(r => r.json()).then(d => {
@@ -2408,8 +2507,7 @@ function saveManualLabel() {
     manualSavedCount += 1;
     manualUpdateStreak();
     refreshTrainLabels();
-    // Stay in manual mode for consecutive frames — the user clicks ✕ to exit
-    // back to auto labeling.
+    // Stay in manual mode for consecutive frames — the user clicks ✕ to exit.
     return manualLoadFrame();
   }).catch(() => alert('Save failed.'))
    .finally(() => { if (saveBtn) saveBtn.disabled = false; });
