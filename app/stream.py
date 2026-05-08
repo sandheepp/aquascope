@@ -51,7 +51,7 @@ _hat_lock = threading.Lock()
 _trails_enabled = False
 _trails_lock = threading.Lock()
 
-_enhance_enabled = True
+_enhance_enabled = False
 _enhance_lock = threading.Lock()
 
 _conf_threshold = 0.35
@@ -587,6 +587,10 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_label_image(p[len("/label/image/"):])
         elif p == "/label/decision":
             self._serve_label_decision()
+        elif p == "/label/snap":
+            self._serve_label_snap()
+        elif p == "/label/manual":
+            self._serve_label_manual()
         elif p == "/train/labels":
             self._serve_train_labels()
         elif p == "/train/start":
@@ -828,6 +832,65 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         result = _label_decide(cid, keep)
         self._json_response(json.dumps(result).encode())
 
+    def _serve_label_snap(self):
+        """Serve the latest pushed frame as a JPEG so the manual-label modal
+        can draw it onto a canvas without needing to capture from the MJPEG
+        <img> (cross-origin canvas reads would taint, and the latest frame is
+        already cached in _frame)."""
+        with _lock:
+            data = _frame
+        if not data:
+            self.send_response(503)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"error":"no frame yet"}')
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _serve_label_manual(self):
+        """Save a hand-drawn box from the manual-label modal as a YOLO label.
+
+        Query params (all required except `class`, default 0):
+          class=<int>   class index in _label_class_names
+          cx,cy,w,h     bounding box in normalized [0, 1] image coordinates
+        The current _frame is captured as the image, so the label always
+        matches what the user saw when they drew the box.
+        """
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+        try:
+            cls_idx = int(params.get("class", 0))
+            cx = float(params["cx"]); cy = float(params["cy"])
+            bw = float(params["w"]);  bh = float(params["h"])
+        except (KeyError, ValueError):
+            self._json_response(b'{"error":"missing or invalid params"}')
+            return
+        cx = max(0.0, min(1.0, cx)); cy = max(0.0, min(1.0, cy))
+        bw = max(0.001, min(1.0, bw)); bh = max(0.001, min(1.0, bh))
+        with _lock:
+            frame_jpeg = _frame
+        if not frame_jpeg:
+            self._json_response(b'{"error":"no frame yet"}')
+            return
+        out_dir = _label_output_dir
+        os.makedirs(os.path.join(out_dir, "images"), exist_ok=True)
+        os.makedirs(os.path.join(out_dir, "labels"), exist_ok=True)
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = f"{ts}_{uuid.uuid4().hex[:8]}_manual"
+        img_path = os.path.join(out_dir, "images", f"{base}.jpg")
+        lbl_path = os.path.join(out_dir, "labels", f"{base}.txt")
+        with open(img_path, "wb") as f:
+            f.write(frame_jpeg)
+        with open(lbl_path, "w") as f:
+            f.write(f"{cls_idx} {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+        self._json_response(json.dumps({"saved": True, "image": img_path,
+                                        "label": lbl_path}).encode())
+
     def _serve_screenshot(self):
         with _lock:
             frame = _frame
@@ -928,7 +991,20 @@ body{
     height:auto;min-height:100vh;
     overflow-y:auto;overflow-x:hidden;
   }
-  #sidebar{ display:none !important }
+  /* Sidebar slides in from the left as an overlay drawer; #nav-toggle
+     button (only visible on mobile) flips a body.nav-open class. */
+  #sidebar{
+    position:fixed;top:0;left:0;bottom:0;z-index:60;
+    width:240px;max-width:85vw;
+    transform:translateX(-100%);transition:transform 0.22s ease-out;
+    box-shadow:6px 0 18px rgba(0,0,0,0.55);
+  }
+  body.nav-open #sidebar{ transform:translateX(0) }
+  body.nav-open::after{
+    content:"";position:fixed;inset:0;background:rgba(0,0,0,0.55);
+    z-index:55;
+  }
+  #nav-toggle{ display:inline-flex !important }
   #topbar{
     padding:0 10px;flex-shrink:0;
     position:sticky;top:0;z-index:20;
@@ -1004,6 +1080,12 @@ body{
 }
 .topbar-left{display:flex;align-items:center;gap:14px}
 .page-title{font-size:15px;font-weight:600;color:var(--text)}
+#nav-toggle{
+  display:none;align-items:center;justify-content:center;
+  background:transparent;color:var(--text);border:1px solid var(--border);
+  width:32px;height:32px;border-radius:6px;font-size:16px;cursor:pointer;
+}
+#nav-toggle:hover{background:rgba(255,255,255,0.04)}
 .live-badge{
   background:linear-gradient(90deg,rgba(0,212,170,0.18) 0%,rgba(0,212,170,0.06) 100%);color:var(--teal);
   border:1px solid rgba(0,212,170,0.3);
@@ -1106,6 +1188,56 @@ body{
   background:linear-gradient(135deg,#3a3a4a 0%,#2a2a35 100%);color:#666;cursor:not-allowed;
 }
 #train-btn:not(:disabled):hover{opacity:0.88}
+
+/* ── Manual-label modal ── */
+#manual-overlay{
+  display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);
+  align-items:center;justify-content:center;z-index:200;padding:16px;
+}
+#manual-overlay.open{display:flex}
+#manual-card{
+  background:var(--card);border:1px solid var(--border);border-radius:12px;
+  padding:14px 16px;width:min(960px, 95vw);max-height:92vh;
+  display:flex;flex-direction:column;gap:10px;
+}
+#manual-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
+#manual-title{font-size:14px;font-weight:700;color:var(--accent)}
+#manual-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+#manual-class{
+  background:#1a2130;color:var(--fg);border:1px solid var(--border);
+  padding:6px 8px;border-radius:6px;font-size:12px;cursor:pointer;
+}
+#manual-controls button{
+  background:#1a2130;color:var(--fg);border:1px solid var(--border);
+  padding:6px 12px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;
+}
+#manual-controls #manual-save{
+  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;
+  border:none;
+}
+#manual-controls #manual-cancel{color:var(--danger);border-color:rgba(252,92,101,0.4)}
+#manual-controls button:hover{opacity:0.88}
+#manual-hint{color:var(--dim);font-size:11px}
+.manual-hint-touch{display:none}
+@media (hover: none) and (pointer: coarse) {
+  .manual-hint-mouse{display:none}
+  .manual-hint-touch{display:inline}
+}
+#manual-canvas-wrap{
+  flex:1;min-height:240px;
+  background:#000;border:1px solid var(--border);border-radius:8px;
+  overflow:hidden;display:flex;align-items:center;justify-content:center;
+}
+#manual-canvas{
+  max-width:100%;max-height:80vh;display:block;
+  touch-action:none;        /* let pointer events drive the drawing */
+  cursor:crosshair;
+}
+#manual-label-btn{
+  background:#1a2130;color:var(--fg);border:1px solid var(--border);
+  padding:10px 18px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;
+}
+#manual-label-btn:hover{background:rgba(255,255,255,0.04)}
 
 /* ── Training modal ── */
 #train-overlay{
@@ -1400,6 +1532,7 @@ body{
 <!-- Topbar -->
 <header id="topbar">
   <div class="topbar-left">
+    <button id="nav-toggle" onclick="toggleNav()" aria-label="Open navigation">☰</button>
     <div class="page-title">Live Feed</div>
     <div class="live-badge">● LIVE</div>
   </div>
@@ -1494,7 +1627,7 @@ body{
       </div>
     </div>
     <button id="trails-btn" onclick="toggleTrails()">〰 Trails: OFF</button>
-    <button id="enhance-btn" class="on" onclick="toggleEnhance()">✨ Enhance: ON</button>
+    <button id="enhance-btn" onclick="toggleEnhance()">✨ Enhance: OFF</button>
     <button id="hat-btn" onclick="toggleHat()">🎩 Party Hats: OFF</button>
     <button id="reset-btn" onclick="doReset()">↺ Reset Trails</button>
   </div>
@@ -1544,9 +1677,36 @@ body{
   <div class="card" id="label-actions">
     <button class="reject" onclick="labelDecision(0)">✗ Not a fish</button>
     <button class="accept" onclick="labelDecision(1)">✓ Yes, fish</button>
+    <button id="manual-label-btn" onclick="openManualLabel()">✏️ Manual label</button>
     <span class="stat-lbl" style="margin-left:auto">Shortcuts: <span class="stat-val">y</span> / <span class="stat-val">n</span></span>
   </div>
 </main>
+
+<!-- Manual-label modal: snap the latest frame, draw/move/resize a single
+     box, then save it as a YOLO label under dataset/user_recorded. -->
+<div id="manual-overlay">
+  <div id="manual-card">
+    <div id="manual-header">
+      <div id="manual-title">✏️ Manual label</div>
+      <div id="manual-controls">
+        <select id="manual-class" title="Class for this box">
+          <option value="0">fish</option>
+          <option value="1">shrimp</option>
+        </select>
+        <button id="manual-clear" onclick="clearManualBox()">Clear</button>
+        <button id="manual-cancel" onclick="closeManualLabel()">Cancel</button>
+        <button id="manual-save" onclick="saveManualLabel()">Save</button>
+      </div>
+    </div>
+    <div id="manual-hint">
+      <span class="manual-hint-mouse">Click and drag to draw a box. Drag corners to resize, the ✋ in the center to move.</span>
+      <span class="manual-hint-touch">Tap on the image to drop a box. Drag corners to resize, ✋ to move.</span>
+    </div>
+    <div id="manual-canvas-wrap">
+      <canvas id="manual-canvas"></canvas>
+    </div>
+  </div>
+</div>
 
 <!-- Filmstrip -->
 <footer id="filmstrip">
@@ -1849,7 +2009,22 @@ function switchTab(tab) {
   const el = document.getElementById(navId);
   if (el) el.classList.add('active');
   if (labelTabActive) labelTick();
+  // Close the mobile nav drawer once a tab is picked.
+  document.body.classList.remove('nav-open');
 }
+
+function toggleNav() {
+  document.body.classList.toggle('nav-open');
+}
+// Tap outside the drawer to dismiss it.
+document.addEventListener('click', (e) => {
+  if (!document.body.classList.contains('nav-open')) return;
+  const sb = document.getElementById('sidebar');
+  const tg = document.getElementById('nav-toggle');
+  if (sb && !sb.contains(e.target) && tg && !tg.contains(e.target)) {
+    document.body.classList.remove('nav-open');
+  }
+});
 
 function toggleLabeling() {
   fetch('/label/toggle').then(r => r.json()).then(d => {
@@ -1923,6 +2098,221 @@ document.addEventListener('keydown', e => {
   if (e.key === 'y' || e.key === 'Y' || e.key === 'ArrowRight') labelDecision(1);
   if (e.key === 'n' || e.key === 'N' || e.key === 'ArrowLeft')  labelDecision(0);
 });
+
+// ── Manual label modal ────────────────────────────────────
+//
+// One box per modal session. Pointer model handles both mouse and touch via
+// the unified Pointer Events API:
+//   - Empty canvas, mouse:  pointerdown/move/up = drag-to-draw a new box
+//   - Empty canvas, touch:  pointerdown drops a default-sized box
+//   - Existing box:         pointerdown on a corner handle = resize that corner
+//                           pointerdown on the center hand = move
+//   - Saving issues GET /label/manual?class=…&cx,cy,w,h=… and the backend
+//     captures the *current* _frame as the image, so the saved label always
+//     matches what the user sees.
+let manualImg  = null;     // Image() of the snapped frame
+let manualBox  = null;     // {x, y, w, h} in image-pixel coords (px on naturalWidth/Height)
+let manualMode = 'idle';   // 'drawing' | 'moving' | 'tl' | 'tr' | 'bl' | 'br' | 'idle'
+let manualLast = null;     // last pointer pos (img-coords) used by 'moving'
+const MANUAL_HANDLE_PX = 18;  // hit radius around corner handles in canvas-coords
+const MANUAL_HAND_PX   = 28;  // hit radius around the center ✋ handle
+
+function openManualLabel() {
+  fetch('/label/snap?t=' + Date.now()).then(r => {
+    if (!r.ok) throw new Error('no frame');
+    return r.blob();
+  }).then(blob => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      manualImg = img;
+      manualBox = null;
+      manualMode = 'idle';
+      const cv = document.getElementById('manual-canvas');
+      cv.width  = img.naturalWidth;
+      cv.height = img.naturalHeight;
+      drawManualCanvas();
+      document.getElementById('manual-overlay').classList.add('open');
+      URL.revokeObjectURL(url);
+    };
+    img.onerror = () => alert('Could not load the live frame.');
+    img.src = url;
+  }).catch(() => alert('No frame available yet — wait a moment and try again.'));
+}
+
+function closeManualLabel() {
+  document.getElementById('manual-overlay').classList.remove('open');
+  manualImg = null;
+  manualBox = null;
+  manualMode = 'idle';
+}
+
+function clearManualBox() {
+  manualBox = null;
+  manualMode = 'idle';
+  drawManualCanvas();
+}
+
+function drawManualCanvas() {
+  const cv = document.getElementById('manual-canvas');
+  if (!cv || !manualImg) return;
+  const ctx = cv.getContext('2d');
+  ctx.drawImage(manualImg, 0, 0);
+  if (!manualBox) return;
+  let {x, y, w, h} = manualBox;
+  // Render even with negative w/h while user is dragging.
+  ctx.lineWidth = Math.max(2, Math.round(cv.width / 480));
+  ctx.strokeStyle = '#00d4aa';
+  ctx.fillStyle = 'rgba(0, 212, 170, 0.10)';
+  ctx.fillRect(x, y, w, h);
+  ctx.strokeRect(x, y, w, h);
+  // Corner handles (only once the box is "real" — i.e. not in active drawing)
+  if (manualMode !== 'drawing') {
+    const hs = MANUAL_HANDLE_PX;
+    ctx.fillStyle = '#00d4aa';
+    [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].forEach(([cx, cy]) => {
+      ctx.fillRect(cx - hs / 2, cy - hs / 2, hs, hs);
+    });
+    // Center ✋ move handle
+    const cx = x + w / 2, cy = y + h / 2;
+    const fontPx = Math.max(28, Math.round(cv.width / 28));
+    ctx.font = `${fontPx}px serif`;
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    // Soft halo so the emoji stays visible on busy backgrounds
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+    ctx.fillText('✋', cx + 1, cy + 1);
+    ctx.fillStyle = '#fff';
+    ctx.fillText('✋', cx, cy);
+  }
+}
+
+function manualEventToImage(e) {
+  const cv = document.getElementById('manual-canvas');
+  const rect = cv.getBoundingClientRect();
+  const sx = cv.width / rect.width;
+  const sy = cv.height / rect.height;
+  return {
+    x: (e.clientX - rect.left) * sx,
+    y: (e.clientY - rect.top) * sy,
+  };
+}
+
+function manualHitTest(x, y) {
+  if (!manualBox) return null;
+  let {x: bx, y: by, w, h} = manualBox;
+  // Normalize to positive size for hit-testing
+  if (w < 0) { bx += w; w = -w; }
+  if (h < 0) { by += h; h = -h; }
+  const hs = MANUAL_HANDLE_PX;
+  if (Math.abs(x - bx)       < hs && Math.abs(y - by)       < hs) return 'tl';
+  if (Math.abs(x - (bx + w)) < hs && Math.abs(y - by)       < hs) return 'tr';
+  if (Math.abs(x - bx)       < hs && Math.abs(y - (by + h)) < hs) return 'bl';
+  if (Math.abs(x - (bx + w)) < hs && Math.abs(y - (by + h)) < hs) return 'br';
+  const cx = bx + w / 2, cy = by + h / 2;
+  if (Math.abs(x - cx) < MANUAL_HAND_PX && Math.abs(y - cy) < MANUAL_HAND_PX) return 'moving';
+  return null;
+}
+
+(function bindManualCanvas() {
+  const cv = document.getElementById('manual-canvas');
+  if (!cv) return;
+
+  cv.addEventListener('pointerdown', (e) => {
+    if (!manualImg) return;
+    e.preventDefault();
+    cv.setPointerCapture(e.pointerId);
+    const p = manualEventToImage(e);
+
+    if (manualBox) {
+      const hit = manualHitTest(p.x, p.y);
+      if (hit) {
+        manualMode = hit;
+        manualLast = p;
+        return;
+      }
+    }
+    // Empty canvas (or pointer outside box): touch drops a default box,
+    // mouse starts a click-drag draw.
+    if (e.pointerType === 'touch' || e.pointerType === 'pen') {
+      const sz = Math.min(cv.width, cv.height) * 0.20;
+      manualBox = { x: p.x - sz / 2, y: p.y - sz / 2, w: sz, h: sz };
+      manualMode = 'idle';
+      drawManualCanvas();
+    } else {
+      manualBox = { x: p.x, y: p.y, w: 0, h: 0 };
+      manualMode = 'drawing';
+      manualLast = p;
+    }
+  });
+
+  cv.addEventListener('pointermove', (e) => {
+    if (manualMode === 'idle' || !manualBox) return;
+    e.preventDefault();
+    const p = manualEventToImage(e);
+    if (manualMode === 'drawing') {
+      manualBox.w = p.x - manualBox.x;
+      manualBox.h = p.y - manualBox.y;
+    } else if (manualMode === 'moving') {
+      manualBox.x += p.x - manualLast.x;
+      manualBox.y += p.y - manualLast.y;
+      manualLast = p;
+    } else {
+      // Resize: anchor the opposite corner and let this corner follow the pointer.
+      let {x: bx, y: by, w, h} = manualBox;
+      let right = bx + w, bottom = by + h;
+      if (manualMode === 'tl') { bx = p.x; by = p.y; }
+      if (manualMode === 'tr') { right = p.x; by = p.y; }
+      if (manualMode === 'bl') { bx = p.x; bottom = p.y; }
+      if (manualMode === 'br') { right = p.x; bottom = p.y; }
+      manualBox = { x: bx, y: by, w: right - bx, h: bottom - by };
+    }
+    drawManualCanvas();
+  });
+
+  cv.addEventListener('pointerup', (e) => {
+    if (manualMode === 'drawing' && manualBox) {
+      // Normalize negative drags to positive box.
+      let {x, y, w, h} = manualBox;
+      if (w < 0) { x += w; w = -w; }
+      if (h < 0) { y += h; h = -h; }
+      manualBox = { x, y, w, h };
+    }
+    manualMode = 'idle';
+    drawManualCanvas();
+    try { cv.releasePointerCapture(e.pointerId); } catch (_) {}
+  });
+  cv.addEventListener('pointercancel', () => { manualMode = 'idle'; });
+})();
+
+function saveManualLabel() {
+  if (!manualBox || !manualImg) {
+    alert('Draw a box first.');
+    return;
+  }
+  let {x, y, w, h} = manualBox;
+  if (w < 0) { x += w; w = -w; }
+  if (h < 0) { y += h; h = -h; }
+  if (w < 6 || h < 6) {
+    alert('Box too small — draw a bigger one.');
+    return;
+  }
+  const W = manualImg.naturalWidth, H = manualImg.naturalHeight;
+  // Clamp the box inside the image just in case the user dragged past the edge.
+  x = Math.max(0, Math.min(W, x));
+  y = Math.max(0, Math.min(H, y));
+  w = Math.min(W - x, w);
+  h = Math.min(H - y, h);
+  const cx = (x + w / 2) / W, cy = (y + h / 2) / H;
+  const wn = w / W, hn = h / H;
+  const cls = parseInt(document.getElementById('manual-class').value, 10) || 0;
+  const url = `/label/manual?class=${cls}&cx=${cx.toFixed(6)}&cy=${cy.toFixed(6)}&w=${wn.toFixed(6)}&h=${hn.toFixed(6)}`;
+  fetch(url).then(r => r.json()).then(d => {
+    if (d.error) { alert('Could not save: ' + d.error); return; }
+    closeManualLabel();
+    refreshTrainLabels();
+  }).catch(() => alert('Save failed.'));
+}
 
 // Poll the queue while the Training tab is open.
 setInterval(() => { if (labelTabActive) labelTick(); }, 1000);
