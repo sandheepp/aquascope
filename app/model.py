@@ -2,6 +2,17 @@
 Model loading and inference for AquaScope.
 
 Wraps YOLOv8 (+ optional SAHI sliced inference) and returns supervision Detections.
+
+Device selection is automatic: CUDA (Jetson, NVIDIA laptop) → MPS (Apple
+Silicon) → CPU. The active device is cached in `config["_device"]` after
+the first load so inference doesn't re-detect every frame.
+
+Model fallback chain (so a fresh laptop clone "just works"):
+  1. The `--model` value the user passed.
+  2. If that's a `.engine` and the file is missing, try the matching `.pt`.
+  3. If THAT is also missing AND the user didn't override the default, fall
+     back to `yolov8n.pt` — Ultralytics will download it on first use, so a
+     laptop user can run the dashboard immediately without a Jetson engine.
 """
 
 import os
@@ -11,21 +22,60 @@ import supervision as sv
 from ultralytics import YOLO
 
 
-def load_model(config: dict) -> YOLO:
-    """Load a YOLOv8 model, falling back from .engine to .pt when needed."""
-    path = config["model_path"]
-    if path.endswith(".engine") and not os.path.exists(path):
+def _detect_device() -> str:
+    """Return 'cuda', 'mps', or 'cpu' — first one that's actually usable."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
+        # MPS (Apple Silicon): older PyTorch builds don't have the attribute.
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is not None and mps_backend.is_available():
+            return "mps"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def _resolve_model_path(path: str) -> str:
+    """Walk the fallback chain (.engine → .pt → yolov8n.pt). Returns whatever
+    we'll actually hand to YOLO()."""
+    if os.path.exists(path):
+        return path
+
+    # .engine missing → try sibling .pt
+    if path.endswith(".engine"):
         pt = path.replace(".engine", ".pt")
-        print(f"[MODEL] Engine not found: {path}")
-        print(f"[MODEL] Falling back to: {pt}")
-        print(
-            f"[MODEL] Export hint: python3 -c \"from ultralytics import YOLO; "
-            f"YOLO('{pt}').export(format='engine', device=0, half=True, "
-            f"imgsz={config['imgsz']})\""
-        )
-        path = pt
-    print(f"[MODEL] Loading YOLO: {path}")
-    return YOLO(path, task="detect")
+        if os.path.exists(pt):
+            print(f"[MODEL] Engine not found ({path}); using {pt} instead.")
+            return pt
+        # Default model location wasn't built yet (fresh clone, no Jetson) — fall
+        # through to yolov8n.pt rather than crashing.
+        if path == "models/best.engine":
+            print(f"[MODEL] No fine-tuned weights yet; using yolov8n.pt "
+                  f"(Ultralytics will download on first run).")
+            return "yolov8n.pt"
+
+    # .pt missing — let YOLO() try to download it (works for the standard
+    # yolov8{n,s,m,l,x}.pt names) or raise a clearer error.
+    print(f"[MODEL] {path} not found locally; YOLO() will attempt a download.")
+    return path
+
+
+def load_model(config: dict) -> YOLO:
+    """Load a YOLOv8 model with sensible cross-platform defaults."""
+    resolved = _resolve_model_path(config["model_path"])
+    config["model_path"] = resolved
+
+    device = config.get("_device") or _detect_device()
+    config["_device"] = device
+    print(f"[MODEL] Loading {resolved} on device='{device}'")
+
+    model = YOLO(resolved, task="detect")
+    # Ultralytics moves the model to whatever `device=` the predict/train call
+    # uses, so we don't need an explicit .to(device) here — but stash it on
+    # config so run_inference() doesn't have to re-detect.
+    return model
 
 
 def slice_tiles(
@@ -62,6 +112,9 @@ def run_inference(
     config: dict,
     conf_threshold: float,
 ) -> sv.Detections:
+    device = config.get("_device") or _detect_device()
+    config["_device"] = device
+
     if config.get("sahi"):
         all_xyxy: list[np.ndarray] = []
         all_confs: list[np.ndarray] = []
@@ -73,7 +126,7 @@ def run_inference(
                 imgsz=config["imgsz"],
                 verbose=False,
                 classes=config.get("detect_classes"),
-                device=0,
+                device=device,
             )
             if not (results and results[0].boxes is not None and len(results[0].boxes)):
                 continue
@@ -99,7 +152,7 @@ def run_inference(
         imgsz=config["imgsz"],
         verbose=False,
         classes=config.get("detect_classes"),
-        device=0,
+        device=device,
     )
     if results and results[0].boxes is not None and len(results[0].boxes):
         xyxy = results[0].boxes.xyxy.cpu().numpy().astype(np.float32)

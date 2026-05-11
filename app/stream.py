@@ -357,29 +357,42 @@ def estimate_training_minutes(label_count: int, epochs: int = _TRAIN_DEFAULT_EPO
 
 
 def latest_engine_version() -> tuple[int, str | None]:
-    """Return (version, path) for the highest versioned engine in models/.
+    """Return (version, path) for the highest versioned weight in models/.
 
-    New format: best_v<N>.engine  (the .engine extension is what TensorRT
-    inference loaders detect, so files MUST end in .engine).
-    Old format: best.engine_v<N>  (still recognized so pre-rename engines
-    keep working — but these files don't load with the .engine extension
-    handler, so they'll fall back to PyTorch path. Re-train to migrate.)
+    Prefers TensorRT engines (faster on the Jetson) but also picks up plain
+    .pt files so the dashboard auto-switches after a CPU/MPS train where no
+    .engine is produced.
+
+    Patterns recognized:
+      - best_v<N>.engine          (preferred — TensorRT loader uses .engine)
+      - best.engine_v<N>          (legacy)
+      - best_v<N>.pt              (cross-platform fallback)
+
+    For the same N, .engine wins over .pt.
     """
     import re
     if not os.path.isdir(_models_dir):
         return 0, None
     best_n = 0
     best_path: str | None = None
-    new_pat = re.compile(r"^best_v(\d+)\.engine$")
-    old_pat = re.compile(r"^best\.engine_v(\d+)$")
+    best_is_engine = False
+    new_engine = re.compile(r"^best_v(\d+)\.engine$")
+    old_engine = re.compile(r"^best\.engine_v(\d+)$")
+    pt_pat     = re.compile(r"^best_v(\d+)\.pt$")
     for name in os.listdir(_models_dir):
-        m = new_pat.match(name) or old_pat.match(name)
+        is_engine = True
+        m = new_engine.match(name) or old_engine.match(name)
+        if not m:
+            m = pt_pat.match(name)
+            is_engine = False
         if not m:
             continue
         n = int(m.group(1))
-        if n > best_n:
+        # Higher version always wins; on a tie, .engine beats .pt.
+        if n > best_n or (n == best_n and is_engine and not best_is_engine):
             best_n = n
             best_path = os.path.join(_models_dir, name)
+            best_is_engine = is_engine
     return best_n, best_path
 
 

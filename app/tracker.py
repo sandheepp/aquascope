@@ -418,7 +418,9 @@ class FishTracker:
                         set_model_path(prev)
 
                 desired_res = get_resolution()
-                if desired_res != self._applied_resolution:
+                if desired_res != self._applied_resolution and not self.config.get("is_video_file"):
+                    # Video files have a fixed resolution; only honour the
+                    # dropdown when we're talking to a webcam.
                     w, h = _RESOLUTIONS[desired_res]
                     self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, w)
                     self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, h)
@@ -548,15 +550,22 @@ class FishTracker:
 
     def _read_frame(self) -> np.ndarray | None:
         ret, frame = self.cap.read()
-        if not ret:
-            if not self.cap.isOpened():
-                print("[CAM] Disconnected — reconnecting...")
-                old = self.cap
-                self.cap = init_camera(self.config)
-                old.release()
-            else:
-                print("[CAM] Frame capture failed, retrying...")
-        return frame if ret else None
+        if ret:
+            return frame
+        # Video file: loop on EOF so demos play indefinitely.
+        if self.config.get("is_video_file"):
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self.cap.read()
+            return frame if ret else None
+        # Webcam: try to reopen if the device dropped.
+        if not self.cap.isOpened():
+            print("[CAM] Disconnected — reconnecting...")
+            old = self.cap
+            self.cap = init_camera(self.config)
+            old.release()
+        else:
+            print("[CAM] Frame capture failed, retrying...")
+        return None
 
     # ── Inference + annotation ────────────────────────────
 

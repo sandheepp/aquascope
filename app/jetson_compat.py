@@ -1,25 +1,29 @@
 """
 Jetson Orin Nano compatibility shims.
 
-MUST be imported before torch, torchvision, or ultralytics.
-Fixes two issues with the Jetson nv24.08 PyTorch build:
+Imported before torch / torchvision / ultralytics. Two issues fixed when
+running on the Jetson nv24.08 PyTorch build:
 
 1. Qt crash when no X display is present (sets QT_QPA_PLATFORM=offscreen).
-2. torchvision C++ extension not compiled → torchvision::nms missing from
-   the dispatch registry, causing _meta_registrations to crash on import.
+2. torchvision C++ extension not compiled → torchvision::nms missing from the
+   dispatch registry, causing _meta_registrations to crash on import.
    Fix: register a pure-Python NMS + patch torchvision.ops.nms.
+
+On a regular Linux/macOS/Windows install the C++ NMS op is already registered,
+so we detect that case and leave torchvision.ops untouched. Importing this
+module is safe on any platform.
 """
 
+import glob
+import importlib.util
 import os
 
-# ── 1. Qt display fix ─────────────────────────────────────
+# ── 1. Qt display fix (harmless everywhere) ───────────────
 if not os.environ.get("DISPLAY"):
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-# ── 2. torchvision::nms dispatch stub ────────────────────
+# ── 2. torchvision::nms dispatch stub (Jetson-only path) ──
 import torch
-import glob
-import importlib.util
 
 # torchvision._C.so registers ops via TORCH_LIBRARY (not PyInit), so it cannot
 # be imported as a Python module. Load it via torch.ops.load_library first so
@@ -70,14 +74,14 @@ if _need_nms_stub:
         lambda d, s, t: _nms_cpu(d.cpu(), s.cpu(), t)
     )
 
-# ── 3. Patch torchvision.ops.nms (bypasses C++ extension guard) ──
-import torchvision.ops
-import torchvision.ops.boxes as _tv_boxes
+    # ── 3. Patch torchvision.ops.nms only when the stub is in play ──
+    # On a normal install the C++ op is already in the dispatch registry, so
+    # leaving torchvision.ops.nms alone preserves its native fast path.
+    import torchvision.ops
+    import torchvision.ops.boxes as _tv_boxes
 
+    def _nms_via_dispatch(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
+        return torch.ops.torchvision.nms(boxes, scores, float(iou_threshold))
 
-def _nms_via_dispatch(boxes: torch.Tensor, scores: torch.Tensor, iou_threshold: float) -> torch.Tensor:
-    return torch.ops.torchvision.nms(boxes, scores, float(iou_threshold))
-
-
-torchvision.ops.nms = _nms_via_dispatch
-_tv_boxes.nms = _nms_via_dispatch
+    torchvision.ops.nms = _nms_via_dispatch
+    _tv_boxes.nms = _nms_via_dispatch

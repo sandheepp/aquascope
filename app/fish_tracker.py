@@ -33,10 +33,14 @@ from tracker import FishTracker
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="AquaScope — real-time aquarium fish tracker")
     p.add_argument("--camera", type=int, default=0, help="Camera device ID (default 0)")
+    p.add_argument("--video", default=None,
+                   help="Path to a video file to use instead of a webcam — handy for "
+                        "demoing the dashboard on a laptop without an aquarium camera.")
     p.add_argument("--resolution", default="720p", choices=["480p", "720p", "1080p"],
-                   help="Capture resolution (default 1080p)")
+                   help="Capture resolution (default 1080p; ignored when --video is set)")
     p.add_argument("--model", default="models/best.engine",
-                   help="YOLOv8 model path (.pt or .engine). Default: models/best.engine")
+                   help="YOLOv8 model path (.pt or .engine). Falls back to yolov8n.pt "
+                        "if the default path doesn't exist (laptop / fresh-clone friendly).")
     p.add_argument("--conf", type=float, default=0.35, help="Detection confidence threshold")
     p.add_argument("--imgsz", type=int, default=640, help="Inference image size")
     p.add_argument("--exposure", type=int, default=None,
@@ -60,6 +64,7 @@ def parse_args() -> argparse.Namespace:
 def build_config(args: argparse.Namespace) -> dict:
     config = DEFAULT_CONFIG.copy()
     config["camera_id"] = args.camera
+    config["video_source"] = args.video
     config["camera_width"], config["camera_height"] = {
         "480p": (640, 480),
         "720p": (1280, 720),

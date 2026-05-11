@@ -1,14 +1,22 @@
 """
-Jetson-side training launcher for the dashboard 'Train Model' button.
+Dashboard 'Train Model' subprocess. Cross-platform.
 
-Designed to be spawned as a subprocess by app/stream.py. Writes a JSON status
-file after each epoch so the dashboard can render progress.
+Spawned by app/stream.py. Writes a JSON status file after each epoch so the
+dashboard can render progress.
 
-Trains YOLOv8s on dataset/user_recorded/ ONLY (90/10 train/val split) with
-the dashboard's two classes (fish, shrimp) and Jetson-Orin-Nano-friendly
-defaults (batch=2, AMP, fewer epochs by default), then exports the best
-weights to TensorRT FP16 as models/best_v<N>.engine with N auto-incremented
-from existing engines under models/.
+Trains YOLOv8s on dataset/user_recorded/ ONLY (90/10 train/val split) with the
+dashboard's two classes (fish, shrimp). Defaults are Jetson-Orin-Nano-friendly
+(batch=2, AMP, mosaic/mixup off) — they're conservative enough that the same
+script trains fine on a laptop CPU, an Apple Silicon Mac (MPS), or a discrete
+NVIDIA GPU.
+
+On CUDA hardware the trained weights are also exported to TensorRT FP16
+(models/best_v<N>.engine). On MPS/CPU the export step is skipped and the
+versioned .pt becomes the new "current" model — the dashboard dropdown picks
+up either format.
+
+Filename kept as train_jetson.py for back-compat with existing scripts; nothing
+about the implementation is Jetson-only any more.
 
 Usage:
     python training/train_jetson.py
@@ -30,6 +38,17 @@ import yaml
 
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _DEFAULT_USERDATA = _PROJECT_ROOT / "dataset" / "user_recorded"
+
+
+def _detect_device() -> str:
+    """Return the best available device: 'cuda', 'mps', or 'cpu'."""
+    import torch
+    if torch.cuda.is_available():
+        return "cuda"
+    mps_backend = getattr(torch.backends, "mps", None)
+    if mps_backend is not None and mps_backend.is_available():
+        return "mps"
+    return "cpu"
 
 
 def build_user_only_yaml(
@@ -200,7 +219,7 @@ def main() -> None:
                   current_epoch=0, total_epochs=args.epochs,
                   message="Setting up data...")
 
-    tmp_dir = Path(tempfile.mkdtemp(prefix="aq_jetson_"))
+    tmp_dir = Path(tempfile.mkdtemp(prefix="aq_train_"))
     try:
         # Train ONLY on user-recorded labels (90/10 split), with class names
         # fixed to the two classes the dashboard tracks. Roboflow + distillation
@@ -214,10 +233,11 @@ def main() -> None:
         )
 
         import torch  # noqa: E402
-        if not torch.cuda.is_available():
-            _write_status(args.status_file, state="failed", version=version,
-                          message="No CUDA GPU detected. Are you on the Jetson with JetPack?")
-            sys.exit(1)
+        device = _detect_device()
+        print(f"[TRAIN] Device: {device}")
+        if device == "cpu":
+            print("[TRAIN] WARNING: training on CPU — expect 5–20× slower epochs "
+                  "than a GPU. Use a small dataset / few epochs while you iterate.")
 
         from ultralytics import YOLO  # noqa: E402
 
@@ -254,14 +274,17 @@ def main() -> None:
         model.add_callback("on_train_epoch_start", on_train_epoch_start)
         model.add_callback("on_train_epoch_end", on_train_epoch_end)
 
+        # AMP only on CUDA: MPS doesn't support it, and CPU training is already
+        # slow enough that mixed precision would mostly add overhead.
+        use_amp = (device == "cuda")
         model.train(
             data=str(data_yaml),
             epochs=args.epochs,
             imgsz=args.imgsz,
-            device=0,
+            device=device,
             batch=args.batch,
             workers=args.workers,
-            amp=True,                  # FP16 — saves memory
+            amp=use_amp,
             cache=False,
             project=str(_PROJECT_ROOT / "runs" / "detect"),
             name=args.name,
@@ -281,7 +304,9 @@ def main() -> None:
                       state="exporting", version=version,
                       current_epoch=args.epochs, total_epochs=args.epochs,
                       elapsed_sec=int(time.time() - start_t),
-                      message="Exporting TensorRT engine...")
+                      message=("Exporting TensorRT engine..."
+                              if device == "cuda" else
+                              "Saving versioned weights..."))
 
         run_dir = _PROJECT_ROOT / "runs" / "detect" / args.name
         best_pt = run_dir / "weights" / "best.pt"
@@ -290,32 +315,37 @@ def main() -> None:
                           message=f"Training finished but best.pt missing: {best_pt}")
             sys.exit(1)
 
-        # Keep a versioned .pt copy alongside the engine for safekeeping.
+        # Always keep a versioned .pt — it's portable across machines and the
+        # dashboard will list it in the model dropdown even if no engine exists.
         versioned_pt = models_dir / f"best_v{version}.pt"
         shutil.copy2(best_pt, versioned_pt)
 
-        # Export to TensorRT FP16 at the inference resolution (NOT the train resolution
-        # — TRT engines have a fixed input shape, so it must match what tracker.py feeds).
-        export_model = YOLO(str(best_pt))
-        export_path = export_model.export(
-            format="engine",
-            imgsz=args.export_imgsz,
-            half=True,
-            device=0,
-            batch=1,
-            simplify=True,
-            workspace=2,           # GiB; conservative for Orin Nano
-        )
-        out_engine = models_dir / f"best_v{version}.engine"
-        try:
-            shutil.move(str(export_path), str(out_engine))
-        except OSError:
-            shutil.copy2(str(export_path), str(out_engine))
+        # TensorRT export is CUDA-only (NVIDIA stack). On MPS/CPU the .pt is the
+        # final artifact; the dashboard will pick it up and inference will run on
+        # whatever device load_model() detects at next reload.
+        out_engine: Path | None = None
+        if device == "cuda":
+            export_model = YOLO(str(best_pt))
+            export_path = export_model.export(
+                format="engine",
+                imgsz=args.export_imgsz,
+                half=True,
+                device=0,
+                batch=1,
+                simplify=True,
+                workspace=2,           # GiB; conservative for Orin Nano
+            )
+            out_engine = models_dir / f"best_v{version}.engine"
+            try:
+                shutil.move(str(export_path), str(out_engine))
+            except OSError:
+                shutil.copy2(str(export_path), str(out_engine))
 
-        # Only wipe the user-recorded set if the engine actually landed on disk
-        # (and is non-empty). On any failure path above, the data stays put so
-        # the next run can re-train against it.
-        if out_engine.exists() and out_engine.stat().st_size > 0:
+        # Only wipe the user-recorded set if a versioned artifact actually
+        # landed on disk. On any failure path above, the data stays put so the
+        # next run can re-train against it.
+        artifact = out_engine if out_engine and out_engine.exists() else versioned_pt
+        if artifact.exists() and artifact.stat().st_size > 0:
             for sub in ("images", "labels"):
                 target = _DEFAULT_USERDATA / sub
                 if target.exists():
@@ -329,14 +359,14 @@ def main() -> None:
                 except OSError:
                     pass
             print(f"[CLEANUP] Wiped {_DEFAULT_USERDATA}/images and /labels "
-                  f"after successful export of {out_engine.name}.")
+                  f"after successful save of {artifact.name}.")
 
         _write_status(args.status_file,
                       state="done", version=version,
-                      engine_path=str(out_engine),
+                      engine_path=str(out_engine) if out_engine else "",
                       pt_path=str(versioned_pt),
                       elapsed_sec=int(time.time() - start_t),
-                      message=f"Saved {out_engine.name}")
+                      message=f"Saved {artifact.name}")
     except Exception as e:                                  # noqa: BLE001
         _write_status(args.status_file,
                       state="failed",
