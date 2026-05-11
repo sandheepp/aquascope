@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  syntax:
+    name: Python syntax check (${{ matrix.os }} / py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Compile every .py
+        # Cheap signal that no commit breaks parsing on the supported platforms.
+        # We don't pip-install the full ML stack here — that'd quintuple CI time
+        # and is well-tested by the user every time they actually run the
+        # dashboard.
+        run: |
+          python -m py_compile $(git ls-files '*.py')
