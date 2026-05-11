@@ -38,6 +38,7 @@ from stream import (
     request_reset,
     set_label_class_names,
     set_label_output_dir,
+    set_last_predictions,
     set_model_path,
     set_models_dir,
     start_public_tunnel,
@@ -60,6 +61,13 @@ class FishTracker:
         self.fps_history: deque = deque(maxlen=30)
         self.last_log_time = time.time()
         self._last_stream_push = 0.0
+        # Per-frame inference snapshot, populated by _infer_and_annotate and
+        # consumed by the stream-push branch in run() to keep /label/snap
+        # and /label/predictions in lockstep. Pre-init so the first stream
+        # push (or a fallback path that skips inference) doesn't see them
+        # missing.
+        self._last_pred_snapshot: list = []
+        self._last_pred_dims: tuple = (0, 0)
         self._applied_resolution = get_resolution()
         self._enhancer = FrameEnhancer()
         self._thermal_zones: dict[str, str] = {}   # label → /sys path, built on first call
@@ -457,6 +465,18 @@ class FishTracker:
                         _, jpeg = cv2.imencode(".jpg", annotated,
                                               [cv2.IMWRITE_JPEG_QUALITY, self.config.get("stream_quality", 75)])
                         push_frame(jpeg.tobytes())
+                        # Push predictions for THIS exact frame so /label/snap
+                        # and /label/predictions stay in sync. Pushing every
+                        # iteration would let the inference loop (faster than
+                        # stream_fps) overwrite predictions with a frame the
+                        # browser never sees. Fall back to the annotated frame
+                        # dims if _infer_and_annotate hasn't stashed any yet
+                        # (only possible on a fallback path that didn't run
+                        # inference, e.g. after a model load failure).
+                        snap = getattr(self, "_last_pred_snapshot", [])
+                        ah, aw = annotated.shape[:2]
+                        sw, sh = getattr(self, "_last_pred_dims", (aw, ah))
+                        set_last_predictions(snap, sw, sh)
                         self._last_stream_push = now_t
                     if self.frame_count % 5 == 0:
                         push_stats(self._build_stats())
@@ -553,10 +573,20 @@ class FishTracker:
         annotated = frame.copy()
         h, w = frame.shape[:2]
         encoded_jpeg: bytes | None = None    # lazily encoded if any detection wants labeling
+        # Snapshot every box as (cls, x1, y1, x2, y2) so the labeling tab
+        # can pre-fill them via /label/predictions. We DON'T push it here —
+        # the run loop pushes predictions in lockstep with push_frame, so
+        # a fish visible in the snapped JPEG is always present in the
+        # /label/predictions response (otherwise the stream-fps throttle
+        # races against the inference loop and the two desync).
+        prediction_snapshot: list[tuple[int, int, int, int, int]] = []
 
         for i in range(len(tracked)):
             x1, y1, x2, y2 = map(int, tracked.xyxy[i])
             track_id = int(tracked.tracker_id[i])
+            cls_id_pred = (int(tracked.class_id[i])
+                           if tracked.class_id is not None else 0)
+            prediction_snapshot.append((cls_id_pred, x1, y1, x2, y2))
             det_conf = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
             cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
             color = self._color(track_id)
@@ -585,6 +615,9 @@ class FishTracker:
             if hat_mode_enabled():
                 self._draw_hat(annotated, x1, y1, x2)
 
+        # Stash for the run loop to push alongside the JPEG.
+        self._last_pred_snapshot = prediction_snapshot
+        self._last_pred_dims = (w, h)
         return annotated
 
     # ── Display + keyboard ────────────────────────────────

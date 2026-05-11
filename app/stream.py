@@ -15,6 +15,7 @@ Endpoints:
   /label/queue       — JSON list of pending candidates
   /label/image/<id>  — JPEG of a pending candidate frame
   /label/decision    — accept/reject a candidate (?id=<id>&keep=0|1)
+  /label/predictions — JSON list of the most recent model boxes for the manual-label modal
   /train/labels      — current user-recorded label count + min required + ETA
   /train/start       — spawn training subprocess (returns 409 if already running)
   /train/status      — poll training progress (state/epoch/eta/message/version)
@@ -77,6 +78,14 @@ _label_class_names: list[str] = []             # populated from model.names at s
 _LABEL_THROTTLE_SEC = 2.0                      # min seconds between captures of same track_id
 _LABEL_QUEUE_MAX = 50                          # cap pending queue to avoid disk blow-up
 _label_last_capture: dict[int, float] = {}     # track_id → last capture ts
+
+# Latest model predictions for the current frame, used to pre-fill the manual
+# labeling modal with the boxes the user already sees on the live feed (so
+# they only have to ✕ wrong ones and add missing ones, instead of redrawing
+# every box from scratch). Pushed once per frame from tracker._infer_and_annotate.
+_last_predictions: list[dict] = []             # [{cls,x1,y1,x2,y2}, ...]
+_last_predictions_dims: tuple[int, int] = (0, 0)  # (img_w, img_h) for the boxes above
+_predictions_lock = threading.Lock()
 
 # ── Training state ────────────────────────────────────────
 _train_proc = None                             # subprocess.Popen | None
@@ -173,6 +182,21 @@ def set_label_class_names(names) -> None:
 def label_enabled() -> bool:
     with _label_lock:
         return _label_enabled
+
+
+def set_last_predictions(boxes, img_w: int, img_h: int) -> None:
+    """Tracker pushes the latest detections each frame so the manual-label
+    modal can pre-fill them as removable boxes. `boxes` is an iterable of
+    (cls_idx, x1, y1, x2, y2) tuples in pixel coords against (img_w, img_h)."""
+    global _last_predictions, _last_predictions_dims
+    snapshot = [
+        {"cls": int(c), "x1": int(x1), "y1": int(y1),
+         "x2": int(x2), "y2": int(y2)}
+        for (c, x1, y1, x2, y2) in boxes
+    ]
+    with _predictions_lock:
+        _last_predictions = snapshot
+        _last_predictions_dims = (int(img_w), int(img_h))
 
 
 def label_should_capture(track_id: int) -> bool:
@@ -597,6 +621,8 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_label_decision()
         elif p == "/label/snap":
             self._serve_label_snap()
+        elif p == "/label/predictions":
+            self._serve_label_predictions()
         elif p == "/label/manual":
             self._serve_label_manual()
         elif p == "/train/labels":
@@ -860,6 +886,20 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _serve_label_predictions(self):
+        """JSON list of the most recent model boxes for the current frame.
+        Used by the manual-label modal to pre-fill predicted fish so the user
+        can remove wrong ones with ✕ instead of redrawing every box."""
+        with _predictions_lock:
+            boxes = list(_last_predictions)
+            img_w, img_h = _last_predictions_dims
+        body = json.dumps({
+            "boxes": boxes,
+            "img_w": img_w,
+            "img_h": img_h,
+        }).encode()
+        self._json_response(body)
+
     def _serve_label_manual(self):
         """Save one or more hand-drawn boxes from the manual-label modal as
         a YOLO label file.
@@ -1032,7 +1072,6 @@ body{
      and a high z-index so nothing in the mobile flex layout wins. */
   #train-overlay,
   #train-confirm-overlay,
-  #manual-overlay,
   #fs-overlay,
   #modal{
     position:fixed !important;top:0 !important;left:0 !important;
@@ -1172,12 +1211,21 @@ body{
 }
 .pop-thumb:hover{border-color:var(--accent)}
 .pop-thumb img{width:100%;height:100%;object-fit:cover}
+/* Always show the action buttons — :hover-only doesn't work on touch and
+   the user couldn't reach delete/download from a phone. */
 .pop-thumb .del{
   position:absolute;top:2px;right:2px;
-  background:rgba(0,0,0,0.7);color:#fc5c65;border:none;
-  border-radius:3px;font-size:10px;padding:1px 4px;cursor:pointer;display:none;
+  background:rgba(0,0,0,0.72);color:#fc5c65;border:none;
+  border-radius:3px;font-size:11px;line-height:1;padding:2px 5px;cursor:pointer;
 }
-.pop-thumb:hover .del{display:block}
+.pop-thumb .dl{
+  position:absolute;top:2px;left:2px;
+  background:rgba(0,0,0,0.72);color:var(--teal);text-decoration:none;
+  border:1px solid rgba(0,212,170,0.4);
+  border-radius:3px;font-size:11px;line-height:1;padding:2px 5px;cursor:pointer;
+}
+.pop-thumb .dl:hover{background:rgba(0,212,170,0.25)}
+.pop-thumb .del:hover{background:rgba(252,92,101,0.25)}
 
 /* ── Main ── */
 #main{
@@ -1191,48 +1239,128 @@ body{
 /* ── Label panel (Training tab) ── */
 #label-panel{
   grid-area:main;
-  display:flex;flex-direction:column;gap:10px;padding:14px;
+  display:none;flex-direction:column;gap:10px;padding:14px;
   overflow:auto;
 }
+/* When the training tab is active, hide the live-feed grid and reveal the
+   labeling panel. Using a body class beats the mobile @media `!important`
+   on #main, which a plain inline `display:none` couldn't. */
+body.train-tab #main{display:none !important}
+body.train-tab #label-panel{display:flex !important}
+body.snaps-tab #main{display:none !important}
+body.snaps-tab #snaps-panel{display:flex !important}
+body.settings-tab #main{display:none !important}
+body.settings-tab #settings-panel{display:flex !important}
+
+/* ── Settings tab ── */
+#settings-panel{
+  grid-area:main;
+  display:none;flex-direction:column;gap:14px;padding:14px;
+  overflow:auto;
+}
+#settings-title{font-size:14px;font-weight:700;color:var(--accent)}
+.settings-section-title{
+  font-size:11px;letter-spacing:1.5px;text-transform:uppercase;
+  color:var(--dim);font-weight:700;margin:6px 4px 2px;
+}
+.settings-card{
+  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);
+  border:1px solid var(--border);border-radius:10px;
+  padding:4px 16px;
+}
+.settings-row{
+  display:flex;align-items:center;justify-content:space-between;gap:14px;
+  padding:11px 0;border-bottom:1px solid rgba(30,45,61,0.55);
+}
+.settings-row:last-child{border-bottom:none}
+.settings-lbl{color:var(--text);font-size:13px}
+.settings-control{min-width:200px;display:flex;align-items:center;gap:8px;justify-content:flex-end}
+.settings-row select{
+  background:#1a2130;color:var(--text);border:1px solid var(--border);
+  padding:6px 28px 6px 10px;border-radius:6px;font-size:12px;cursor:pointer;
+  appearance:none;-webkit-appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a5568'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 10px center;
+  min-width:200px;
+}
+.settings-row .toggle-btn{
+  background:#1a2130;color:var(--text);border:1px solid var(--border);
+  padding:6px 16px;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;
+  font-family:var(--font);min-width:80px;
+}
+.settings-row .toggle-btn.on{
+  background:linear-gradient(135deg,rgba(0,212,170,0.30) 0%,rgba(0,212,170,0.12) 100%);
+  border-color:var(--teal);color:var(--teal);
+}
+.settings-row .toggle-btn:hover{opacity:0.88}
+#settings-conf-slider{
+  flex:1;-webkit-appearance:none;appearance:none;
+  height:4px;border-radius:2px;outline:none;cursor:pointer;min-width:140px;
+  background:linear-gradient(to right,var(--accent) 0%,var(--accent) 35%,#1e2d3d 35%,#1e2d3d 100%);
+}
+#settings-conf-slider::-webkit-slider-thumb{
+  -webkit-appearance:none;width:14px;height:14px;border-radius:50%;
+  background:var(--accent);cursor:pointer;border:2px solid #0e1117;
+}
+#settings-conf-val{
+  font-family:var(--mono);font-size:12px;color:var(--accent);
+  width:40px;text-align:right;flex-shrink:0;
+}
+.settings-readonly{
+  font-family:var(--mono);color:var(--dim);font-size:12px;
+}
+
+/* ── Snapshots tab ── */
+#snaps-panel{
+  grid-area:main;
+  display:none;flex-direction:column;gap:10px;padding:14px;
+  overflow:auto;
+}
+#snaps-header{
+  display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:10px 14px;
+}
+#snaps-title{font-size:14px;font-weight:700;color:var(--accent)}
+#snaps-count-info{font-size:11px;color:var(--dim);font-family:var(--mono)}
+#snaps-grid-wrap{flex:1;min-height:0;padding:14px}
+#snaps-grid{
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));
+  gap:12px;
+}
+.snap-card{
+  background:#0d141d;border:1px solid var(--border);border-radius:8px;
+  overflow:hidden;display:flex;flex-direction:column;
+  transition:border-color 0.15s;
+}
+.snap-card:hover{border-color:var(--accent)}
+.snap-card img{
+  width:100%;aspect-ratio:16/9;object-fit:cover;cursor:pointer;
+  background:#000;
+}
+.snap-card-meta{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:8px 10px;font-size:11px;color:var(--dim);
+}
+.snap-card-actions{display:flex;gap:6px;align-items:center}
+.snap-card-actions a, .snap-card-actions button{
+  background:#1a2130;border:1px solid var(--border);
+  border-radius:5px;padding:4px 9px;font-size:11px;cursor:pointer;
+  text-decoration:none;display:inline-flex;align-items:center;gap:4px;
+  font-family:var(--font);line-height:1;
+}
+.snap-card-actions a{color:var(--teal);border-color:rgba(0,212,170,0.4)}
+.snap-card-actions a:hover{background:rgba(0,212,170,0.15)}
+.snap-card-actions .del{color:var(--danger);border-color:rgba(252,92,101,0.4)}
+.snap-card-actions .del:hover{background:rgba(252,92,101,0.15)}
+#snaps-empty{color:var(--dim);font-size:13px;text-align:center;padding:30px}
 #label-controls{
   display:flex;align-items:center;gap:18px;flex-wrap:wrap;
 }
 .label-model-wrap{display:flex;align-items:center;gap:8px;min-width:240px}
 .label-model-wrap .stat-lbl{white-space:nowrap}
 .label-model-wrap select{flex:1;min-width:160px}
-#label-toggle{
-  background:linear-gradient(135deg,var(--accent) 0%,#d4a017 100%);color:#111;border:none;
-  padding:8px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;
-}
-#label-toggle.on{background:linear-gradient(135deg,var(--danger) 0%,#c73e4a 100%);color:#fff}
-#label-canvas-wrap{
-  flex:1;min-height:300px;
-  background:#000;border:1px solid var(--border);border-radius:10px;
-  display:flex;align-items:center;justify-content:center;overflow:hidden;
-}
-/* The candidate frame fills the wrap and respects its bounds, so the
-   image stays fully visible regardless of how tall the surrounding panels
-   are. (Old max-height:70vh let the canvas be taller than its wrap when
-   the labeling tab had a lot of stats above, so the wrap's overflow:hidden
-   clipped the bottom of the frame.) */
-#label-canvas{max-width:100%;max-height:100%;object-fit:contain}
-#label-empty{color:var(--dim);font-size:13px;padding:30px;text-align:center}
-/* Centered action row. The shortcut hint floats to the right on desktop
-   and drops below the buttons on mobile so it never crowds them. */
-#label-actions{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap;position:relative}
-#label-actions .shortcut-hint{position:absolute;right:14px}
-@media (max-width: 700px) {
-  #label-actions .shortcut-hint{position:static;width:100%;text-align:center}
-}
-#label-actions .accept{
-  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;border:none;
-  padding:10px 22px;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;
-}
-#label-actions .reject{
-  background:linear-gradient(135deg,var(--danger) 0%,#c73e4a 100%);color:#fff;border:none;
-  padding:10px 22px;border-radius:6px;font-size:14px;font-weight:700;cursor:pointer;
-}
-#label-actions .accept:hover, #label-actions .reject:hover, #label-toggle:hover{opacity:0.88}
+#label-actions{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap}
 
 /* ── Train button + epochs dropdown ── */
 #train-controls{display:flex;align-items:center;gap:8px;margin-left:auto}
@@ -1251,24 +1379,14 @@ body{
 }
 #train-btn:not(:disabled):hover{opacity:0.88}
 
-/* ── Manual-label modal ── */
-#manual-overlay{
-  display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);
-  align-items:center;justify-content:center;z-index:200;padding:16px;
-}
-#manual-overlay.open{display:flex}
+/* ── Manual-label inline card (used to be a modal; now lives inside the
+   labeling tab so the user lands directly on the predicted-frame screen). */
 #manual-card{
   background:var(--card);border:1px solid var(--border);border-radius:12px;
-  padding:14px 16px;width:min(960px, 95vw);max-height:92vh;
-  display:flex;flex-direction:column;gap:10px;position:relative;
+  padding:12px 14px;
+  display:flex;flex-direction:column;gap:10px;
+  flex:1;min-height:0;       /* let the canvas region claim leftover height */
 }
-#manual-close{
-  position:absolute;top:8px;right:10px;
-  background:transparent;color:var(--dim);border:1px solid var(--border);
-  width:30px;height:30px;border-radius:6px;font-size:14px;cursor:pointer;
-  z-index:2;
-}
-#manual-close:hover{color:var(--danger);border-color:rgba(252,92,101,0.5)}
 #manual-streak{color:var(--dim);font-weight:500;font-size:11px;margin-left:8px}
 #manual-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
 #manual-title{font-size:14px;font-weight:700;color:var(--accent)}
@@ -1291,27 +1409,30 @@ body{
 }
 #manual-controls #manual-cancel{color:var(--danger);border-color:rgba(252,92,101,0.4)}
 #manual-controls button:hover{opacity:0.88}
-#manual-hint{color:var(--dim);font-size:11px}
-.manual-hint-touch{display:none}
-@media (hover: none) and (pointer: coarse) {
-  .manual-hint-mouse{display:none}
-  .manual-hint-touch{display:inline}
+#manual-hint{
+  color:var(--dim);font-size:11px;
+  display:flex;flex-wrap:wrap;gap:14px;align-items:center;
 }
+#manual-hint .demo-chip{
+  display:inline-flex;align-items:center;gap:6px;
+  background:#0d141d;border:1px solid var(--border);
+  border-radius:14px;padding:3px 10px;color:var(--text);
+}
+#manual-hint .demo-chip b{color:var(--accent);font-weight:600}
 #manual-canvas-wrap{
-  flex:1;min-height:240px;
+  flex:1;min-height:200px;
   background:#000;border:1px solid var(--border);border-radius:8px;
   overflow:hidden;display:flex;align-items:center;justify-content:center;
+  position:relative;
 }
 #manual-canvas{
-  max-width:100%;max-height:80vh;display:block;
+  max-width:100%;max-height:100%;display:block;
   touch-action:none;        /* let pointer events drive the drawing */
   cursor:crosshair;
 }
-#manual-label-btn{
-  background:#1a2130;color:var(--fg);border:1px solid var(--border);
-  padding:10px 18px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;
+#manual-empty{
+  color:var(--dim);font-size:12px;text-align:center;padding:24px;
 }
-#manual-label-btn:hover{background:rgba(255,255,255,0.04)}
 
 /* ── Training modal ── */
 /* ── Training-confirm modal ── */
@@ -1628,13 +1749,13 @@ body{
   <div class="nav-section">Monitor</div>
   <div class="nav-item active" id="nav-live" onclick="switchTab('live')"><span class="nav-icon">📹</span>Live Feed</div>
   <div class="nav-item"><span class="nav-icon">📊</span>Analytics</div>
-  <div class="nav-item"><span class="nav-icon">🖼️</span>Snapshots</div>
+  <div class="nav-item" id="nav-snaps" onclick="switchTab('snaps')"><span class="nav-icon">🖼️</span>Snapshots</div>
 
   <div class="nav-section">Training</div>
   <div class="nav-item" id="nav-train" onclick="switchTab('train')"><span class="nav-icon">🏷️</span>Label Fish</div>
 
   <div class="nav-section">System</div>
-  <div class="nav-item"><span class="nav-icon">⚙️</span>Settings</div>
+  <div class="nav-item" id="nav-settings" onclick="switchTab('settings')"><span class="nav-icon">⚙️</span>Settings</div>
 
   <div class="nav-spacer"></div>
   <div class="nav-item" style="margin-bottom:6px">
@@ -1754,9 +1875,8 @@ body{
 </main>
 
 <!-- Label panel (Training tab) -->
-<main id="label-panel" style="display:none">
+<main id="label-panel">
   <div class="card" id="label-controls">
-    <button id="label-toggle" onclick="toggleLabeling()">▶ Start labeling</button>
     <div class="label-model-wrap">
       <span class="stat-lbl">Detection model</span>
       <select id="label-model-select" onchange="setModel(this.value)">
@@ -1764,24 +1884,8 @@ body{
       </select>
     </div>
     <div class="stat-row" style="margin:0">
-      <span class="stat-lbl">Status</span>
-      <span class="stat-val" id="label-state">off</span>
-    </div>
-    <div class="stat-row" style="margin:0">
-      <span class="stat-lbl">Queued</span>
-      <span class="stat-val" id="label-count">0</span>
-    </div>
-    <div class="stat-row" style="margin:0">
       <span class="stat-lbl">Saved</span>
       <span class="stat-val" id="label-saved">0/100</span>
-    </div>
-    <div class="stat-row" style="margin:0">
-      <span class="stat-lbl">Track</span>
-      <span class="stat-val" id="label-track">—</span>
-    </div>
-    <div class="stat-row" style="margin:0">
-      <span class="stat-lbl">Class</span>
-      <span class="stat-val" id="label-class">—</span>
     </div>
     <div id="train-controls">
       <select id="train-epochs" onchange="onEpochsChange()" title="Number of training epochs">
@@ -1796,25 +1900,13 @@ body{
       <button id="train-btn" disabled onclick="confirmTraining()">🧠 Train model</button>
     </div>
   </div>
-  <div id="label-canvas-wrap">
-    <canvas id="label-canvas" style="display:none"></canvas>
-    <div id="label-empty">No candidates yet — press <b>▶ Start labeling</b> and let the tracker collect detections.</div>
-  </div>
-  <div class="card" id="label-actions">
-    <button class="reject" onclick="labelDecision(0)">✗ Not a fish</button>
-    <button class="accept" onclick="labelDecision(1)">✓ Yes, fish</button>
-    <button id="manual-label-btn" onclick="openManualLabel()">✏️ Manual label</button>
-    <span class="stat-lbl shortcut-hint">Shortcuts: <span class="stat-val">y</span> / <span class="stat-val">n</span></span>
-  </div>
-</main>
-
-<!-- Manual-label modal: snap the latest frame, draw/move/resize a single
-     box, then save it as a YOLO label under dataset/user_recorded. -->
-<div id="manual-overlay">
-  <div id="manual-card">
+  <!-- Inline labeling card: lands the user directly on the predicted-frame
+       screen. Predicted fish are pre-drawn (teal); each has a red ✕ to
+       remove false positives. The user draws missing boxes (purple) and
+       hits Save & next to advance to a fresh frame. -->
+  <div class="card" id="manual-card">
     <div id="manual-header">
-      <button id="manual-close" onclick="closeManualLabel()" aria-label="Exit manual labeling">✕</button>
-      <div id="manual-title">✏️ Manual labeling <span id="manual-streak"></span></div>
+      <div id="manual-title">✏️ Label this frame <span id="manual-streak"></span></div>
       <div id="manual-controls">
         <select id="manual-class" title="Class for the box you're currently drawing">
           <option value="0">fish</option>
@@ -1827,14 +1919,112 @@ body{
       </div>
     </div>
     <div id="manual-hint">
-      <span class="manual-hint-mouse">Click-drag to draw a box. Drag corners to resize, ✋ to move. <b>+ Add another</b> saves the current box locally and starts a fresh one — repeat for multiple fish in the same frame. <b>Save &amp; next</b> writes them all to a single label and loads the next frame; ✕ exits.</span>
-      <span class="manual-hint-touch">Tap to drop a box. Drag corners to resize, ✋ to move. <b>+ Add another</b> for multiple boxes per frame. <b>Save &amp; next</b> writes them all and advances; ✕ exits.</span>
+      <span class="demo-chip"><b>✕</b> remove wrong prediction</span>
+      <span class="demo-chip"><b>drag</b> draw new box</span>
+      <span class="demo-chip"><b>✋</b> move</span>
+      <span class="demo-chip"><b>corners</b> resize</span>
+      <span class="demo-chip"><b>+ Add another</b> stage box, draw next</span>
+      <span class="demo-chip"><b>Save &amp; next</b> commit + advance</span>
     </div>
     <div id="manual-canvas-wrap">
-      <canvas id="manual-canvas"></canvas>
+      <canvas id="manual-canvas" style="display:none"></canvas>
+      <div id="manual-empty">Waiting for a live frame… start the live feed if it's stopped, then come back.</div>
     </div>
   </div>
-</div>
+</main>
+
+<!-- Snapshots panel -->
+<main id="snaps-panel">
+  <div class="card" id="snaps-header">
+    <div id="snaps-title">🖼️ Snapshots</div>
+    <div id="snaps-count-info">0 saved</div>
+  </div>
+  <div class="card" id="snaps-grid-wrap">
+    <div id="snaps-grid"></div>
+    <div id="snaps-empty">No snapshots yet — tap 📷 in the topbar to capture one.</div>
+  </div>
+</main>
+
+<!-- Settings panel -->
+<main id="settings-panel">
+  <div class="card">
+    <div id="settings-title">⚙️ Settings</div>
+  </div>
+
+  <div class="settings-section-title">📹 Inference</div>
+  <div class="settings-card">
+    <div class="settings-row">
+      <label class="settings-lbl">Detection model</label>
+      <div class="settings-control">
+        <select id="settings-model-select" onchange="setModel(this.value)">
+          <option>loading…</option>
+        </select>
+      </div>
+    </div>
+    <div class="settings-row">
+      <label class="settings-lbl">Resolution</label>
+      <div class="settings-control">
+        <select id="settings-res-select" onchange="setResolution(this.value)">
+          <option value="480p">480p &nbsp;(854×480)</option>
+          <option value="720p">720p &nbsp;(1280×720)</option>
+          <option value="1080p" selected>1080p (1920×1080)</option>
+        </select>
+      </div>
+    </div>
+    <div class="settings-row">
+      <label class="settings-lbl">Confidence threshold</label>
+      <div class="settings-control" style="flex:1;max-width:280px">
+        <input id="settings-conf-slider" type="range" min="5" max="95" step="5" value="35" oninput="onSettingsConfSlider(this.value)">
+        <span id="settings-conf-val">35%</span>
+      </div>
+    </div>
+    <div class="settings-row">
+      <label class="settings-lbl">Trails</label>
+      <button class="toggle-btn" id="settings-trails-btn" onclick="toggleTrails()">OFF</button>
+    </div>
+    <div class="settings-row">
+      <label class="settings-lbl">Underwater enhance</label>
+      <button class="toggle-btn" id="settings-enhance-btn" onclick="toggleEnhance()">OFF</button>
+    </div>
+    <div class="settings-row">
+      <label class="settings-lbl">Party hats</label>
+      <button class="toggle-btn" id="settings-hat-btn" onclick="toggleHat()">OFF</button>
+    </div>
+  </div>
+
+  <div class="settings-section-title">🧠 Training</div>
+  <div class="settings-card">
+    <div class="settings-row">
+      <label class="settings-lbl">Detection model (for labeling)</label>
+      <div class="settings-control">
+        <select id="settings-label-model-select" onchange="setModel(this.value)">
+          <option>loading…</option>
+        </select>
+      </div>
+    </div>
+    <div class="settings-row">
+      <label class="settings-lbl">Epochs</label>
+      <div class="settings-control">
+        <select id="settings-train-epochs" onchange="onSettingsEpochsChange(this.value)">
+          <option value="5" selected>5 epochs</option>
+          <option value="10">10 epochs</option>
+          <option value="15">15 epochs</option>
+          <option value="20">20 epochs</option>
+          <option value="30">30 epochs</option>
+          <option value="50">50 epochs</option>
+        </select>
+      </div>
+    </div>
+    <div class="settings-row">
+      <label class="settings-lbl">Saved labels</label>
+      <span class="settings-readonly" id="settings-label-saved">0/—</span>
+    </div>
+    <div class="settings-row">
+      <label class="settings-lbl">Estimated training time</label>
+      <span class="settings-readonly" id="settings-train-eta">—</span>
+    </div>
+  </div>
+</main>
 
 <!-- Filmstrip -->
 <footer id="filmstrip">
@@ -1912,11 +2102,21 @@ function doReset() {
   });
 }
 
+// Mirror a boolean state into the matching Settings toggle button so the
+// Settings tab always reflects the live value.
+function _syncSettingsToggle(key, on) {
+  const btn = document.getElementById('settings-' + key + '-btn');
+  if (!btn) return;
+  btn.classList.toggle('on', !!on);
+  btn.textContent = on ? 'ON' : 'OFF';
+}
+
 function toggleTrails() {
   fetch('/trails').then(r => r.json()).then(d => {
     const btn = document.getElementById('trails-btn');
     btn.textContent = '〰 Trails: ' + (d.trails ? 'ON' : 'OFF');
     btn.classList.toggle('on', d.trails);
+    _syncSettingsToggle('trails', d.trails);
   });
 }
 
@@ -1935,7 +2135,8 @@ function loadModels() {
   fetch('/models').then(r => r.json()).then(d => {
     // Populate every model dropdown on the page (live feed + labeling tab)
     // from the same /models response so they stay in sync.
-    const selects = document.querySelectorAll('#model-select, #label-model-select');
+    const selects = document.querySelectorAll(
+      '#model-select, #label-model-select, #settings-model-select, #settings-label-model-select');
     if (!selects.length) return;
     const models = d.models || [];
     const currentBase = (d.current || '').split('/').pop();
@@ -1977,6 +2178,14 @@ function _updateConfUI(pct) {
   slider.style.background =
     'linear-gradient(to right,var(--accent) 0%,var(--accent) ' + fill + '%,#1e2d3d ' + fill + '%,#1e2d3d 100%)';
   document.getElementById('conf-val').textContent = pct + '%';
+  // Mirror to Settings.
+  const sSlider = document.getElementById('settings-conf-slider');
+  if (sSlider) {
+    sSlider.value = pct;
+    sSlider.style.background = slider.style.background;
+  }
+  const sVal = document.getElementById('settings-conf-val');
+  if (sVal) sVal.textContent = pct + '%';
 }
 
 function onConfSlider(val) {
@@ -1985,11 +2194,17 @@ function onConfSlider(val) {
   _sendConf(pct);
 }
 
+// Settings slider drives the same handler — single source of truth.
+function onSettingsConfSlider(val) {
+  onConfSlider(val);
+}
+
 function toggleEnhance() {
   fetch('/enhance').then(r => r.json()).then(d => {
     const btn = document.getElementById('enhance-btn');
     btn.textContent = '✨ Enhance: ' + (d.enhance ? 'ON' : 'OFF');
     btn.classList.toggle('on', d.enhance);
+    _syncSettingsToggle('enhance', d.enhance);
   });
 }
 
@@ -1998,6 +2213,7 @@ function toggleHat() {
     const btn = document.getElementById('hat-btn');
     btn.textContent = '🎩 Party Hats: ' + (d.hat ? 'ON' : 'OFF');
     btn.classList.toggle('on', d.hat);
+    _syncSettingsToggle('hat', d.hat);
   });
 }
 
@@ -2013,8 +2229,14 @@ function addThumb(s) {
   const pt = document.createElement('div');
   pt.className = 'pop-thumb';
   pt.dataset.file = s.filename;
-  pt.innerHTML = '<img src="' + url + '"><button class="del" onclick="deleteSnap(event,\'' + s.filename + '\')">✕</button>';
+  pt.innerHTML =
+    '<img src="' + url + '">' +
+    '<a class="dl" href="' + url + '" download="' + s.filename + '" title="Download">⬇</a>' +
+    '<button class="del" onclick="deleteSnap(event,\'' + s.filename + '\')">✕</button>';
   pt.querySelector('img').onclick = () => openModal(url);
+  // Download click shouldn't bubble up to the popover-toggle / image-open
+  // handlers — let the browser handle the <a download> directly.
+  pt.querySelector('.dl').addEventListener('click', e => e.stopPropagation());
   popRow.prepend(pt);
 
   // Filmstrip thumb
@@ -2029,29 +2251,33 @@ function addThumb(s) {
   row.prepend(ft);
 
   document.getElementById('snap-count').textContent = snapList.length;
+  // Keep the Snapshots tab in sync without forcing a full poll.
+  if (document.body.classList.contains('snaps-tab')) renderSnapsGrid();
 }
 
 function takeSnap() {
   const btn = document.getElementById('snap-btn');
   const wrap = document.getElementById('snap-wrap');
+  // Open the popover immediately. Previously we only added .open after the
+  // /screenshot response returned, so a slow capture or any failure left the
+  // popover closed and the user couldn't see existing snapshots at all.
+  wrap.classList.add('open');
   btn.disabled = true;
   btn.textContent = '⏳';
   fetch('/screenshot').then(r => r.json()).then(d => {
     btn.textContent = '✓';
-    wrap.classList.add('open');
-    const s = {filename: d.filename, ts: d.filename.replace('snap_','').replace('.jpg',''), label: 'Snap ' + d.filename.slice(9,15)};
-    snapList.unshift(s);
-    addThumb(s);
+    if (d && d.filename) {
+      const s = {filename: d.filename, ts: d.filename.replace('snap_','').replace('.jpg',''), label: 'Snap ' + d.filename.slice(9,15)};
+      snapList.unshift(s);
+      addThumb(s);
+    }
     setTimeout(() => { btn.textContent = '📷 Snapshot'; btn.disabled = false; }, 1200);
   }).catch(() => { btn.textContent = '📷 Snapshot'; btn.disabled = false; });
 }
 
-// Toggle popover on button area click
-document.getElementById('snap-wrap').addEventListener('click', function(e) {
-  if (e.target.id !== 'snap-btn' && snapList.length) {
-    this.classList.toggle('open');
-  }
-});
+// Click outside the wrap closes the popover. Clicks inside (thumbs,
+// download/delete buttons, the button itself) are handled by their own
+// handlers and don't toggle the popover here.
 document.addEventListener('click', e => {
   if (!document.getElementById('snap-wrap').contains(e.target))
     document.getElementById('snap-wrap').classList.remove('open');
@@ -2065,7 +2291,11 @@ function deleteSnap(e, filename) {
   if (!snapList.length) {
     document.getElementById('snap-empty').style.display = '';
     document.getElementById('snap-pop-empty').style.display = '';
+    const sg = document.getElementById('snaps-empty');
+    if (sg) sg.style.display = '';
   }
+  const info = document.getElementById('snaps-count-info');
+  if (info) info.textContent = snapList.length + ' saved';
 }
 
 function openModal(url) {
@@ -2108,6 +2338,8 @@ function updateStats(d) {
   if (d.resolution) {
     const sel = document.getElementById('res-select');
     if (sel.value !== d.resolution) sel.value = d.resolution;
+    const sSel = document.getElementById('settings-res-select');
+    if (sSel && sSel.value !== d.resolution) sSel.value = d.resolution;
   }
 
   const bar = document.getElementById('fps-bar');
@@ -2154,20 +2386,97 @@ loadSnapshots();
 loadModels();
 
 // ── Training / Label tab ─────────────────────────────────
-let labelCurrent = null;
 let labelTabActive = false;
 
 function switchTab(tab) {
   labelTabActive = (tab === 'train');
-  document.getElementById('main').style.display      = labelTabActive ? 'none' : '';
-  document.getElementById('label-panel').style.display = labelTabActive ? 'flex' : 'none';
+  // Toggle body classes instead of inline display, because the mobile
+  // @media rule on #main uses !important (needed to override the
+  // later-in-source desktop grid rule), which inline styles can't beat.
+  const body = document.body;
+  body.classList.toggle('train-tab',    tab === 'train');
+  body.classList.toggle('snaps-tab',    tab === 'snaps');
+  body.classList.toggle('settings-tab', tab === 'settings');
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  const navId = labelTabActive ? 'nav-train' : 'nav-live';
-  const el = document.getElementById(navId);
-  if (el) el.classList.add('active');
-  if (labelTabActive) labelTick();
+  const navMap = {
+    live: 'nav-live', train: 'nav-train',
+    snaps: 'nav-snaps', settings: 'nav-settings',
+  };
+  const navId = navMap[tab];
+  if (navId) {
+    const el = document.getElementById(navId);
+    if (el) el.classList.add('active');
+  }
   // Close the mobile nav drawer once a tab is picked.
-  document.body.classList.remove('nav-open');
+  body.classList.remove('nav-open');
+  // Auto-load the latest frame + predictions when entering the labeling
+  // tab so the user lands on the predicted-frame screen instead of an
+  // empty placeholder.
+  if (tab === 'train')    manualActivate();
+  if (tab === 'snaps')    renderSnapsGrid();
+  if (tab === 'settings') syncSettingsFromInline();
+}
+
+// Copy live state from the inline (Live Feed / Label) controls into the
+// Settings tab so it always opens reflecting current values. After this
+// initial sync, both sides stay aligned because the Settings controls call
+// the same handlers (setModel, setResolution, onConfSlider, toggle*) that
+// already update the inline UI.
+function syncSettingsFromInline() {
+  const copy = (srcId, dstId) => {
+    const s = document.getElementById(srcId);
+    const d = document.getElementById(dstId);
+    if (s && d && d.value !== s.value) d.value = s.value;
+  };
+  copy('res-select',    'settings-res-select');
+  copy('train-epochs',  'settings-train-epochs');
+  // Confidence: re-run the UI updater so slider value, fill gradient, and
+  // both labels match.
+  const conf = document.getElementById('conf-slider');
+  if (conf) _updateConfUI(parseInt(conf.value, 10));
+  // Toggles
+  ['trails', 'enhance', 'hat'].forEach(k => {
+    const src = document.getElementById(k + '-btn');
+    if (src) _syncSettingsToggle(k, src.classList.contains('on'));
+  });
+  // Read-only: saved labels + ETA come from refreshTrainLabels(); kick it
+  // so the Settings readouts are fresh on tab open.
+  if (typeof refreshTrainLabels === 'function') refreshTrainLabels();
+}
+
+// Build a grid of all current snapshots in the Snapshots tab. Cheap
+// enough at the cap (50) to fully re-render on every change rather than
+// reconcile a diff. Each card has open / download / delete actions.
+function renderSnapsGrid() {
+  const grid  = document.getElementById('snaps-grid');
+  const empty = document.getElementById('snaps-empty');
+  const info  = document.getElementById('snaps-count-info');
+  if (!grid) return;
+  grid.innerHTML = '';
+  if (info) info.textContent = snapList.length + (snapList.length === 1 ? ' saved' : ' saved');
+  if (!snapList.length) {
+    if (empty) empty.style.display = '';
+    return;
+  }
+  if (empty) empty.style.display = 'none';
+  for (const s of snapList) {
+    const url = '/screenshots/' + s.filename;
+    const card = document.createElement('div');
+    card.className = 'snap-card';
+    card.dataset.file = s.filename;
+    card.innerHTML =
+      '<img src="' + url + '" loading="lazy" alt="' + s.filename + '">' +
+      '<div class="snap-card-meta">' +
+        '<span>' + s.label + '</span>' +
+        '<span class="snap-card-actions">' +
+          '<a href="' + url + '" download="' + s.filename + '" title="Download">⬇</a>' +
+          '<button class="del" type="button" title="Delete">✕</button>' +
+        '</span>' +
+      '</div>';
+    card.querySelector('img').onclick = () => openModal(url);
+    card.querySelector('.del').onclick = (e) => deleteSnap(e, s.filename);
+    grid.appendChild(card);
+  }
 }
 
 function toggleNav() {
@@ -2182,20 +2491,6 @@ document.addEventListener('click', (e) => {
     document.body.classList.remove('nav-open');
   }
 });
-
-function toggleLabeling() {
-  fetch('/label/toggle').then(r => r.json()).then(d => {
-    const btn = document.getElementById('label-toggle');
-    btn.textContent = d.enabled ? '⏸ Stop labeling' : '▶ Start labeling';
-    btn.classList.toggle('on', d.enabled);
-    document.getElementById('label-state').textContent = d.enabled ? 'on' : 'off';
-    // After labeling stops, surface a one-tap "Start inferencing" button on
-    // the live feed so the user can explicitly tear down any leftover
-    // training subprocess and reset inference back to clean state.
-    const sib = document.getElementById('start-inference-btn');
-    if (sib) sib.style.display = d.enabled ? 'none' : '';
-  });
-}
 
 function startInferencing(e) {
   if (e && e.stopPropagation) e.stopPropagation();   // don't open fullscreen feed
@@ -2216,70 +2511,6 @@ function startInferencing(e) {
     });
   });
 }
-
-function labelTick() {
-  fetch('/label/queue').then(r => r.json()).then(d => {
-    document.getElementById('label-count').textContent = d.count;
-    if (!d.count) {
-      labelCurrent = null;
-      document.getElementById('label-empty').style.display = '';
-      document.getElementById('label-canvas').style.display = 'none';
-      document.getElementById('label-track').textContent = '—';
-      document.getElementById('label-class').textContent = '—';
-      return;
-    }
-    const next = d.queue[0];
-    if (labelCurrent && labelCurrent.id === next.id) return;   // already showing
-    labelCurrent = next;
-    document.getElementById('label-empty').style.display = 'none';
-    document.getElementById('label-canvas').style.display = '';
-    document.getElementById('label-class').textContent = next.class_name;
-    document.getElementById('label-track').textContent = '#' + next.track_id;
-    drawLabelCanvas(next);
-  });
-}
-
-function drawLabelCanvas(c) {
-  const cv = document.getElementById('label-canvas');
-  const ctx = cv.getContext('2d');
-  const img = new Image();
-  img.onload = () => {
-    cv.width = c.img_w;
-    cv.height = c.img_h;
-    ctx.drawImage(img, 0, 0);
-    const [x1, y1, x2, y2] = c.bbox;
-    ctx.lineWidth = Math.max(3, Math.round(c.img_w / 400));
-    ctx.strokeStyle = '#f5c518';
-    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
-    // Filled label tag
-    ctx.fillStyle = 'rgba(245,197,24,0.85)';
-    const tag = `${c.class_name}  #${c.track_id}`;
-    ctx.font = `${Math.max(14, Math.round(c.img_w / 60))}px sans-serif`;
-    const m = ctx.measureText(tag);
-    const th = parseInt(ctx.font, 10) + 4;
-    ctx.fillRect(x1, Math.max(0, y1 - th - 2), m.width + 12, th + 2);
-    ctx.fillStyle = '#111';
-    ctx.fillText(tag, x1 + 6, Math.max(th, y1 - 6));
-  };
-  img.src = c.image_url + '?t=' + Date.now();
-}
-
-function labelDecision(keep) {
-  if (!labelCurrent) return;
-  const cid = labelCurrent.id;
-  fetch(`/label/decision?id=${encodeURIComponent(cid)}&keep=${keep}`)
-    .then(r => r.json()).then(() => {
-      labelCurrent = null;
-      labelTick();
-    });
-}
-
-document.addEventListener('keydown', e => {
-  if (!labelTabActive) return;
-  if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
-  if (e.key === 'y' || e.key === 'Y' || e.key === 'ArrowRight') labelDecision(1);
-  if (e.key === 'n' || e.key === 'N' || e.key === 'ArrowLeft')  labelDecision(0);
-});
 
 // ── Manual label modal ────────────────────────────────────
 //
@@ -2302,6 +2533,36 @@ let manualSavedCount = 0;  // images saved during this manual session — reset 
 const MANUAL_CLASS_NAMES = ['fish', 'shrimp'];
 const MANUAL_HANDLE_PX = 18;  // hit radius around corner handles in canvas-coords
 const MANUAL_HAND_PX   = 28;  // hit radius around the center ✋ handle
+const MANUAL_CLOSE_PX  = 32;  // size of the ✕ close button drawn over each frozen box
+
+// Compute the canvas-space rect of the ✕ button drawn on a frozen box `b`.
+// Kept in one place so draw + hit-test agree. The ✕ sits *inside* the
+// top-right of the box rather than half-outside, because anchoring it
+// outside meant a box flush with the canvas top clamped its ✕ to y=0,
+// which visually merged with the toolbar above the canvas ("close button
+// on top of menu items"). Inside-anchored means the button always lives
+// over the box itself — no clamping, no toolbar collision.
+function manualCloseRect(b) {
+  const cv = document.getElementById('manual-canvas');
+  const sz = Math.max(MANUAL_CLOSE_PX, Math.round((cv ? cv.width : 1000) / 50));
+  const cvW = cv ? cv.width : 0, cvH = cv ? cv.height : 0;
+  // Normalize negative-size boxes so we always operate on the visible rect.
+  let bx = b.x, by = b.y, bw = b.w, bh = b.h;
+  if (bw < 0) { bx += bw; bw = -bw; }
+  if (bh < 0) { by += bh; bh = -bh; }
+  const inset = Math.max(2, Math.round(sz / 6));
+  let cx = bx + bw - sz - inset;
+  let cy = by + inset;
+  // For boxes smaller than the button itself, fall back to top-right
+  // outside-corner so the ✕ is still visible and tappable.
+  if (bw < sz + inset * 2 || bh < sz + inset * 2) {
+    cx = bx + bw - sz / 2;
+    cy = by - sz / 2;
+  }
+  cx = Math.max(0, Math.min(cvW - sz, cx));
+  cy = Math.max(0, Math.min(cvH - sz, cy));
+  return { x: cx, y: cy, w: sz, h: sz };
+}
 
 // Snap the latest live frame onto the manual-label canvas. Used both to open
 // the modal and to advance to the next frame after each save (the modal stays
@@ -2309,27 +2570,57 @@ const MANUAL_HAND_PX   = 28;  // hit radius around the center ✋ handle
 // for consecutive frames" behavior).
 function manualLoadFrame(opts) {
   opts = opts || {};
-  return fetch('/label/snap?t=' + Date.now()).then(r => {
+  // Load the JPEG and the latest model boxes in parallel — the boxes are
+  // pre-filled into manualBoxes so the user only has to ✕ wrong ones and add
+  // missed ones, instead of redrawing every fish from scratch.
+  const framePromise = fetch('/label/snap?t=' + Date.now()).then(r => {
     if (!r.ok) throw new Error('no frame');
     return r.blob();
-  }).then(blob => new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(blob);
-    const img = new Image();
-    img.onload = () => {
-      manualImg = img;
-      manualBoxes = [];
-      manualBox = null;
-      manualMode = 'idle';
-      const cv = document.getElementById('manual-canvas');
-      cv.width  = img.naturalWidth;
-      cv.height = img.naturalHeight;
-      drawManualCanvas();
-      URL.revokeObjectURL(url);
-      resolve();
-    };
-    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
-    img.src = url;
-  }));
+  });
+  const predsPromise = fetch('/label/predictions?t=' + Date.now())
+    .then(r => r.ok ? r.json() : { boxes: [], img_w: 0, img_h: 0 })
+    .catch(() => ({ boxes: [], img_w: 0, img_h: 0 }));
+
+  return Promise.all([framePromise, predsPromise]).then(([blob, preds]) => {
+    return new Promise((resolve, reject) => {
+      const url = URL.createObjectURL(blob);
+      const img = new Image();
+      img.onload = () => {
+        manualImg = img;
+        manualBox = null;
+        manualMode = 'idle';
+        const cv = document.getElementById('manual-canvas');
+        const empty = document.getElementById('manual-empty');
+        cv.width  = img.naturalWidth;
+        cv.height = img.naturalHeight;
+        cv.style.display = '';
+        if (empty) empty.style.display = 'none';
+        // Pre-fill predicted boxes. Scale them if the prediction frame dims
+        // don't match the snapped frame dims (e.g. resolution just changed,
+        // or the JPEG encoder padded). Strict equality used to drop boxes
+        // entirely on the slightest dim drift, which made the predicted
+        // close buttons never appear for the user.
+        manualBoxes = [];
+        if (preds && Array.isArray(preds.boxes) && preds.boxes.length
+            && preds.img_w > 0 && preds.img_h > 0) {
+          const sx = img.naturalWidth  / preds.img_w;
+          const sy = img.naturalHeight / preds.img_h;
+          for (const p of preds.boxes) {
+            const x = Math.max(0, p.x1 * sx);
+            const y = Math.max(0, p.y1 * sy);
+            const w = Math.max(1, (p.x2 - p.x1) * sx);
+            const h = Math.max(1, (p.y2 - p.y1) * sy);
+            manualBoxes.push({ x, y, w, h, cls: p.cls | 0, predicted: true });
+          }
+        }
+        drawManualCanvas();
+        URL.revokeObjectURL(url);
+        resolve();
+      };
+      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
+      img.src = url;
+    });
+  });
 }
 
 function manualUpdateStreak() {
@@ -2338,29 +2629,25 @@ function manualUpdateStreak() {
   el.textContent = manualSavedCount > 0 ? `(${manualSavedCount} saved this session)` : '';
 }
 
-function openManualLabel() {
+// Activate the inline labeling card (called from switchTab when the user
+// opens the Label tab). Loads the latest frame + predictions; if no frame
+// is available yet, leaves the placeholder visible so the user knows why.
+function manualActivate() {
   manualSavedCount = 0;
   manualUpdateStreak();
-  manualLoadFrame()
-    .then(() => document.getElementById('manual-overlay').classList.add('open'))
-    .catch(() => alert('No frame available yet — wait a moment and try again.'));
+  return manualLoadFrame().catch(() => {
+    // No frame yet — keep the placeholder visible.
+    const cv = document.getElementById('manual-canvas');
+    const empty = document.getElementById('manual-empty');
+    if (cv) cv.style.display = 'none';
+    if (empty) empty.style.display = '';
+  });
 }
 
 function manualNextFrame() {
   // Skip the current frame without saving — useful when the snapped frame
   // has nothing worth labeling.
   manualLoadFrame().catch(() => {});
-}
-
-function closeManualLabel() {
-  // Exits manual mode and returns the labeling tab to the auto-candidate flow.
-  document.getElementById('manual-overlay').classList.remove('open');
-  manualImg = null;
-  manualBoxes = [];
-  manualBox = null;
-  manualMode = 'idle';
-  manualSavedCount = 0;
-  manualUpdateStreak();
 }
 
 // "Clear" pops what the user drew most recently:
@@ -2404,11 +2691,16 @@ function drawManualCanvas() {
   const ctx = cv.getContext('2d');
   ctx.drawImage(manualImg, 0, 0);
   const lineW = Math.max(2, Math.round(cv.width / 480));
-  // 1) Frozen boxes — drawn dimmer, with class label, no handles.
+  // 1) Frozen boxes — drawn dimmer, with class label, no handles. Each box
+  //    gets a ✕ close button at the top-right; tapping it removes the box.
+  //    Predicted boxes use teal so the user can tell them apart from boxes
+  //    they drew themselves (purple).
   for (const b of manualBoxes) {
+    const stroke = b.predicted ? '#00d4aa' : '#7c4dff';
+    const fillTr = b.predicted ? 'rgba(0, 212, 170, 0.10)' : 'rgba(124, 77, 255, 0.10)';
     ctx.lineWidth = lineW;
-    ctx.strokeStyle = '#7c4dff';
-    ctx.fillStyle = 'rgba(124, 77, 255, 0.10)';
+    ctx.strokeStyle = stroke;
+    ctx.fillStyle = fillTr;
     ctx.fillRect(b.x, b.y, b.w, b.h);
     ctx.strokeRect(b.x, b.y, b.w, b.h);
     // Class label tag in the top-left corner of the box.
@@ -2419,10 +2711,23 @@ function drawManualCanvas() {
     ctx.textAlign = 'left';
     const padX = 6, padY = 4;
     const textW = ctx.measureText(name).width;
-    ctx.fillStyle = '#7c4dff';
+    ctx.fillStyle = stroke;
     ctx.fillRect(b.x, b.y, textW + padX * 2, fontPx + padY * 2);
     ctx.fillStyle = '#fff';
     ctx.fillText(name, b.x + padX, b.y + padY);
+    // ✕ close button at top-right of the box.
+    const cr = manualCloseRect(b);
+    ctx.fillStyle = '#fc5c65';
+    ctx.fillRect(cr.x, cr.y, cr.w, cr.h);
+    ctx.lineWidth = Math.max(2, Math.round(cr.w / 12));
+    ctx.strokeStyle = '#fff';
+    const inset = Math.round(cr.w * 0.28);
+    ctx.beginPath();
+    ctx.moveTo(cr.x + inset, cr.y + inset);
+    ctx.lineTo(cr.x + cr.w - inset, cr.y + cr.h - inset);
+    ctx.moveTo(cr.x + cr.w - inset, cr.y + inset);
+    ctx.lineTo(cr.x + inset, cr.y + cr.h - inset);
+    ctx.stroke();
   }
   // 2) Active box (the one with handles) on top.
   if (!manualBox) return;
@@ -2486,6 +2791,21 @@ function manualHitTest(x, y) {
     e.preventDefault();
     cv.setPointerCapture(e.pointerId);
     const p = manualEventToImage(e);
+
+    // 1) Hit-test the ✕ close button on each frozen box first — tapping
+    //    it removes that box and ends the gesture. Iterate top-most first
+    //    (last drawn = front) so the topmost ✕ wins on overlap.
+    for (let i = manualBoxes.length - 1; i >= 0; i--) {
+      const cr = manualCloseRect(manualBoxes[i]);
+      if (p.x >= cr.x && p.x <= cr.x + cr.w
+          && p.y >= cr.y && p.y <= cr.y + cr.h) {
+        manualBoxes.splice(i, 1);
+        manualMode = 'idle';
+        drawManualCanvas();
+        try { cv.releasePointerCapture(e.pointerId); } catch (_) {}
+        return;
+      }
+    }
 
     if (manualBox) {
       const hit = manualHitTest(p.x, p.y);
@@ -2601,19 +2921,6 @@ function saveManualLabel() {
    .finally(() => { if (saveBtn) saveBtn.disabled = false; });
 }
 
-// Poll the queue while the Training tab is open.
-setInterval(() => { if (labelTabActive) labelTick(); }, 1000);
-
-// Initial label state sync (so the toggle button reflects server-side state on reload).
-fetch('/label/state').then(r => r.json()).then(d => {
-  if (d.enabled) {
-    const btn = document.getElementById('label-toggle');
-    btn.textContent = '⏸ Stop labeling';
-    btn.classList.add('on');
-    document.getElementById('label-state').textContent = 'on';
-  }
-});
-
 // ── Training: label count + Train button ─────────────────
 let trainEstimate = null;
 function selectedEpochs() {
@@ -2623,18 +2930,35 @@ function selectedEpochs() {
 function refreshTrainLabels() {
   const ep = selectedEpochs();
   fetch('/train/labels?epochs=' + ep).then(r => r.json()).then(d => {
-    document.getElementById('label-saved').textContent =
-      d.count + '/' + d.min_required;
+    const savedTxt = d.count + '/' + d.min_required;
+    document.getElementById('label-saved').textContent = savedTxt;
     const btn = document.getElementById('train-btn');
     btn.disabled = !d.ready || trainModalOpen;
     trainEstimate = d.estimate;
     const hint = document.getElementById('train-eta-hint');
-    if (hint && d.estimate) {
-      hint.textContent = `~${d.estimate.low_min}–${d.estimate.high_min} min`;
-    }
+    const etaTxt = d.estimate ? `~${d.estimate.low_min}–${d.estimate.high_min} min` : '—';
+    if (hint && d.estimate) hint.textContent = etaTxt;
+    // Mirror to Settings.
+    const sSaved = document.getElementById('settings-label-saved');
+    if (sSaved) sSaved.textContent = savedTxt;
+    const sEta = document.getElementById('settings-train-eta');
+    if (sEta) sEta.textContent = etaTxt;
   }).catch(() => {});
 }
-function onEpochsChange() { refreshTrainLabels(); }
+function onEpochsChange() {
+  refreshTrainLabels();
+  // Sync Settings dropdown to the labeling-tab dropdown so they stay paired.
+  const ep = document.getElementById('train-epochs');
+  const sEp = document.getElementById('settings-train-epochs');
+  if (ep && sEp && sEp.value !== ep.value) sEp.value = ep.value;
+}
+// Settings epochs change → mirror back to the labeling-tab dropdown,
+// then run the same recompute path.
+function onSettingsEpochsChange(val) {
+  const ep = document.getElementById('train-epochs');
+  if (ep) ep.value = val;
+  refreshTrainLabels();
+}
 setInterval(refreshTrainLabels, 3000);
 refreshTrainLabels();
 
@@ -2687,7 +3011,9 @@ function openTrainModal() {
   cancelBtn.textContent = 'Cancel';
   document.getElementById('train-close').style.display = 'none';
   // Disable both model dropdowns, the epochs dropdown, and the train button
-  document.querySelectorAll('#model-select, #label-model-select').forEach(s => s.disabled = true);
+  document.querySelectorAll(
+    '#model-select, #label-model-select, #settings-model-select, #settings-label-model-select'
+  ).forEach(s => s.disabled = true);
   const es = document.getElementById('train-epochs');
   if (es) es.disabled = true;
   document.getElementById('train-btn').disabled = true;
@@ -2700,7 +3026,9 @@ function closeTrainModal() {
   trainModalOpen = false;
   document.getElementById('train-overlay').classList.remove('open');
   if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
-  document.querySelectorAll('#model-select, #label-model-select').forEach(s => s.disabled = false);
+  document.querySelectorAll(
+    '#model-select, #label-model-select, #settings-model-select, #settings-label-model-select'
+  ).forEach(s => s.disabled = false);
   const es = document.getElementById('train-epochs');
   if (es) es.disabled = false;
   refreshTrainLabels();
