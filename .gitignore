@@ -25,6 +25,7 @@ fish_logs/
 snapshot_*.jpg
 *.csv
 *.txt
+!scripts/requirements*.txt
 
 # Jetson setup downloads
 cloudflared

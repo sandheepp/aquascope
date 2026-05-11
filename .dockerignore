@@ -1,0 +1,49 @@
+# Keep the build context small and predictable.
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+venv/
+.venv/
+
+# Datasets & recorded data — not part of the runtime image.
+dataset/
+fish_logs/
+runs/
+
+# Models & engines — pulled at runtime or via volume mount.
+*.pt
+*.engine
+*.onnx
+*.trt
+*.whl
+*.zip
+
+# Snapshots / videos
+*.mp4
+*.jpg
+*.png
+
+# Jetson setup downloads
+cloudflared
+cloudflared-linux-arm64
+cuda-keyring*.deb
+
+# Secrets
+.env
+*.env
+!.env.example
+
+# Tooling
+.git/
+.github/
+.vscode/
+.idea/
+.claude/
+.DS_Store
+docs/
+README.md
+CONTRIBUTING.md
+LICENSE

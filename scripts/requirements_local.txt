@@ -1,0 +1,36 @@
+# AquaScope — laptop / non-Jetson dependencies.
+#
+# Use this file when you DON'T have a Jetson — i.e. macOS, regular Linux, or
+# Windows (WSL). The Jetson-only packages (tensorrt*, jetson-stats, the cuda-
+# specific torch wheel) are skipped.
+#
+#   python3 -m venv venv
+#   source venv/bin/activate
+#   pip install -r scripts/requirements_local.txt
+#
+# Then run the dashboard:
+#   bash scripts/run_local.sh                       # webcam (default)
+#   bash scripts/run_local.sh --video samples/aquarium.mp4
+#
+# Notes:
+#   - Torch is unpinned: pip will fetch the right wheel for your platform/CUDA.
+#     macOS gets MPS-capable wheels automatically; Linux gets CUDA wheels if a
+#     CUDA toolkit is detected, otherwise CPU.
+#   - Ultralytics will lazily download yolov8n.pt on first run if there are no
+#     weights in models/.
+
+# Core
+ultralytics>=8.3.0
+torch>=2.0
+torchvision>=0.15
+numpy>=1.26,<3
+opencv-python>=4.8
+
+# Tracking
+lap>=0.5
+supervision>=0.25
+
+# Streaming + dashboard
+python-dotenv>=1.0
+PyYAML>=5.4
+Pillow>=9.0
