@@ -33,7 +33,8 @@ aquascope/
 ├── models/                     # Weights & engines (best.engine, best_v<N>.engine, …)
 ├── dataset/user_recorded/      # Labels produced by the dashboard's labeling tab
 ├── fish_logs/                  # Runtime output: JSON stats + screenshots
-└── .env                        # JETSON_HOST / JETSON_USER / JETSON_PASSWORD (gitignored)
+├── .env.example                # Template for the gitignored .env (JETSON_HOST / USER / etc.)
+└── LICENSE                     # GNU AGPL-3.0 (same family as YOLOv8)
 ```
 
 ## Architecture
@@ -136,10 +137,11 @@ The dashboard is a single page served from `app/stream.py` with these tabs:
 - **Analytics** — per-track activity stats from the JSON log files.
 - **Snapshots** — screenshots taken from the dashboard, stored under
   [fish_logs/screenshots/](fish_logs/screenshots/).
-- **Labeling** — turns the live tracker into a data-collection loop. Each
-  detection becomes a candidate crop; tick to keep it as a YOLO label
-  (saved under [dataset/user_recorded/](dataset/user_recorded/)) or cross
-  to discard. Manual multi-box drawing is also supported.
+- **Label Fish** — opens straight onto the most recent live frame with all
+  predicted boxes pre-drawn. Each predicted box has a red ✕ to remove false
+  positives; click-drag to add missing fish; *Save & next* writes a YOLO
+  label under [dataset/user_recorded/](dataset/user_recorded/) and pulls
+  the next frame.
 - **Settings** — model dropdown (lists every `models/best*.engine`
   on disk), confidence threshold, resolution, exposure.
 
@@ -255,5 +257,8 @@ Snapshots taken from the dashboard live in `fish_logs/screenshots/`.
 
 ## License
 
-Provided as-is for personal/educational use. YOLOv8 is licensed under
-AGPL-3.0 by Ultralytics.
+AquaScope is released under the GNU Affero General Public License v3.0
+([LICENSE](LICENSE)). The AGPL applies to network use: if you run a
+modified version of this code as a service, you must make the modified
+source available to its users. YOLOv8 (the upstream detector) is also
+AGPL-3.0 by Ultralytics, so the licenses match.

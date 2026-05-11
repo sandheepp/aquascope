@@ -31,9 +31,16 @@ cloudflared
 cloudflared-linux-arm64
 cuda-keyring*.deb
 
-# Environment / secrets
+# Environment / secrets (keep .env.example tracked as a template)
 .env
 *.env
+!.env.example
+
+# Ultralytics training output (runs/detect/*, runs/train/*)
+runs/
+
+# Local Claude Code settings
+.claude/
 
 # macOS
 .DS_Store

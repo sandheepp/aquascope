@@ -13,9 +13,9 @@ if [ -f "$ENV_FILE" ]; then
 fi
 
 REMOTE_USER="${JETSON_USER:-jetson}"
-REMOTE_HOST="${JETSON_HOST:-192.168.31.141}"
+REMOTE_HOST="${JETSON_HOST:?JETSON_HOST not set. Copy .env.example to .env and fill it in, or export it.}"
 REMOTE_PATH="${JETSON_PATH:-/home/jetson/projects/aquascope}"
-PASSWORD="${JETSON_PASSWORD:?JETSON_PASSWORD not set. Add it to .env or export it.}"
+PASSWORD="${JETSON_PASSWORD:?JETSON_PASSWORD not set. Copy .env.example to .env and fill it in, or export it.}"
 
 if ! command -v sshpass >/dev/null 2>&1; then
   echo "ERROR: sshpass is required to use this script."
