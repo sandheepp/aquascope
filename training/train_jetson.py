@@ -30,6 +30,7 @@ import random
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -152,19 +153,146 @@ def build_user_only_yaml(
 _USER_CLASSES: list[str] = ["fish", "shrimp"]
 
 
-def _write_status(path: str | None, **kwargs) -> None:
-    if not path:
+# Shared status state. _write_status() merges kwargs into _STATUS and
+# atomically writes the whole thing — so the per-epoch callback, the GPU
+# sampler thread, and the main flow can all contribute fields without
+# clobbering each other.
+_STATUS_LOCK = threading.Lock()
+_STATUS: dict = {}
+_STATUS_PATH: str | None = None
+
+
+def _status_flush_locked() -> None:
+    """Caller holds _STATUS_LOCK."""
+    if not _STATUS_PATH:
         return
     try:
-        # Atomic-ish: write to tmp then rename
-        d = os.path.dirname(path) or "."
+        d = os.path.dirname(_STATUS_PATH) or "."
         os.makedirs(d, exist_ok=True)
-        tmp = path + ".tmp"
+        tmp = _STATUS_PATH + ".tmp"
         with open(tmp, "w") as f:
-            json.dump(kwargs, f)
-        os.replace(tmp, path)
+            json.dump(_STATUS, f)
+        os.replace(tmp, _STATUS_PATH)
     except OSError:
         pass
+
+
+def _write_status(path: str | None, **kwargs) -> None:
+    """Merge `kwargs` into the shared status dict and flush. `path` is only
+    consulted on the first call (it pins _STATUS_PATH); subsequent calls
+    can pass None or the same path."""
+    global _STATUS_PATH
+    with _STATUS_LOCK:
+        if path and not _STATUS_PATH:
+            _STATUS_PATH = path
+        _STATUS.update(kwargs)
+        _status_flush_locked()
+
+
+def _status_append(key: str, value, cap: int = 240) -> None:
+    """Append `value` to the list at status[key] (creating it if missing),
+    bounded to the most recent `cap` entries. Cap protects against
+    unbounded growth on long runs — the dashboard charts only need a
+    rolling window anyway."""
+    with _STATUS_LOCK:
+        lst = _STATUS.setdefault(key, [])
+        lst.append(value)
+        if len(lst) > cap:
+            del lst[:len(lst) - cap]
+        _status_flush_locked()
+
+
+def _sample_gpu() -> dict:
+    """Best-effort GPU usage snapshot. Returns {} when no GPU is in use
+    (MPS, CPU, or NVML/Tegra probes failed)."""
+    try:
+        import torch
+    except ImportError:
+        return {}
+    if not torch.cuda.is_available():
+        return {}
+    out: dict = {}
+    try:
+        out["mem_mb"] = int(torch.cuda.memory_allocated() / (1024 * 1024))
+    except Exception:                                       # noqa: BLE001
+        pass
+    try:
+        out["mem_total_mb"] = int(
+            torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
+    except Exception:                                       # noqa: BLE001
+        pass
+    # Utilization: NVML on dGPU; /sys/devices/gpu.0/load on Tegra (0–1000).
+    util_pct: float | None = None
+    try:
+        util_pct = float(torch.cuda.utilization())          # NVML-backed
+    except Exception:                                       # noqa: BLE001
+        try:
+            with open("/sys/devices/gpu.0/load") as fh:
+                util_pct = float(fh.read().strip()) / 10.0
+        except (OSError, ValueError):
+            util_pct = None
+    if util_pct is not None:
+        out["util_pct"] = round(util_pct, 1)
+    return out
+
+
+def _sample_ram() -> dict:
+    """System RAM snapshot via /proc/meminfo (Linux/Jetson). Returns {} on
+    non-Linux or if /proc/meminfo isn't readable for any reason."""
+    try:
+        with open("/proc/meminfo") as fh:
+            info: dict = {}
+            for line in fh:
+                key, _, rest = line.partition(":")
+                parts = rest.strip().split()
+                if not parts:
+                    continue
+                try:
+                    info[key] = int(parts[0])               # kB
+                except ValueError:
+                    pass
+        total_kb = info.get("MemTotal")
+        avail_kb = info.get("MemAvailable", info.get("MemFree"))
+        if total_kb is None or avail_kb is None:
+            return {}
+        return {
+            "ram_used_mb": int((total_kb - avail_kb) / 1024),
+            "ram_total_mb": int(total_kb / 1024),
+        }
+    except OSError:
+        return {}
+
+
+def _start_system_sampler(start_t: float, stop_event: threading.Event,
+                          interval: float = 2.0) -> threading.Thread:
+    """Daemon thread that samples GPU + RAM every `interval` seconds and
+    appends them to status['gpu_samples'] as
+        {t, util_pct, mem_mb, ram_mb}.
+    Top-level fields gpu_mem_total_mb / ram_total_mb are written once at
+    startup so the dashboard can size its Y axes even before usage builds
+    up. Daemon thread; main sets stop_event after training."""
+    def _run():
+        first_gpu = _sample_gpu()
+        first_ram = _sample_ram()
+        if "mem_total_mb" in first_gpu:
+            _write_status(None, gpu_mem_total_mb=first_gpu["mem_total_mb"])
+        if "ram_total_mb" in first_ram:
+            _write_status(None, ram_total_mb=first_ram["ram_total_mb"])
+        while not stop_event.is_set():
+            gpu = _sample_gpu()
+            ram = _sample_ram()
+            if gpu or ram:
+                _status_append("gpu_samples", {
+                    "t": round(time.time() - start_t, 2),
+                    "util_pct": gpu.get("util_pct"),
+                    "mem_mb":   gpu.get("mem_mb"),
+                    "ram_mb":   ram.get("ram_used_mb"),
+                })
+            stop_event.wait(interval)
+
+    t = threading.Thread(target=_run, daemon=True, name="aq-sys-sampler")
+    t.start()
+    return t
 
 
 def _next_version(models_dir: Path) -> int:
@@ -256,6 +384,27 @@ def main() -> None:
             nonlocal epoch_start_t
             epoch_start_t = time.time()
 
+        def _extract_epoch_losses(trainer) -> dict:
+            """Pull the running-mean train losses for this epoch from the
+            trainer. `trainer.tloss` is the per-loss running mean tensor,
+            `trainer.loss_names` are the human-readable names (typically
+            ['box_loss', 'cls_loss', 'dfl_loss']). Both can be absent on
+            non-detect tasks — degrade silently."""
+            out: dict = {}
+            try:
+                names = list(getattr(trainer, "loss_names", []) or [])
+                tloss = getattr(trainer, "tloss", None)
+                if tloss is None or not names:
+                    return out
+                vals = tloss.tolist() if hasattr(tloss, "tolist") else list(tloss)
+                for n, v in zip(names, vals):
+                    out[str(n)] = float(v)
+                if out:
+                    out["total"] = float(sum(out.values()))
+            except Exception:                               # noqa: BLE001
+                pass
+            return out
+
         def on_train_epoch_end(trainer):
             nonlocal epoch_start_t
             current = trainer.epoch + 1
@@ -263,6 +412,10 @@ def main() -> None:
             avg = sum(epoch_durations) / len(epoch_durations)
             remaining = max(0, args.epochs - current)
             eta = int(avg * remaining)
+            losses = _extract_epoch_losses(trainer)
+            if losses:
+                _status_append("loss_samples",
+                               {"epoch": current, **losses})
             _write_status(args.status_file,
                           state="training", version=version,
                           current_epoch=current, total_epochs=args.epochs,
@@ -273,6 +426,11 @@ def main() -> None:
 
         model.add_callback("on_train_epoch_start", on_train_epoch_start)
         model.add_callback("on_train_epoch_end", on_train_epoch_end)
+
+        # Kick off the background GPU sampler. Daemon thread, stops with
+        # the process or when we set the stop_event in the finally block.
+        gpu_stop = threading.Event()
+        _start_system_sampler(start_t, gpu_stop)
 
         # AMP only on CUDA: MPS doesn't support it, and CPU training is already
         # slow enough that mixed precision would mostly add overhead.
@@ -374,6 +532,13 @@ def main() -> None:
                       trace=traceback.format_exc()[-2000:])
         raise
     finally:
+        # Best-effort: ask the sampler thread to stop. It's a daemon so the
+        # process can exit even if this is skipped (e.g. an exception before
+        # we got to start it), hence the try/except.
+        try:
+            gpu_stop.set()                                  # noqa: F821
+        except NameError:
+            pass
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 

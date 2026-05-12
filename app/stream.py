@@ -17,6 +17,7 @@ Endpoints:
   /label/decision    — accept/reject a candidate (?id=<id>&keep=0|1)
   /label/predictions — JSON list of the most recent model boxes for the manual-label modal
   /train/labels      — current user-recorded label count + min required + ETA
+  /train/min-labels  — get/set the min-labels-to-train threshold (?v=N)
   /train/start       — spawn training subprocess (returns 409 if already running)
   /train/status      — poll training progress (state/epoch/eta/message/version)
   /train/cancel      — terminate the running training subprocess
@@ -98,7 +99,8 @@ _train_log_thread = None                       # daemon thread that tees subproc
 # The tracker keeps inference paused while this is True — so the user controls when
 # inference resumes (via /train/acknowledge), not the subprocess exit.
 _train_unacked: bool = False
-_TRAIN_MIN_LABELS: int = 25                    # button stays disabled below this
+_TRAIN_MIN_LABELS: int = 5                     # initial threshold; runtime-mutable
+_train_min_labels_lock = threading.Lock()      # guards the int above
 _TRAIN_DEFAULT_EPOCHS: int = 5
 _TRAIN_EPOCH_CHOICES: tuple[int, ...] = (5, 10, 15, 20, 30, 50)
 _TRAIN_DEFAULT_BATCH: int = 2                  # Orin Nano unified-memory friendly
@@ -340,6 +342,22 @@ def count_user_labels() -> int:
     if not os.path.isdir(labels_dir):
         return 0
     return sum(1 for f in os.listdir(labels_dir) if f.endswith(".txt"))
+
+
+def min_labels_required() -> int:
+    """Current minimum-labels threshold below which the Train button stays
+    disabled. Settable from the Settings UI via /train/min-labels?v=N."""
+    with _train_min_labels_lock:
+        return _TRAIN_MIN_LABELS
+
+
+def set_min_labels_required(n: int) -> int:
+    """Clamp to [1, 1000] and store. Returns the value actually applied."""
+    global _TRAIN_MIN_LABELS
+    n = max(1, min(1000, int(n)))
+    with _train_min_labels_lock:
+        _TRAIN_MIN_LABELS = n
+    return n
 
 
 def estimate_training_minutes(label_count: int, epochs: int = _TRAIN_DEFAULT_EPOCHS) -> dict:
@@ -640,6 +658,8 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_label_manual()
         elif p == "/train/labels":
             self._serve_train_labels()
+        elif p == "/train/min-labels":
+            self._serve_train_min_labels()
         elif p == "/train/start":
             self._serve_train_start()
         elif p == "/train/status":
@@ -826,10 +846,11 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
     def _serve_train_labels(self):
         count = count_user_labels()
         epochs = self._parse_epochs()
+        min_required = min_labels_required()
         body = json.dumps({
             "count": count,
-            "min_required": _TRAIN_MIN_LABELS,
-            "ready": count >= _TRAIN_MIN_LABELS,
+            "min_required": min_required,
+            "ready": count >= min_required,
             "epochs": epochs,
             "epoch_choices": list(_TRAIN_EPOCH_CHOICES),
             "default_epochs": _TRAIN_DEFAULT_EPOCHS,
@@ -837,13 +858,27 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         }).encode()
         self._json_response(body)
 
+    def _serve_train_min_labels(self):
+        """GET /train/min-labels?v=N to set the threshold (clamped to
+        [1, 1000]); returns current value either way."""
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = parse_qs(qs)
+        if "v" in params:
+            try:
+                set_min_labels_required(int(params["v"][0]))
+            except (ValueError, TypeError):
+                pass
+        body = json.dumps({"min_required": min_labels_required()}).encode()
+        self._json_response(body)
+
     def _serve_train_start(self):
         count = count_user_labels()
-        if count < _TRAIN_MIN_LABELS:
+        min_required = min_labels_required()
+        if count < min_required:
             self._json_response(json.dumps({
-                "error": f"need at least {_TRAIN_MIN_LABELS} labels (have {count})",
+                "error": f"need at least {min_required} labels (have {count})",
                 "count": count,
-                "min_required": _TRAIN_MIN_LABELS,
+                "min_required": min_required,
             }).encode())
             return
         epochs = self._parse_epochs()
@@ -1055,8 +1090,17 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
   --mono:    'Courier New', monospace;
 }
 *{margin:0;padding:0;box-sizing:border-box}
+/* `color-scheme: dark` on the root opts the page out of light-mode UA
+   defaults (form controls, scrollbars, the viewport canvas colour). Without
+   it, browsers in forced-light or auto-color mode were painting the area
+   behind the label panel white whenever an inner element had a transparent
+   background. Pair it with an explicit bg-color fallback so even if the
+   gradient fails to paint for any reason, the fallback is dark. */
+html{color-scheme:dark;background:#0e1117}
 body{
-  background:linear-gradient(160deg,#0b1520 0%,#0e1117 40%,#0a1a1a 100%);color:var(--text);
+  background-color:#0e1117;
+  background-image:linear-gradient(160deg,#0b1520 0%,#0e1117 40%,#0a1a1a 100%);
+  color:var(--text);
   font-family:var(--font);font-size:13px;
   display:grid;
   grid-template-columns: 200px 1fr;
@@ -1118,16 +1162,36 @@ body{
     grid-template-columns:unset !important;
     width:100%;padding:0;gap:0;flex-shrink:0;
   }
+  /* Same mobile collapse for #label-panel — its desktop body.train-tab
+     `display:grid !important` rule would otherwise force a 2-column layout
+     on phones. Body.train-tab on mobile re-applies flex column. */
+  body.train-tab #label-panel{
+    display:flex !important;flex-direction:column !important;
+    grid-template-columns:unset !important;
+    width:100%;padding:0;gap:0;flex-shrink:0;overflow:auto;
+  }
+  #label-canvas-area{padding:0}
+  /* Sidebar cards STACK vertically on narrow screens. The previous
+     row+wrap-with-50%-cards layout looked OK in theory but the
+     calc(50% - 8px) gap-math made the right column slide past the
+     viewport (Train-model button got clipped), and tall buttons like
+     "Save & next" wrapped their text awkwardly. Single column kills both
+     bugs and gives every card the full width to breathe. */
+  #label-sidebar{
+    display:flex;flex-direction:column;
+    gap:8px;padding:10px;width:100%;overflow:visible;
+  }
+  #label-sidebar .card{flex:0 0 auto;width:100%;max-width:100%}
   #feed-wrap{
     width:100%;height:56vw;min-height:180px;
     border-radius:0;border-left:none;border-right:none;border-top:none;flex-shrink:0;
   }
   #stats-panel{
-    display:flex;flex-direction:row;flex-wrap:wrap;
+    display:flex;flex-direction:column;
     gap:8px;padding:10px;width:100%;overflow:visible;flex-shrink:0;
   }
-  #stats-panel .card{ flex:1 1 calc(50% - 8px);min-width:130px;max-width:100% }
-  #stats-panel #fish-list{ max-height:160px }
+  #stats-panel .card{flex:0 0 auto;width:100%;max-width:100%}
+  #stats-panel #fish-list{max-height:160px}
   #filmstrip{
     width:100%;height:auto;min-height:100px;flex-shrink:0;
   }
@@ -1247,59 +1311,95 @@ body{
   grid-template-columns:1fr 200px;
   gap:10px;padding:10px;
   overflow:hidden;
+  /* Same explicit dark bg as #label-panel — guarantees the live page
+     reads as the page background everywhere, including under transparent
+     stats cards. */
+  background:#0e1117;
+  color-scheme:dark;
 }
 
 /* ── Label panel (Training tab) ── */
+/* The label page mirrors #main's layout exactly: 1fr canvas + 200px right
+   sidebar, same gap + padding. Switching tabs swaps which panel claims the
+   grid-area; the page never resizes and the chrome stays consistent.
+
+   Explicit `background:#0e1117` (the page gradient's middle tone) — the
+   body sets its own gradient, but without setting an explicit bg here
+   some browsers / forced-color modes were painting the panel white once
+   the inner card backgrounds were removed. Pinning a dark colour
+   guarantees the panel reads as page background under every browser. */
 #label-panel{
   grid-area:main;
-  display:none;flex-direction:column;gap:10px;padding:14px;
-  overflow:auto;
+  display:none;
+  grid-template-columns:1fr 200px;
+  gap:10px;padding:10px;
+  overflow:hidden;
+  background:#0e1117;
+  color-scheme:dark;
 }
 /* When the training tab is active, hide the live-feed grid and reveal the
    labeling panel. Using a body class beats the mobile @media `!important`
    on #main, which a plain inline `display:none` couldn't. */
 body.train-tab #main{display:none !important}
-body.train-tab #label-panel{display:flex !important}
+body.train-tab #label-panel{display:grid !important}
 body.snaps-tab #main{display:none !important}
 body.snaps-tab #snaps-panel{display:flex !important}
 body.settings-tab #main{display:none !important}
 body.settings-tab #settings-panel{display:flex !important}
 
 /* ── Settings tab ── */
+/* Settings page: capped width so it doesn't stretch across a 4K monitor,
+   tight row heights, side-by-side Inference + Training sections on wide
+   screens so all controls fit in one viewport. */
 #settings-panel{
   grid-area:main;
-  display:none;flex-direction:column;gap:14px;padding:14px;
-  overflow:auto;
+  display:none;flex-direction:column;gap:10px;
+  padding:14px 18px;overflow:auto;
+  background:#0e1117;
+  color-scheme:dark;
 }
-#settings-title{font-size:14px;font-weight:700;color:var(--accent)}
-.settings-section-title{
-  font-size:11px;letter-spacing:1.5px;text-transform:uppercase;
-  color:var(--dim);font-weight:700;margin:6px 4px 2px;
+#settings-panel-inner{
+  width:100%;max-width:1100px;align-self:center;
+  display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));
+  gap:14px;
 }
-.settings-card{
-  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);
+#settings-header{
+  grid-column:1 / -1;
+  display:flex;align-items:center;justify-content:space-between;
+}
+#settings-title{font-size:15px;font-weight:700;color:var(--accent)}
+.settings-section{
+  background:transparent;
   border:1px solid var(--border);border-radius:10px;
-  padding:4px 16px;
+  padding:4px 14px;
+}
+.settings-section-title{
+  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;
+  color:var(--accent);font-weight:700;
+  padding:10px 0 6px;border-bottom:1px solid var(--border);margin-bottom:4px;
 }
 .settings-row{
-  display:flex;align-items:center;justify-content:space-between;gap:14px;
-  padding:11px 0;border-bottom:1px solid rgba(30,45,61,0.55);
+  display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:7px 0;border-bottom:1px solid rgba(30,45,61,0.45);
 }
 .settings-row:last-child{border-bottom:none}
-.settings-lbl{color:var(--text);font-size:13px}
-.settings-control{min-width:200px;display:flex;align-items:center;gap:8px;justify-content:flex-end}
+.settings-lbl{color:var(--text);font-size:12px}
+.settings-control{
+  display:flex;align-items:center;gap:6px;justify-content:flex-end;
+  min-width:0;
+}
 .settings-row select{
   background:#1a2130;color:var(--text);border:1px solid var(--border);
-  padding:6px 28px 6px 10px;border-radius:6px;font-size:12px;cursor:pointer;
+  padding:4px 24px 4px 8px;border-radius:5px;font-size:12px;cursor:pointer;
   appearance:none;-webkit-appearance:none;
   background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a5568'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;background-position:right 10px center;
-  min-width:200px;
+  background-repeat:no-repeat;background-position:right 8px center;
+  min-width:140px;max-width:200px;
 }
 .settings-row .toggle-btn{
   background:#1a2130;color:var(--text);border:1px solid var(--border);
-  padding:6px 16px;border-radius:6px;font-size:12px;cursor:pointer;font-weight:600;
-  font-family:var(--font);min-width:80px;
+  padding:4px 14px;border-radius:5px;font-size:11px;cursor:pointer;font-weight:600;
+  font-family:var(--font);min-width:60px;
 }
 .settings-row .toggle-btn.on{
   background:linear-gradient(135deg,rgba(0,212,170,0.30) 0%,rgba(0,212,170,0.12) 100%);
@@ -1307,20 +1407,34 @@ body.settings-tab #settings-panel{display:flex !important}
 }
 .settings-row .toggle-btn:hover{opacity:0.88}
 #settings-conf-slider{
-  flex:1;-webkit-appearance:none;appearance:none;
-  height:4px;border-radius:2px;outline:none;cursor:pointer;min-width:140px;
+  -webkit-appearance:none;appearance:none;
+  height:4px;border-radius:2px;outline:none;cursor:pointer;
+  width:140px;
   background:linear-gradient(to right,var(--accent) 0%,var(--accent) 35%,#1e2d3d 35%,#1e2d3d 100%);
 }
 #settings-conf-slider::-webkit-slider-thumb{
-  -webkit-appearance:none;width:14px;height:14px;border-radius:50%;
+  -webkit-appearance:none;width:13px;height:13px;border-radius:50%;
   background:var(--accent);cursor:pointer;border:2px solid #0e1117;
 }
 #settings-conf-val{
-  font-family:var(--mono);font-size:12px;color:var(--accent);
-  width:40px;text-align:right;flex-shrink:0;
+  font-family:var(--mono);font-size:11px;color:var(--accent);
+  width:34px;text-align:right;flex-shrink:0;
 }
 .settings-readonly{
-  font-family:var(--mono);color:var(--dim);font-size:12px;
+  font-family:var(--mono);color:var(--dim);font-size:11px;
+}
+#settings-min-labels{
+  background:#1a2130;color:var(--text);border:1px solid var(--border);
+  border-radius:5px;padding:3px 6px;font-size:11px;font-family:var(--mono);
+  width:60px;text-align:center;
+  -moz-appearance:textfield;
+}
+#settings-min-labels::-webkit-outer-spin-button,
+#settings-min-labels::-webkit-inner-spin-button{margin:0}
+#settings-label-count{color:var(--text)}
+
+@media (max-width: 900px){
+  #settings-panel-inner{grid-template-columns:1fr}
 }
 
 /* ── Snapshots tab ── */
@@ -1367,79 +1481,111 @@ body.settings-tab #settings-panel{display:flex !important}
 .snap-card-actions .del{color:var(--danger);border-color:rgba(252,92,101,0.4)}
 .snap-card-actions .del:hover{background:rgba(252,92,101,0.15)}
 #snaps-empty{color:var(--dim);font-size:13px;text-align:center;padding:30px}
-#label-controls{
-  display:flex;align-items:center;gap:18px;flex-wrap:wrap;
-}
-.label-model-wrap{display:flex;align-items:center;gap:8px;min-width:240px}
-.label-model-wrap .stat-lbl{white-space:nowrap}
-.label-model-wrap select{flex:1;min-width:160px}
-#label-actions{display:flex;align-items:center;justify-content:center;gap:14px;flex-wrap:wrap}
+/* Dead rules from the old single-card label layout (#label-controls,
+   .label-model-wrap, #label-actions, #train-controls inline button) have
+   been removed — the new label page uses #label-sidebar + .card with
+   shared #label-sidebar select / #train-btn / .manual-btn-row rules. */
 
-/* ── Train button + epochs dropdown ── */
-#train-controls{display:flex;align-items:center;gap:8px;margin-left:auto}
-#train-epochs{
-  background:#1a2130;color:var(--fg);border:1px solid var(--border);
-  padding:6px 8px;border-radius:6px;font-size:12px;cursor:pointer;
+/* ── Label page layout (mirrors Live Feed: feed-wrap + sidebar) ── */
+#label-canvas-area{
+  display:flex;flex-direction:column;gap:8px;
+  min-width:0;min-height:0;overflow:hidden;
 }
-#train-epochs:disabled{opacity:0.55;cursor:not-allowed}
-#train-eta-hint{color:var(--dim);font-size:11px;white-space:nowrap}
-#train-btn{
-  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);color:#fff;border:none;
-  padding:8px 14px;border-radius:6px;font-size:13px;font-weight:700;cursor:pointer;
+#label-sidebar{
+  display:flex;flex-direction:column;gap:8px;overflow:hidden;
 }
-#train-btn:disabled{
-  background:linear-gradient(135deg,#3a3a4a 0%,#2a2a35 100%);color:#666;cursor:not-allowed;
+/* Cards on the Label-Fish sidebar use the page background, not the lighter
+   stats-panel gradient. The lighter gradient (#1a2130 → #141c26) sits
+   above the page bg (#0e1117) by ~5% lightness — enough that on a dark
+   monitor it reads as "white-ish blocks". Transparent fill + the existing
+   border-color keeps the card outline but lets the page colour through. */
+#label-sidebar .card{
+  background:transparent;
+  border:1px solid var(--border);border-radius:8px;padding:10px 12px;
 }
-#train-btn:not(:disabled):hover{opacity:0.88}
-
-/* ── Manual-label inline card (used to be a modal; now lives inside the
-   labeling tab so the user lands directly on the predicted-frame screen). */
-#manual-card{
-  background:var(--card);border:1px solid var(--border);border-radius:12px;
-  padding:12px 14px;
-  display:flex;flex-direction:column;gap:10px;
-  flex:1;min-height:0;       /* let the canvas region claim leftover height */
+#label-sidebar .card-title{
+  font-size:10px;letter-spacing:2px;text-transform:uppercase;
+  color:var(--dim);margin-bottom:8px;
 }
-#manual-streak{color:var(--dim);font-weight:500;font-size:11px;margin-left:8px}
-#manual-header{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
-#manual-title{font-size:14px;font-weight:700;color:var(--accent)}
-#manual-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-#manual-class{
-  background:#1a2130;color:var(--fg);border:1px solid var(--border);
-  padding:6px 8px;border-radius:6px;font-size:12px;cursor:pointer;
+#label-sidebar select,
+#label-sidebar #train-btn,
+#label-sidebar .manual-btn-row button{
+  width:100%;
+  background:#1a2130;color:var(--text);border:1px solid var(--border);
+  padding:7px 10px;border-radius:6px;font-size:12px;cursor:pointer;
+  font-family:var(--font);
 }
-#manual-controls button{
-  background:#1a2130;color:var(--fg);border:1px solid var(--border);
-  padding:6px 12px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;
+#label-sidebar select{
+  appearance:none;-webkit-appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a5568'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 10px center;
+  padding-right:24px;
 }
-#manual-controls #manual-save{
-  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;
-  border:none;
+#label-sidebar select:disabled,
+#label-sidebar #train-btn:disabled{opacity:0.55;cursor:not-allowed}
+.manual-btn-row{display:flex;gap:6px;margin-bottom:6px}
+.manual-btn-row:last-child{margin-bottom:0}
+.manual-btn-row #manual-save{
+  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);
+  color:#0e1117;border:none;font-weight:700;
 }
-#manual-controls #manual-add{
-  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);color:#fff;
-  border:none;
+.manual-btn-row #manual-add{
+  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);
+  color:#fff;border:none;font-weight:700;
 }
-#manual-controls #manual-cancel{color:var(--danger);border-color:rgba(252,92,101,0.4)}
-#manual-controls button:hover{opacity:0.88}
+#label-sidebar #train-btn{
+  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);
+  color:#fff;border:none;font-weight:700;
+}
+#label-sidebar #train-btn:disabled{
+  background:linear-gradient(135deg,#3a3a4a 0%,#2a2a35 100%);
+  color:#666;font-weight:600;
+}
+#label-saved-big{
+  display:flex;align-items:baseline;gap:8px;
+  font-family:var(--mono);
+}
+#label-saved-big #label-saved{
+  font-size:22px;font-weight:700;color:var(--text);
+}
+#label-saved-big #manual-streak{
+  color:var(--dim);font-size:11px;font-family:var(--font);
+}
+#train-eta-hint{
+  color:var(--dim);font-size:11px;margin:4px 0 8px;
+}
+#manual-streak{color:var(--dim);font-weight:500;font-size:11px}
 #manual-hint{
   color:var(--dim);font-size:11px;
-  display:flex;flex-wrap:wrap;gap:14px;align-items:center;
+  display:flex;flex-wrap:wrap;gap:6px;align-items:center;
+  flex-shrink:0;
 }
 #manual-hint .demo-chip{
   display:inline-flex;align-items:center;gap:6px;
   background:#0d141d;border:1px solid var(--border);
-  border-radius:14px;padding:3px 10px;color:var(--text);
+  border-radius:14px;padding:3px 9px;color:var(--text);
+  font-size:10.5px;
 }
 #manual-hint .demo-chip b{color:var(--accent);font-weight:600}
+
+/* Canvas wrap is intentionally invisible: no border, no background, no
+   radius. The canvas IS the only visible content; any empty space (from
+   aspect-fit) shows the page gradient underneath, so there's nothing to
+   read as a frame or outline.
+
+   max-width caps the canvas at a readable size on ultrawide monitors —
+   same treatment as #feed-wrap so both pages have matching visual scale. */
 #manual-canvas-wrap{
-  flex:1;min-height:200px;
-  background:#000;border:1px solid var(--border);border-radius:8px;
-  overflow:hidden;display:flex;align-items:center;justify-content:center;
   position:relative;
+  flex:1;min-height:0;
+  background:transparent;border:0;border-radius:0;
+  overflow:hidden;
+  display:flex;align-items:center;justify-content:center;
+  max-width:1600px;width:100%;margin-inline:auto;
 }
 #manual-canvas{
-  max-width:100%;max-height:100%;display:block;
+  max-width:100%;max-height:100%;
+  display:block;
   touch-action:none;        /* let pointer events drive the drawing */
   cursor:crosshair;
 }
@@ -1485,27 +1631,53 @@ body.settings-tab #settings-panel{display:flex !important}
 #train-overlay.open{display:flex}
 #train-card{
   background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);
-  border-radius:12px;padding:24px 28px;min-width:360px;max-width:680px;width:min(680px,92vw);
+  border-radius:12px;padding:20px 22px;min-width:360px;
+  width:min(820px,94vw);max-width:820px;
   box-shadow:0 16px 48px rgba(0,0,0,0.7);
-  display:flex;flex-direction:column;max-height:88vh;
+  display:flex;flex-direction:column;gap:10px;max-height:92vh;
 }
-#train-log-wrap{
-  background:#0a0f15;border:1px solid var(--border);border-radius:6px;
-  margin-bottom:14px;padding:8px 10px;
-  font-family:var(--mono);font-size:11px;line-height:1.45;color:#9fb3c8;
-  height:240px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+#train-title{font-size:16px;font-weight:700;color:var(--accent)}
+#train-state-line{color:var(--text);font-size:13px}
+
+/* Two-stage progress block at the top of the modal. Stage 1 is the epoch
+   loop; stage 2 is the post-training TensorRT export (skipped on CPU/MPS
+   where there's nothing to export). */
+#train-stages{
+  display:flex;flex-direction:column;gap:8px;
+  background:rgba(255,255,255,0.02);
+  border:1px solid var(--border);border-radius:8px;padding:10px 12px;
 }
-#train-log-wrap.empty{color:var(--dim);font-style:italic}
-#train-log-label{
-  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);
-  margin-bottom:5px;
+.train-stage{display:flex;flex-direction:column;gap:5px}
+.train-stage-head{
+  display:flex;justify-content:space-between;align-items:center;
+  font-size:11px;color:var(--dim);letter-spacing:0.5px;
 }
-#train-title{font-size:16px;font-weight:700;color:var(--accent);margin-bottom:12px}
-#train-state-line{color:var(--text);font-size:14px;margin-bottom:14px}
-#train-bar-wrap{background:#0d141d;border:1px solid var(--border);border-radius:4px;height:10px;overflow:hidden;margin-bottom:14px;position:relative}
-#train-bar{height:100%;width:0%;background:linear-gradient(90deg,#7c4dff,#00d4aa);transition:width 0.4s}
-/* Indeterminate animation used during the TensorRT export phase (no % known) */
-#train-bar-wrap.indeterminate #train-bar{
+.train-stage-head .stage-name{color:var(--text);font-weight:600}
+.train-stage-head .stage-name .stage-tag{
+  display:inline-block;font-size:9px;padding:1px 5px;border-radius:8px;
+  margin-right:6px;background:#0d141d;border:1px solid var(--border);
+  color:var(--dim);font-weight:700;letter-spacing:1px;
+}
+.train-stage.active .stage-tag{
+  background:rgba(245,197,24,0.15);border-color:var(--accent);color:var(--accent);
+}
+.train-stage.done .stage-tag{
+  background:rgba(0,212,170,0.15);border-color:var(--teal);color:var(--teal);
+}
+.train-stage.skipped .stage-tag{
+  background:rgba(74,85,104,0.15);color:var(--dim);
+}
+.train-stage-bar-wrap{
+  background:#0d141d;border:1px solid var(--border);
+  border-radius:4px;height:8px;overflow:hidden;position:relative;
+}
+.train-stage-bar{
+  height:100%;width:0%;
+  background:linear-gradient(90deg,#7c4dff,#00d4aa);
+  transition:width 0.4s;
+}
+/* Indeterminate animation for the export stage (no % available). */
+.train-stage-bar-wrap.indeterminate .train-stage-bar{
   width:100% !important;
   background:linear-gradient(90deg,
     rgba(124,77,255,0.15) 0%, rgba(124,77,255,0.85) 25%,
@@ -1514,10 +1686,84 @@ body.settings-tab #settings-panel{display:flex !important}
   background-size:200% 100%;
   animation:train-stripes 1.4s linear infinite;
 }
+.train-stage.done .train-stage-bar{width:100%;background:var(--teal)}
+.train-stage.skipped .train-stage-bar{background:#2a3a4a;width:100%}
 @keyframes train-stripes{0%{background-position:200% 0}100%{background-position:-200% 0}}
-#train-info{display:grid;grid-template-columns:1fr 1fr;gap:6px 18px;font-size:12px;margin-bottom:14px}
-#train-info .stat-val{font-family:var(--mono)}
-#train-msg{color:var(--dim);font-size:11px;margin-bottom:12px}
+
+#train-info{display:grid;grid-template-columns:repeat(4,1fr);gap:6px 14px;font-size:11px}
+#train-info .stat-lbl{font-size:10px}
+#train-info .stat-val{font-family:var(--mono);font-size:12px}
+
+/* Tab strip below the progress / stats block. */
+#train-tabs{
+  display:flex;gap:4px;border-bottom:1px solid var(--border);
+  margin-top:2px;
+}
+.train-tab{
+  background:transparent;color:var(--dim);
+  border-bottom:none;
+  border-radius:6px 6px 0 0;
+  font-size:12px;font-weight:600;cursor:pointer;
+  font-family:var(--font);position:relative;top:1px;
+}
+.train-tab:hover{color:var(--text)}
+.train-tab.active{
+  color:var(--accent);
+  background:#0d141d;border-color:var(--border);
+}
+.train-tab-pane{display:none;flex-direction:column;gap:10px;flex:1;min-height:0}
+.train-tab-pane.active{display:flex}
+
+/* Charts pane: responsive grid of small cards with real breathing room.
+   `auto-fill, minmax(...)` means the layout grows with chart count — the
+   pane stays usable whether there are 4 charts or 8. Vertical overflow
+   scrolls so adding charts never overflows the modal. */
+#train-pane-charts.active{display:grid}
+#train-pane-charts{
+  grid-template-columns:repeat(auto-fill, minmax(260px, 1fr));
+  gap:12px;
+  overflow-y:auto;
+  align-content:start;
+  flex:1;min-height:0;
+  padding-right:4px;  /* room for the scrollbar without overlapping cards */
+}
+@media (max-width: 700px){
+  #train-pane-charts{grid-template-columns:1fr}
+}
+
+/* Chart cards inside the Charts pane. */
+.train-chart-card{
+  background:#0a0f15;border:1px solid var(--border);border-radius:6px;
+  padding:8px 10px;display:flex;flex-direction:column;gap:4px;
+}
+.train-chart-head{
+  display:flex;align-items:center;justify-content:space-between;
+  font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);
+}
+.train-chart-head .chart-now{
+  font-family:var(--mono);color:var(--text);text-transform:none;letter-spacing:0;
+  font-size:11px;
+}
+.train-chart-card canvas{width:100%;display:block}
+.train-chart-empty{color:var(--dim);font-style:italic;font-size:11px;padding:8px 0}
+.train-chart-legend{
+  display:flex;gap:12px;flex-wrap:wrap;font-size:10px;color:var(--dim);
+}
+.train-chart-legend .swatch{
+  display:inline-block;width:9px;height:9px;border-radius:2px;
+  margin-right:4px;vertical-align:middle;
+}
+
+#train-log-wrap{
+  background:#0a0f15;border:1px solid var(--border);border-radius:6px;
+  padding:8px 10px;
+  font-family:var(--mono);font-size:11px;line-height:1.45;color:#9fb3c8;
+  height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;
+  flex:1;min-height:0;
+}
+#train-log-wrap.empty{color:var(--dim);font-style:italic}
+
+#train-msg{color:var(--dim);font-size:11px}
 #train-actions{display:flex;gap:10px;justify-content:flex-end}
 #train-actions button{
   border:1px solid var(--border);background:#1a2130;color:var(--text);
@@ -1525,6 +1771,12 @@ body.settings-tab #settings-panel{display:flex !important}
 }
 #train-cancel{color:var(--danger);border-color:rgba(252,92,101,0.4)}
 #train-actions button:hover{opacity:0.85}
+
+@media (max-width: 700px){
+  #train-info{grid-template-columns:repeat(2,1fr)}
+  #train-card{padding:16px 14px}
+  #train-log-wrap{height:200px}
+}
 
 /* ── Inference-disabled overlay on the live feed ── */
 #start-inference-btn{
@@ -1552,9 +1804,15 @@ body.settings-tab #settings-panel{display:flex !important}
 /* ── Feed ── */
 #feed-wrap{
   position:relative;
-  background:#000;border-radius:10px;overflow:hidden;
-  border:1px solid var(--border);
+  /* Match Label-Fish's canvas wrap exactly: invisible (no bg/border/
+     radius). The MJPEG image IS the visible content; any aspect-fit
+     gutter shows the page bg underneath, so there's no visible frame. */
+  background:transparent;border:0;border-radius:0;
+  overflow:hidden;
   display:flex;align-items:center;justify-content:center;
+  /* Cap horizontal stretch on ultrawide monitors so the camera image
+     stays readable instead of swimming in a 3000px letterbox band. */
+  max-width:1600px;width:100%;margin-inline:auto;
 }
 #feed{max-width:100%;max-height:100%;object-fit:contain;display:block}
 .corner{position:absolute;width:20px;height:20px;border-color:var(--teal);border-style:solid;opacity:0.6}
@@ -1591,6 +1849,10 @@ body.settings-tab #settings-panel{display:flex !important}
 #stats-panel{
   display:flex;flex-direction:column;gap:8px;overflow:hidden;
 }
+/* Same override as #label-sidebar .card — drop the lighter gradient so
+   the stats cards on Live Feed match Label-Fish's transparent-fill look
+   (just an outline against the page bg). */
+#stats-panel .card{background:transparent}
 .card{
   background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);
   border-radius:8px;padding:12px;
@@ -1887,21 +2149,60 @@ body.settings-tab #settings-panel{display:flex !important}
   </div>
 </main>
 
-<!-- Label panel (Training tab) -->
+<!-- Label panel (Label Fish tab) — same grid as #main: 1fr canvas + 200px
+     right sidebar of cards. The canvas wrap and the sidebar mirror Live
+     Feed exactly so flipping tabs doesn't change page chrome. -->
 <main id="label-panel">
-  <div class="card" id="label-controls">
-    <div class="label-model-wrap">
-      <span class="stat-lbl">Detection model</span>
+  <div id="label-canvas-area">
+    <div id="manual-canvas-wrap">
+      <canvas id="manual-canvas" style="display:none"></canvas>
+      <div id="manual-empty">Waiting for a live frame… start the live feed if it's stopped, then come back.</div>
+    </div>
+    <div id="manual-hint">
+      <span class="demo-chip"><b>✕</b> remove wrong prediction</span>
+      <span class="demo-chip"><b>drag</b> draw new box</span>
+      <span class="demo-chip"><b>✋</b> move</span>
+      <span class="demo-chip"><b>corners</b> resize</span>
+      <span class="demo-chip"><b>+ Add another</b> stage</span>
+      <span class="demo-chip"><b>Save &amp; next</b> commit</span>
+    </div>
+  </div>
+
+  <div id="label-sidebar">
+    <div class="card">
+      <div class="card-title">Detection model</div>
       <select id="label-model-select" onchange="setModel(this.value)">
         <option>loading…</option>
       </select>
     </div>
-    <div class="stat-row" style="margin:0">
-      <span class="stat-lbl">Saved</span>
-      <span class="stat-val" id="label-saved">0/100</span>
+
+    <div class="card">
+      <div class="card-title">Labels saved</div>
+      <div id="label-saved-big">
+        <span id="label-saved">0/5</span>
+        <span id="manual-streak"></span>
+      </div>
     </div>
-    <div id="train-controls">
-      <select id="train-epochs" onchange="onEpochsChange()" title="Number of training epochs">
+
+    <div class="card">
+      <div class="card-title">Label this frame</div>
+      <select id="manual-class" title="Class for the box you're currently drawing" style="margin-bottom:8px">
+        <option value="0">fish</option>
+        <option value="1">shrimp</option>
+      </select>
+      <div class="manual-btn-row">
+        <button id="manual-add" onclick="manualAddBox()">+ Add</button>
+        <button id="manual-clear" onclick="clearManualBox()">Clear</button>
+      </div>
+      <div class="manual-btn-row">
+        <button id="manual-skip" onclick="manualNextFrame()">Skip</button>
+        <button id="manual-save" onclick="saveManualLabel()">Save &amp; next</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Train model</div>
+      <select id="train-epochs" onchange="onEpochsChange()" title="Number of training epochs" style="margin-bottom:6px">
         <option value="5" selected>5 epochs</option>
         <option value="10">10 epochs</option>
         <option value="15">15 epochs</option>
@@ -1909,39 +2210,8 @@ body.settings-tab #settings-panel{display:flex !important}
         <option value="30">30 epochs</option>
         <option value="50">50 epochs</option>
       </select>
-      <span id="train-eta-hint">—</span>
+      <div id="train-eta-hint">—</div>
       <button id="train-btn" disabled onclick="confirmTraining()">🧠 Train model</button>
-    </div>
-  </div>
-  <!-- Inline labeling card: lands the user directly on the predicted-frame
-       screen. Predicted fish are pre-drawn (teal); each has a red ✕ to
-       remove false positives. The user draws missing boxes (purple) and
-       hits Save & next to advance to a fresh frame. -->
-  <div class="card" id="manual-card">
-    <div id="manual-header">
-      <div id="manual-title">✏️ Label this frame <span id="manual-streak"></span></div>
-      <div id="manual-controls">
-        <select id="manual-class" title="Class for the box you're currently drawing">
-          <option value="0">fish</option>
-          <option value="1">shrimp</option>
-        </select>
-        <button id="manual-add" onclick="manualAddBox()">+ Add another</button>
-        <button id="manual-clear" onclick="clearManualBox()">Clear</button>
-        <button id="manual-skip" onclick="manualNextFrame()">Skip frame</button>
-        <button id="manual-save" onclick="saveManualLabel()">Save &amp; next</button>
-      </div>
-    </div>
-    <div id="manual-hint">
-      <span class="demo-chip"><b>✕</b> remove wrong prediction</span>
-      <span class="demo-chip"><b>drag</b> draw new box</span>
-      <span class="demo-chip"><b>✋</b> move</span>
-      <span class="demo-chip"><b>corners</b> resize</span>
-      <span class="demo-chip"><b>+ Add another</b> stage box, draw next</span>
-      <span class="demo-chip"><b>Save &amp; next</b> commit + advance</span>
-    </div>
-    <div id="manual-canvas-wrap">
-      <canvas id="manual-canvas" style="display:none"></canvas>
-      <div id="manual-empty">Waiting for a live frame… start the live feed if it's stopped, then come back.</div>
     </div>
   </div>
 </main>
@@ -1958,83 +2228,90 @@ body.settings-tab #settings-panel{display:flex !important}
   </div>
 </main>
 
-<!-- Settings panel -->
+<!-- Settings panel: capped at 1100px wide so it doesn't sprawl across
+     ultrawide displays. Inference + Training render side-by-side as
+     two .settings-section columns on screens ≥ 900px; they stack on
+     phones via the @media collapse. -->
 <main id="settings-panel">
-  <div class="card">
-    <div id="settings-title">⚙️ Settings</div>
-  </div>
+  <div id="settings-panel-inner">
+    <div id="settings-header">
+      <div id="settings-title">⚙️ Settings</div>
+    </div>
 
-  <div class="settings-section-title">📹 Inference</div>
-  <div class="settings-card">
-    <div class="settings-row">
-      <label class="settings-lbl">Detection model</label>
-      <div class="settings-control">
-        <select id="settings-model-select" onchange="setModel(this.value)">
-          <option>loading…</option>
-        </select>
+    <div class="settings-section">
+      <div class="settings-section-title">📹 Inference</div>
+      <div class="settings-row">
+        <label class="settings-lbl">Detection model</label>
+        <div class="settings-control">
+          <select id="settings-model-select" onchange="setModel(this.value)">
+            <option>loading…</option>
+          </select>
+        </div>
+      </div>
+      <div class="settings-row">
+        <label class="settings-lbl">Resolution</label>
+        <div class="settings-control">
+          <select id="settings-res-select" onchange="setResolution(this.value)">
+            <option value="480p">480p (854×480)</option>
+            <option value="720p">720p (1280×720)</option>
+            <option value="1080p" selected>1080p (1920×1080)</option>
+          </select>
+        </div>
+      </div>
+      <div class="settings-row">
+        <label class="settings-lbl">Confidence</label>
+        <div class="settings-control">
+          <input id="settings-conf-slider" type="range" min="5" max="95" step="5" value="35" oninput="onSettingsConfSlider(this.value)">
+          <span id="settings-conf-val">35%</span>
+        </div>
+      </div>
+      <div class="settings-row">
+        <label class="settings-lbl">Trails</label>
+        <button class="toggle-btn" id="settings-trails-btn" onclick="toggleTrails()">OFF</button>
+      </div>
+      <div class="settings-row">
+        <label class="settings-lbl">Underwater enhance</label>
+        <button class="toggle-btn" id="settings-enhance-btn" onclick="toggleEnhance()">OFF</button>
+      </div>
+      <div class="settings-row">
+        <label class="settings-lbl">Party hats</label>
+        <button class="toggle-btn" id="settings-hat-btn" onclick="toggleHat()">OFF</button>
       </div>
     </div>
-    <div class="settings-row">
-      <label class="settings-lbl">Resolution</label>
-      <div class="settings-control">
-        <select id="settings-res-select" onchange="setResolution(this.value)">
-          <option value="480p">480p &nbsp;(854×480)</option>
-          <option value="720p">720p &nbsp;(1280×720)</option>
-          <option value="1080p" selected>1080p (1920×1080)</option>
-        </select>
-      </div>
-    </div>
-    <div class="settings-row">
-      <label class="settings-lbl">Confidence threshold</label>
-      <div class="settings-control" style="flex:1;max-width:280px">
-        <input id="settings-conf-slider" type="range" min="5" max="95" step="5" value="35" oninput="onSettingsConfSlider(this.value)">
-        <span id="settings-conf-val">35%</span>
-      </div>
-    </div>
-    <div class="settings-row">
-      <label class="settings-lbl">Trails</label>
-      <button class="toggle-btn" id="settings-trails-btn" onclick="toggleTrails()">OFF</button>
-    </div>
-    <div class="settings-row">
-      <label class="settings-lbl">Underwater enhance</label>
-      <button class="toggle-btn" id="settings-enhance-btn" onclick="toggleEnhance()">OFF</button>
-    </div>
-    <div class="settings-row">
-      <label class="settings-lbl">Party hats</label>
-      <button class="toggle-btn" id="settings-hat-btn" onclick="toggleHat()">OFF</button>
-    </div>
-  </div>
 
-  <div class="settings-section-title">🧠 Training</div>
-  <div class="settings-card">
-    <div class="settings-row">
-      <label class="settings-lbl">Detection model (for labeling)</label>
-      <div class="settings-control">
-        <select id="settings-label-model-select" onchange="setModel(this.value)">
-          <option>loading…</option>
-        </select>
+    <div class="settings-section">
+      <div class="settings-section-title">🧠 Training</div>
+      <div class="settings-row">
+        <label class="settings-lbl">Model (for labeling)</label>
+        <div class="settings-control">
+          <select id="settings-label-model-select" onchange="setModel(this.value)">
+            <option>loading…</option>
+          </select>
+        </div>
       </div>
-    </div>
-    <div class="settings-row">
-      <label class="settings-lbl">Epochs</label>
-      <div class="settings-control">
-        <select id="settings-train-epochs" onchange="onSettingsEpochsChange(this.value)">
-          <option value="5" selected>5 epochs</option>
-          <option value="10">10 epochs</option>
-          <option value="15">15 epochs</option>
-          <option value="20">20 epochs</option>
-          <option value="30">30 epochs</option>
-          <option value="50">50 epochs</option>
-        </select>
+      <div class="settings-row">
+        <label class="settings-lbl">Epochs</label>
+        <div class="settings-control">
+          <select id="settings-train-epochs" onchange="onSettingsEpochsChange(this.value)">
+            <option value="5" selected>5 epochs</option>
+            <option value="10">10 epochs</option>
+            <option value="15">15 epochs</option>
+            <option value="20">20 epochs</option>
+            <option value="30">30 epochs</option>
+            <option value="50">50 epochs</option>
+          </select>
+        </div>
       </div>
-    </div>
-    <div class="settings-row">
-      <label class="settings-lbl">Saved labels</label>
-      <span class="settings-readonly" id="settings-label-saved">0/—</span>
-    </div>
-    <div class="settings-row">
-      <label class="settings-lbl">Estimated training time</label>
-      <span class="settings-readonly" id="settings-train-eta">—</span>
+      <div class="settings-row">
+        <label class="settings-lbl">Saved labels</label>
+        <div class="settings-control">
+          <span class="settings-readonly" id="settings-label-count">0</span>
+          <span class="settings-readonly" style="color:var(--dim)">/</span>
+          <input id="settings-min-labels" type="number" min="1" max="1000" step="1"
+                 value="5" onchange="onMinLabelsChange(this.value)"
+                 title="Minimum labels required before training is enabled">
+        </div>
+      </div>
     </div>
   </div>
 </main>
@@ -2088,16 +2365,50 @@ body.settings-tab #settings-panel{display:flex !important}
   <div id="train-card">
     <div id="train-title">🧠 Training model</div>
     <div id="train-state-line">starting…</div>
-    <div id="train-bar-wrap"><div id="train-bar"></div></div>
+
+    <!-- Top: two-stage progress -->
+    <div id="train-stages">
+      <div class="train-stage" id="train-stage1">
+        <div class="train-stage-head">
+          <span class="stage-name"><span class="stage-tag">STAGE 1</span>Epochs</span>
+          <span id="train-stage1-text">—</span>
+        </div>
+        <div class="train-stage-bar-wrap"><div class="train-stage-bar" id="train-stage1-bar"></div></div>
+      </div>
+      <div class="train-stage" id="train-stage2">
+        <div class="train-stage-head">
+          <span class="stage-name"><span class="stage-tag">STAGE 2</span>TensorRT engine export</span>
+          <span id="train-stage2-text">pending</span>
+        </div>
+        <div class="train-stage-bar-wrap"><div class="train-stage-bar" id="train-stage2-bar"></div></div>
+      </div>
+    </div>
+
+    <!-- Compact stats row -->
     <div id="train-info">
       <div><span class="stat-lbl">Epoch</span> <span class="stat-val" id="train-epoch">—</span> / <span id="train-total">—</span></div>
       <div><span class="stat-lbl">Elapsed</span> <span class="stat-val" id="train-elapsed">—</span></div>
       <div><span class="stat-lbl">ETA</span> <span class="stat-val" id="train-eta">—</span></div>
       <div><span class="stat-lbl">Version</span> <span class="stat-val" id="train-version">—</span></div>
     </div>
+
+    <!-- Tab strip -->
+    <div id="train-tabs">
+      <button class="train-tab active" data-tab="charts" onclick="setTrainTab('charts')">📊 Charts</button>
+      <button class="train-tab"        data-tab="logs"   onclick="setTrainTab('logs')">📜 Logs</button>
+    </div>
+
+    <!-- Charts pane: cards are rendered dynamically from TRAIN_CHARTS so
+         the total number of charts is variable — add to the config and a
+         new card appears in the grid (which scrolls when it overflows). -->
+    <div id="train-pane-charts" class="train-tab-pane active"></div>
+
+    <!-- Logs pane -->
+    <div id="train-pane-logs" class="train-tab-pane">
+      <div id="train-log-wrap" class="empty">waiting for training subprocess output…</div>
+    </div>
+
     <div id="train-msg">Inference is paused while training runs.</div>
-    <div id="train-log-label">Training output</div>
-    <div id="train-log-wrap" class="empty">waiting for training subprocess output…</div>
     <div id="train-actions">
       <button id="train-cancel" onclick="cancelTraining()">Cancel</button>
       <button id="train-close" onclick="closeTrainModal()" style="display:none">Close</button>
@@ -2704,30 +3015,36 @@ function drawManualCanvas() {
   const ctx = cv.getContext('2d');
   ctx.drawImage(manualImg, 0, 0);
   const lineW = Math.max(2, Math.round(cv.width / 480));
-  // 1) Frozen boxes — drawn dimmer, with class label, no handles. Each box
-  //    gets a ✕ close button at the top-right; tapping it removes the box.
-  //    Predicted boxes use teal so the user can tell them apart from boxes
-  //    they drew themselves (purple).
+  // 1) Frozen boxes — drawn dimmer, no handles, with a ✕ close button at
+  //    the top-right. Predicted boxes (teal) are intentionally minimal:
+  //    a thin outline + the ✕ only. The underlying JPEG already has the
+  //    tracker's "Fish #X (NN%)" tag baked in, so adding our own class
+  //    label here just duplicates the tag and crowds the canvas.
+  //    User-drawn boxes (purple) keep their class label since there's
+  //    nothing else on the frame telling the user what class they picked.
   for (const b of manualBoxes) {
-    const stroke = b.predicted ? '#00d4aa' : '#7c4dff';
-    const fillTr = b.predicted ? 'rgba(0, 212, 170, 0.10)' : 'rgba(124, 77, 255, 0.10)';
-    ctx.lineWidth = lineW;
+    const isPred = !!b.predicted;
+    const stroke = isPred ? '#00d4aa' : '#7c4dff';
+    const fillTr = isPred ? 'rgba(0, 212, 170, 0.08)' : 'rgba(124, 77, 255, 0.10)';
+    ctx.lineWidth = isPred ? Math.max(1, Math.round(lineW * 0.6)) : lineW;
     ctx.strokeStyle = stroke;
     ctx.fillStyle = fillTr;
     ctx.fillRect(b.x, b.y, b.w, b.h);
     ctx.strokeRect(b.x, b.y, b.w, b.h);
-    // Class label tag in the top-left corner of the box.
-    const name = MANUAL_CLASS_NAMES[b.cls] || ('class_' + b.cls);
-    const fontPx = Math.max(14, Math.round(cv.width / 80));
-    ctx.font = `bold ${fontPx}px sans-serif`;
-    ctx.textBaseline = 'top';
-    ctx.textAlign = 'left';
-    const padX = 6, padY = 4;
-    const textW = ctx.measureText(name).width;
-    ctx.fillStyle = stroke;
-    ctx.fillRect(b.x, b.y, textW + padX * 2, fontPx + padY * 2);
-    ctx.fillStyle = '#fff';
-    ctx.fillText(name, b.x + padX, b.y + padY);
+    if (!isPred) {
+      // Class label tag in the top-left corner — user-drawn only.
+      const name = MANUAL_CLASS_NAMES[b.cls] || ('class_' + b.cls);
+      const fontPx = Math.max(14, Math.round(cv.width / 80));
+      ctx.font = `bold ${fontPx}px sans-serif`;
+      ctx.textBaseline = 'top';
+      ctx.textAlign = 'left';
+      const padX = 6, padY = 4;
+      const textW = ctx.measureText(name).width;
+      ctx.fillStyle = stroke;
+      ctx.fillRect(b.x, b.y, textW + padX * 2, fontPx + padY * 2);
+      ctx.fillStyle = '#fff';
+      ctx.fillText(name, b.x + padX, b.y + padY);
+    }
     // ✕ close button at top-right of the box.
     const cr = manualCloseRect(b);
     ctx.fillStyle = '#fc5c65';
@@ -2951,12 +3268,23 @@ function refreshTrainLabels() {
     const hint = document.getElementById('train-eta-hint');
     const etaTxt = d.estimate ? `~${d.estimate.low_min}–${d.estimate.high_min} min` : '—';
     if (hint && d.estimate) hint.textContent = etaTxt;
-    // Mirror to Settings.
-    const sSaved = document.getElementById('settings-label-saved');
-    if (sSaved) sSaved.textContent = savedTxt;
-    const sEta = document.getElementById('settings-train-eta');
-    if (sEta) sEta.textContent = etaTxt;
+    // Mirror to Settings: count and threshold are now separate fields.
+    const sCount = document.getElementById('settings-label-count');
+    if (sCount) sCount.textContent = String(d.count);
+    const sMin = document.getElementById('settings-min-labels');
+    // Don't clobber the input mid-edit (when document.activeElement is it).
+    if (sMin && document.activeElement !== sMin && Number(sMin.value) !== d.min_required) {
+      sMin.value = String(d.min_required);
+    }
   }).catch(() => {});
+}
+
+// Persist a new min-labels threshold to the server, then re-fetch so the
+// Train button + label-saved counter pick up the new value.
+function onMinLabelsChange(val) {
+  const n = parseInt(val, 10);
+  if (!Number.isFinite(n) || n < 1) return;
+  fetch('/train/min-labels?v=' + n).finally(() => refreshTrainLabels());
 }
 function onEpochsChange() {
   refreshTrainLabels();
@@ -3087,20 +3415,358 @@ function pollTrainLog() {
   }).catch(() => {});
 }
 
-function updateTrainModal(s) {
+// Active tab inside the training modal ('charts' or 'logs'). Persisted so a
+// poll-driven redraw doesn't yank the user back to the default.
+let trainCurrentTab = 'charts';
+function setTrainTab(name) {
+  trainCurrentTab = name;
+  document.querySelectorAll('.train-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.tab === name);
+  });
+  document.querySelectorAll('.train-tab-pane').forEach(p => p.classList.remove('active'));
+  const pane = document.getElementById('train-pane-' + name);
+  if (pane) pane.classList.add('active');
+  // Force a chart redraw when switching back to Charts so the canvas
+  // re-fits the (now visible) container size.
+  if (name === 'charts' && _lastTrainStatus) drawTrainCharts(_lastTrainStatus);
+}
+
+const LOSS_COLORS = {
+  total:    '#f5c518',
+  box_loss: '#4fc3f7',
+  cls_loss: '#fc5c65',
+  dfl_loss: '#00d4aa',
+};
+
+function _fmtChartNum(v) {
+  if (v == null || !isFinite(v)) return '';
+  const a = Math.abs(v);
+  if (a >= 1000) return Math.round(v).toString();
+  if (a >= 10)   return v.toFixed(0);
+  if (a >= 1)    return v.toFixed(2);
+  return v.toFixed(3);
+}
+
+// Resize the canvas's pixel buffer to match its CSS box at devicePixelRatio,
+// so lines stay sharp on hi-DPI displays.
+function _fitCanvas(canvas) {
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  const cssH = rect.height || parseFloat(canvas.getAttribute('height')) || 80;
+  const cssW = rect.width  || 600;
+  const w = Math.max(1, Math.floor(cssW * dpr));
+  const h = Math.max(1, Math.floor(cssH * dpr));
+  if (canvas.width  !== w) canvas.width  = w;
+  if (canvas.height !== h) canvas.height = h;
+  return { dpr, w, h };
+}
+
+// Minimal canvas line chart. `series` = [{name, color, points: [{x, y}, ...]}];
+// `opts` may pin yMin/yMax/xMin/xMax. Series with 0 points are skipped.
+function _drawLineChart(canvasId, series, opts) {
+  const cv = document.getElementById(canvasId);
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  const { dpr, w, h } = _fitCanvas(cv);
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const pad = { l: 42 * dpr, r: 8 * dpr, t: 6 * dpr, b: 16 * dpr };
+  const plotW = w - pad.l - pad.r;
+  const plotH = h - pad.t - pad.b;
+
+  const nonEmpty = series.filter(s => s.points && s.points.length);
+  if (!nonEmpty.length) {
+    ctx.fillStyle = '#4a5568';
+    ctx.font = (11 * dpr) + 'px monospace';
+    ctx.textBaseline = 'middle';
+    ctx.textAlign = 'left';
+    ctx.fillText('no data yet', pad.l, h / 2);
+    return;
+  }
+  opts = opts || {};
+  let xMin = (opts.xMin != null) ? opts.xMin : Infinity;
+  let xMax = (opts.xMax != null) ? opts.xMax : -Infinity;
+  let yMin = (opts.yMin != null) ? opts.yMin : Infinity;
+  let yMax = (opts.yMax != null) ? opts.yMax : -Infinity;
+  for (const s of nonEmpty) {
+    for (const p of s.points) {
+      if (opts.xMin == null && p.x < xMin) xMin = p.x;
+      if (opts.xMax == null && p.x > xMax) xMax = p.x;
+      if (opts.yMin == null && p.y < yMin) yMin = p.y;
+      if (opts.yMax == null && p.y > yMax) yMax = p.y;
+    }
+  }
+  if (!isFinite(xMin) || !isFinite(xMax) || xMin === xMax) { xMin = 0; xMax = 1; }
+  if (!isFinite(yMin) || !isFinite(yMax) || yMin === yMax) { yMin = 0; yMax = yMax || 1; }
+
+  // Y grid + labels
+  ctx.strokeStyle = '#1e2d3d';
+  ctx.lineWidth = 1 * dpr;
+  ctx.fillStyle = '#4a5568';
+  ctx.font = (10 * dpr) + 'px monospace';
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'right';
+  const yTicks = 3;
+  for (let i = 0; i <= yTicks; i++) {
+    const yy = pad.t + plotH * (i / yTicks);
+    ctx.beginPath();
+    ctx.moveTo(pad.l, yy);
+    ctx.lineTo(pad.l + plotW, yy);
+    ctx.stroke();
+    const v = yMax - (yMax - yMin) * (i / yTicks);
+    ctx.fillText(_fmtChartNum(v), pad.l - 4 * dpr, yy);
+  }
+  // X axis label (just min/max)
+  ctx.textAlign = 'left';  ctx.textBaseline = 'top';
+  ctx.fillText(_fmtChartNum(xMin), pad.l, pad.t + plotH + 2 * dpr);
+  ctx.textAlign = 'right';
+  ctx.fillText(_fmtChartNum(xMax), pad.l + plotW, pad.t + plotH + 2 * dpr);
+
+  // Lines
+  for (const s of nonEmpty) {
+    ctx.strokeStyle = s.color || '#00d4aa';
+    ctx.lineWidth = 2 * dpr;
+    ctx.beginPath();
+    s.points.forEach((p, i) => {
+      const px = pad.l + plotW * ((p.x - xMin) / (xMax - xMin || 1));
+      const py = pad.t + plotH * (1 - (p.y - yMin) / (yMax - yMin || 1));
+      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+    });
+    ctx.stroke();
+  }
+}
+
+// Chart registry — adding a new chart is a single appended entry. Each
+// entry produces one card in the Charts grid.
+//
+//   id      — DOM-id prefix; the card uses `${id}-chart`, `${id}-now`, and
+//             optionally `${id}-legend`.
+//   title   — header label shown to the user.
+//   legend  — true if the card should render a swatch legend below the canvas
+//             (drives by `legendFor(s)` returning the series list).
+//   build(s) — returns { series, opts, now } given the latest status `s`.
+//
+// The renderer doesn't know anything about loss vs GPU vs RAM specifically;
+// it just walks this list. To add chart #6, append one more entry.
+const TRAIN_CHARTS = [
+  {
+    id: 'loss-total',
+    title: 'Total loss',
+    build(s) {
+      const samples = s.loss_samples || [];
+      return {
+        series: [{
+          name: 'total', color: LOSS_COLORS.total,
+          points: samples.map(d => ({ x: d.epoch, y: d.total })),
+        }],
+        opts: { yMin: 0 },
+        now: samples.length
+          ? ('epoch ' + samples[samples.length - 1].epoch + ' · '
+              + (samples[samples.length - 1].total != null
+                  ? samples[samples.length - 1].total.toFixed(3) : '—'))
+          : '—',
+      };
+    },
+  },
+  {
+    id: 'loss-components',
+    title: 'Component losses',
+    legend: true,
+    build(s) {
+      const samples = s.loss_samples || [];
+      const names = samples.length
+        ? Object.keys(samples[samples.length - 1])
+            .filter(k => k !== 'epoch' && k !== 'total')
+            .sort()
+        : [];
+      const series = names.map(name => ({
+        name, color: LOSS_COLORS[name] || '#00d4aa',
+        points: samples.map(d => ({ x: d.epoch, y: d[name] })),
+      }));
+      const now = samples.length
+        ? names.map(n => n.replace('_loss', '') + ' '
+            + (samples[samples.length - 1][n] != null
+                ? samples[samples.length - 1][n].toFixed(2) : '—')).join(' · ')
+        : '—';
+      return { series, opts: { yMin: 0 }, now };
+    },
+    legendFor(s) {
+      const samples = s.loss_samples || [];
+      if (!samples.length) return [];
+      return Object.keys(samples[samples.length - 1])
+        .filter(k => k !== 'epoch' && k !== 'total')
+        .sort()
+        .map(name => ({ name, color: LOSS_COLORS[name] || '#00d4aa' }));
+    },
+  },
+  {
+    id: 'gpu-util',
+    title: 'GPU utilization',
+    build(s) {
+      const g = s.gpu_samples || [];
+      const pts = g.filter(d => d.util_pct != null).map(d => ({ x: d.t, y: d.util_pct }));
+      const last = pts.length ? pts[pts.length - 1].y : null;
+      return {
+        series: [{ name: 'util', color: '#4fc3f7', points: pts }],
+        opts: { yMin: 0, yMax: 100 },
+        now: (last != null) ? (last.toFixed(0) + '%') : '—',
+      };
+    },
+  },
+  {
+    id: 'gpu-mem',
+    title: 'GPU memory',
+    build(s) {
+      const g = s.gpu_samples || [];
+      const pts = g.filter(d => d.mem_mb != null).map(d => ({ x: d.t, y: d.mem_mb }));
+      const last = pts.length ? pts[pts.length - 1].y : null;
+      const memTotal = s.gpu_mem_total_mb || 0;
+      return {
+        series: [{ name: 'mem', color: '#f5c518', points: pts }],
+        opts: { yMin: 0, yMax: memTotal || undefined },
+        now: (last != null)
+          ? (last + ' MB' + (memTotal ? ' / ' + memTotal + ' MB' : ''))
+          : '—',
+      };
+    },
+  },
+  {
+    id: 'ram',
+    title: 'RAM',
+    build(s) {
+      const g = s.gpu_samples || [];
+      const pts = g.filter(d => d.ram_mb != null).map(d => ({ x: d.t, y: d.ram_mb }));
+      const last = pts.length ? pts[pts.length - 1].y : null;
+      const ramTotal = s.ram_total_mb || 0;
+      return {
+        series: [{ name: 'ram', color: '#7c4dff', points: pts }],
+        opts: { yMin: 0, yMax: ramTotal || undefined },
+        now: (last != null)
+          ? (last + ' MB' + (ramTotal ? ' / ' + ramTotal + ' MB' : ''))
+          : '—',
+      };
+    },
+  },
+];
+
+function _buildTrainChartCards() {
+  const grid = document.getElementById('train-pane-charts');
+  if (!grid || grid.dataset.built === '1') return;
+  for (const cfg of TRAIN_CHARTS) {
+    const card = document.createElement('div');
+    card.className = 'train-chart-card';
+    const legendHtml = cfg.legend
+      ? '<div class="train-chart-legend" id="' + cfg.id + '-legend"></div>'
+      : '';
+    card.innerHTML =
+      '<div class="train-chart-head">' +
+        '<span>' + cfg.title + '</span>' +
+        '<span class="chart-now" id="' + cfg.id + '-now">—</span>' +
+      '</div>' +
+      '<canvas id="' + cfg.id + '-chart" height="90"></canvas>' +
+      legendHtml;
+    grid.appendChild(card);
+  }
+  grid.dataset.built = '1';
+}
+
+function _renderChartLegend(cfg, items) {
+  const el = document.getElementById(cfg.id + '-legend');
+  if (!el) return;
+  el.innerHTML = '';
+  for (const it of items) {
+    const span = document.createElement('span');
+    span.innerHTML = '<span class="swatch" style="background:' + it.color + '"></span>' + it.name;
+    el.appendChild(span);
+  }
+}
+
+function drawTrainCharts(s) {
+  _buildTrainChartCards();
+  for (const cfg of TRAIN_CHARTS) {
+    const r = cfg.build(s) || { series: [], opts: {}, now: '—' };
+    _drawLineChart(cfg.id + '-chart', r.series, r.opts);
+    const now = document.getElementById(cfg.id + '-now');
+    if (now) now.textContent = r.now;
+    if (cfg.legend) {
+      _renderChartLegend(cfg, cfg.legendFor ? cfg.legendFor(s) : []);
+    }
+  }
+}
+
+function updateTrainStages(s) {
   const cur = s.current_epoch || 0;
   const tot = s.total_epochs || 0;
   const pct = (tot > 0) ? Math.round(100 * cur / tot) : 0;
-  // The TensorRT export runs AFTER all epochs and has no progress signal.
-  // Show an indeterminate animated bar so the operator can tell it's still
-  // working (the static 100% bar made it look frozen).
-  const wrap = document.getElementById('train-bar-wrap');
+  const state = s.state || 'idle';
+  const exporting = (state === 'exporting');
+
+  const s1 = document.getElementById('train-stage1');
+  const s2 = document.getElementById('train-stage2');
+  const s1bar  = document.getElementById('train-stage1-bar');
+  const s2bar  = document.getElementById('train-stage2-bar');
+  const s1text = document.getElementById('train-stage1-text');
+  const s2text = document.getElementById('train-stage2-text');
+  const s2wrap = s2bar.parentElement;
+  if (!s1 || !s2) return;
+
+  // Stage 1 — epoch loop
+  s1.classList.remove('active', 'done', 'skipped');
+  if (state === 'starting' || state === 'training') {
+    s1.classList.add('active');
+    s1bar.style.width = pct + '%';
+    s1text.textContent = tot ? (cur + '/' + tot + ' (' + pct + '%)') : 'starting…';
+  } else if (state === 'exporting' || state === 'done') {
+    s1.classList.add('done');
+    s1bar.style.width = '100%';
+    s1text.textContent = tot ? (tot + '/' + tot + ' ✓') : '✓';
+  } else if (state === 'failed') {
+    s1bar.style.width = pct + '%';
+    s1text.textContent = tot ? (cur + '/' + tot) : 'failed';
+  } else {
+    s1bar.style.width = '0%';
+    s1text.textContent = '—';
+  }
+
+  // Stage 2 — TensorRT export. No % signal so we use the indeterminate stripe
+  // animation while running. On done, "skipped" if no engine_path (CPU/MPS).
+  s2.classList.remove('active', 'done', 'skipped');
+  s2wrap.classList.remove('indeterminate');
+  if (exporting) {
+    s2.classList.add('active');
+    s2wrap.classList.add('indeterminate');
+    s2text.textContent = 'exporting…';
+  } else if (state === 'done') {
+    if (s.engine_path) {
+      s2.classList.add('done');
+      s2text.textContent = 'engine saved ✓';
+    } else {
+      s2.classList.add('skipped');
+      s2text.textContent = 'skipped (CPU/MPS)';
+    }
+  } else if (state === 'failed') {
+    s2text.textContent = '—';
+  } else {
+    s2bar.style.width = '0%';
+    s2text.textContent = 'pending';
+  }
+}
+
+let _lastTrainStatus = null;
+function updateTrainModal(s) {
+  _lastTrainStatus = s;
+  const cur = s.current_epoch || 0;
+  const tot = s.total_epochs || 0;
+  const pct = (tot > 0) ? Math.round(100 * cur / tot) : 0;
   const exporting = (s.state === 'exporting');
-  if (wrap) wrap.classList.toggle('indeterminate', exporting);
-  if (!exporting) document.getElementById('train-bar').style.width = pct + '%';
+
+  updateTrainStages(s);
+  drawTrainCharts(s);
+
   const stateLine = exporting
     ? ((s.message || 'Exporting TensorRT engine') + ' — this can take ~2–3 min on Orin Nano…')
-    : ((s.message || s.state || '…') + (tot ? `   (${pct}%)` : ''));
+    : ((s.message || s.state || '…') + (tot ? '   (' + pct + '%)' : ''));
   document.getElementById('train-state-line').textContent = stateLine;
   document.getElementById('train-epoch').textContent = cur || '—';
   document.getElementById('train-total').textContent = tot || '—';
@@ -3115,8 +3781,8 @@ function updateTrainModal(s) {
   if (s.state === 'done') {
     const engineName = (s.engine_path || s.latest_engine || '').split('/').pop() || 'engine';
     document.getElementById('train-msg').innerHTML =
-      `✓ Saved <b>${engineName}</b>. ` +
-      `Click <b>Close</b> to resume inference with the new model.`;
+      '✓ Saved <b>' + engineName + '</b>. ' +
+      'Click <b>Close</b> to resume inference with the new model.';
     document.getElementById('train-cancel').style.display = 'none';
     document.getElementById('train-close').style.display = '';
     if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
@@ -3128,6 +3794,18 @@ function updateTrainModal(s) {
     if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
   }
 }
+
+// Redraw charts on window resize so the canvas refits when the modal width
+// changes (e.g. mobile orientation flip). Throttled with rAF.
+let _trainResizeRaf = 0;
+window.addEventListener('resize', () => {
+  if (!trainModalOpen) return;
+  if (_trainResizeRaf) return;
+  _trainResizeRaf = requestAnimationFrame(() => {
+    _trainResizeRaf = 0;
+    if (_lastTrainStatus) drawTrainCharts(_lastTrainStatus);
+  });
+});
 
 function setFeedDisabled(disabled) {
   const overlay = document.getElementById('feed-disabled');

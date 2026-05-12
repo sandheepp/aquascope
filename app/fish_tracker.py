@@ -22,6 +22,24 @@ import jetson_compat  # noqa: F401
 
 import argparse
 import os
+import warnings
+
+# Upstream noise: Ultralytics + supervision occasionally hit `0/0` and
+# `nan * x` inside NMS/IoU on edge-case (empty / degenerate) detection
+# sets — visible at the terminal as scalar-divide / invalid-value
+# RuntimeWarnings. They're benign (downstream code already guards on
+# empty xyxy), so silence the exact two patterns rather than the whole
+# numpy RuntimeWarning category.
+warnings.filterwarnings(
+    "ignore",
+    message=r"divide by zero encountered in scalar",
+    category=RuntimeWarning,
+)
+warnings.filterwarnings(
+    "ignore",
+    message=r"invalid value encountered in scalar",
+    category=RuntimeWarning,
+)
 
 from dotenv import load_dotenv
 load_dotenv()
