@@ -221,19 +221,78 @@ def _sample_gpu() -> dict:
             torch.cuda.get_device_properties(0).total_memory / (1024 * 1024))
     except Exception:                                       # noqa: BLE001
         pass
-    # Utilization: NVML on dGPU; /sys/devices/gpu.0/load on Tegra (0–1000).
-    util_pct: float | None = None
-    try:
-        util_pct = float(torch.cuda.utilization())          # NVML-backed
-    except Exception:                                       # noqa: BLE001
-        try:
-            with open("/sys/devices/gpu.0/load") as fh:
-                util_pct = float(fh.read().strip()) / 10.0
-        except (OSError, ValueError):
-            util_pct = None
+    util_pct = _read_gpu_util_pct()
     if util_pct is not None:
         out["util_pct"] = round(util_pct, 1)
     return out
+
+
+# Cache the working Tegra GPU-load path between samples so we don't re-glob
+# /sys every 2 s. None = no path found yet; "" = probed-and-no-path.
+_GPU_LOAD_PATH: str | None = None
+
+
+def _read_gpu_util_pct() -> float | None:
+    """GPU utilization in [0, 100]. Tries, in order:
+        1) NVML via torch.cuda.utilization() — works on dGPUs and some
+           JetPack 5 builds; returns 'N/A' / raises on most JetPack 6.
+        2) Tegra sysfs `load` (0–1000) — the path moved on JetPack 6
+           from /sys/devices/gpu.0/load to nested device paths like
+           /sys/devices/platform/17000000.ga10b/load. We glob-discover
+           it once and cache the first match.
+        3) `nvidia-smi --query-gpu=utilization.gpu` — covers dGPU hosts
+           where NVML access from torch is wonky but the CLI works.
+       Returns None when nothing reports anything usable."""
+    # 1) NVML
+    try:
+        import torch
+        return float(torch.cuda.utilization())
+    except Exception:                                       # noqa: BLE001
+        pass
+
+    # 2) Tegra sysfs (0–1000 scale)
+    import glob
+    global _GPU_LOAD_PATH
+    if _GPU_LOAD_PATH is None:
+        candidates = [
+            "/sys/devices/gpu.0/load",                      # legacy
+            *sorted(glob.glob("/sys/devices/platform/*.gpu/load")),
+            *sorted(glob.glob("/sys/devices/platform/*ga10b/load")),
+            *sorted(glob.glob("/sys/class/devfreq/*gpu*/load")),
+        ]
+        for path in candidates:
+            try:
+                with open(path) as fh:
+                    fh.read()
+                _GPU_LOAD_PATH = path
+                break
+            except OSError:
+                continue
+        if _GPU_LOAD_PATH is None:
+            _GPU_LOAD_PATH = ""                             # don't re-probe
+    if _GPU_LOAD_PATH:
+        try:
+            with open(_GPU_LOAD_PATH) as fh:
+                raw = float(fh.read().strip())
+            return raw / 10.0 if raw > 100 else raw
+        except (OSError, ValueError):
+            pass
+
+    # 3) nvidia-smi
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=2,
+        )
+        if r.returncode == 0:
+            val = r.stdout.strip().splitlines()[0]
+            return float(val)
+    except (FileNotFoundError, subprocess.SubprocessError, ValueError, IndexError):
+        pass
+
+    return None
 
 
 def _sample_ram() -> dict:
@@ -293,6 +352,56 @@ def _start_system_sampler(start_t: float, stop_event: threading.Event,
     t = threading.Thread(target=_run, daemon=True, name="aq-sys-sampler")
     t.start()
     return t
+
+
+def _read_results_csv(path) -> list:
+    """Parse Ultralytics' per-epoch results.csv (written to
+    runs/detect/<name>/results.csv) into a list of dicts. We only keep the
+    fields Analytics charts use — mAP, precision, recall, val losses —
+    so the persisted history JSON stays small. Returns [] on any parse
+    failure; the run isn't aborted, the user just loses metric history."""
+    try:
+        from pathlib import Path as _P
+        path = _P(path)
+        if not path.exists():
+            return []
+        with open(path) as f:
+            header = f.readline().strip().split(",")
+            rows = [line.strip().split(",") for line in f if line.strip()]
+    except OSError:
+        return []
+    # Map header → index. Ultralytics renames columns between minor versions
+    # (sometimes "metrics/mAP50(B)", sometimes "metrics/mAP_0.5"), so we
+    # match by substring rather than exact name.
+    def _idx(needle: str) -> int | None:
+        for i, h in enumerate(header):
+            if needle in h:
+                return i
+        return None
+    cols = {
+        "epoch":       _idx("epoch"),
+        "precision":   _idx("metrics/precision"),
+        "recall":      _idx("metrics/recall"),
+        "map50":       _idx("metrics/mAP50") or _idx("metrics/mAP_0.5"),
+        "map50_95":    _idx("metrics/mAP50-95") or _idx("metrics/mAP_0.5:0.95"),
+        "val_box":     _idx("val/box_loss"),
+        "val_cls":     _idx("val/cls_loss"),
+        "val_dfl":     _idx("val/dfl_loss"),
+    }
+    out: list[dict] = []
+    for row in rows:
+        rec: dict = {}
+        for name, idx in cols.items():
+            if idx is None or idx >= len(row):
+                continue
+            try:
+                rec[name] = float(row[idx])
+            except ValueError:
+                pass
+        if "epoch" in rec:
+            rec["epoch"] = int(rec["epoch"])
+            out.append(rec)
+    return out
 
 
 def _next_version(models_dir: Path) -> int:
@@ -525,6 +634,33 @@ def main() -> None:
                       pt_path=str(versioned_pt),
                       elapsed_sec=int(time.time() - start_t),
                       message=f"Saved {artifact.name}")
+
+        # Persist a copy of the final status (loss_samples + gpu_samples +
+        # ram_total_mb + everything) under models/best_v<N>.status.json so
+        # the Analytics page can reconstruct the training run for any
+        # past version. Best-effort — failure here doesn't break the run.
+        try:
+            with _STATUS_LOCK:
+                history = dict(_STATUS)
+            history["device"] = device
+            history["dataset_size"] = len(train_imgs) + len(val_imgs)
+            history["train_size"] = len(train_imgs)
+            history["val_size"] = len(val_imgs)
+            history["batch"] = args.batch
+            history["imgsz"] = args.imgsz
+            history["base_model"] = base_model
+            history["completed_at"] = int(time.time())
+            # Quality signal: pull validation metrics (mAP@50, mAP@50-95,
+            # precision, recall) per-epoch from Ultralytics' results.csv.
+            # This is what tells the user "did the model actually get
+            # better?" — loss going down isn't the same as accuracy going
+            # up. Best-effort: missing/garbled CSV → skip.
+            history["metrics"] = _read_results_csv(run_dir / "results.csv")
+            hist_path = models_dir / f"best_v{version}.status.json"
+            with open(hist_path, "w") as f:
+                json.dump(history, f)
+        except (OSError, NameError):
+            pass
     except Exception as e:                                  # noqa: BLE001
         _write_status(args.status_file,
                       state="failed",

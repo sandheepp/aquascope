@@ -24,13 +24,24 @@ fine-tune — with no cloud, no upload, no API key.
 
 - **Live detection + tracking** of fish and shrimp at 20–30 FPS on a Jetson
   Orin Nano (or whatever your laptop manages).
-- **In-browser labeling**: each detection becomes a candidate crop you keep
-  or reject with one click. Manual box-drawing for things the model misses.
-- **One-click fine-tuning**: when you have enough labels, the **Train Model**
-  button retrains YOLOv8 on YOUR fish, in YOUR tank, under YOUR lighting —
-  with live progress in the page.
-- **Auto-export**: on a Jetson the new model is compiled to TensorRT FP16
-  and hot-swapped into the running tracker.
+- **In-browser labeling on the latest frame**: predicted boxes appear
+  pre-filled — tap the red ✕ to drop false positives, click-drag to add
+  fish the model missed, hit **Save & next** for a fresh frame.
+- **One-click fine-tuning**: when you've saved enough labels (threshold
+  configurable in Settings), the **Train model** button retrains YOLOv8
+  on YOUR fish, in YOUR tank, under YOUR lighting.
+- **Live training charts in the page**: two-stage progress bar (epochs →
+  TensorRT export), loss curves (total + box / cls / dfl), GPU
+  utilization, GPU memory, RAM — all updating every 2 s.
+- **Auto-export + hot-swap**: on a Jetson the new model is compiled to
+  TensorRT FP16 (`models/best_v<N>.engine`) and appears in the Model
+  dropdown without a restart.
+- **Analytics history**: every successful training run is saved as
+  `models/best_v<N>.status.json`, and the **Analytics** tab lets you
+  re-open any past version's loss curves + resource usage from a dropdown.
+- **Multi-user aware**: when someone starts a training run, every
+  connected dashboard auto-opens the training modal; when it ends, the
+  modal dismisses itself and inference resumes for everyone.
 - **Runs offline**: nothing leaves your network. Optional Cloudflare tunnel
   if you want to share the dashboard publicly.
 
@@ -72,15 +83,33 @@ See [Setup → Jetson](#setup-on-a-jetson) below for the full recipe.
 
 ## Take the tour
 
-1. Open the dashboard at `http://<host>:8080`.
-2. **Live Feed** — watch boxes appear with track IDs and trails.
-3. **Labeling** — tick crops, draw missed boxes manually, watch the counter
-   climb. The inference threshold drops to 5% while you're labeling so weak
-   guesses surface as candidates.
-4. **Train Model** — set epochs, click. The page shows epoch + ETA. On a
-   Jetson the new TensorRT engine hot-swaps in when training finishes; on a
-   laptop the new `.pt` does the same.
-5. **Settings** — pick which model is active, tweak confidence + resolution.
+Open the dashboard at `http://<host>:8080`. Five tabs in the left sidebar:
+
+1. **📹 Live Feed** — MJPEG video with track IDs + trails + FPS / Total
+   IDs / Frame counter on the right.
+2. **📊 Analytics** — pick any past trained model (`best_v<N>`) from the
+   dropdown to see its full training summary: final loss, dataset size,
+   elapsed time, device, plus the same loss/GPU/RAM charts the live
+   training modal showed while it was running.
+3. **🖼️ Snapshots** — grid of every snapshot you've taken with
+   per-card open / download / delete actions.
+4. **🏷️ Label Fish** — lands you directly on the predicted-frame screen.
+   Predicted fish are pre-drawn with red ✕ buttons to remove false
+   positives; click-drag for missed ones; **Save & next** writes a YOLO
+   label and pulls a fresh frame. The Train-model card on the right
+   tells you how many more labels you need to unlock training.
+5. **⚙️ Settings** — two columns: **Inference** (detection model,
+   resolution, confidence slider, trails, underwater enhance) and
+   **Training** (labeling model, epoch count, editable
+   minimum-labels-to-train threshold). Settings stays in sync with the
+   inline controls on other tabs.
+
+When you click **🧠 Train model** on Label Fish: a confirmation dialog
+shows label count + ETA, then the training modal opens with a two-stage
+progress bar (Stage 1 epochs, Stage 2 TensorRT engine export), tabs for
+**📊 Charts** (loss + GPU util + GPU memory + RAM) and **📜 Logs**
+(subprocess output). The modal is broadcast — every connected user sees
+it open + auto-dismiss together.
 
 For the screenshot-by-screenshot walkthrough see
 [docs/02-the-label-train-loop.md](docs/02-the-label-train-loop.md).
@@ -94,13 +123,17 @@ For the screenshot-by-screenshot walkthrough see
 └──────────────┘                   └──────────────┘                └──────┬───────┘
                                                                           │ tracked boxes
                                                                           ▼
-                                              ┌────────────────────────────────────┐
-                                              │ Dashboard (single-file HTTP server)│
-                                              │  /  ── Live MJPEG stream + HUD     │
-                                              │  /label  ── crop yes/no, manual    │
-                                              │  /train  ── spawn trainer subproc  │
-                                              │  /models ── select active weights  │
-                                              └────────────────────────────────────┘
+                              ┌────────────────────────────────────────────────────┐
+                              │ Dashboard (single-file HTTP server, app/stream.py) │
+                              │  /stream            ── Live MJPEG video            │
+                              │  /label/predictions ── boxes for the labeling tab  │
+                              │  /label/manual      ── save user-drawn YOLO labels │
+                              │  /train/start       ── spawn trainer subprocess    │
+                              │  /train/status      ── live stages + loss + usage  │
+                              │  /train/history     ── per-version saved runs      │
+                              │  /train/min-labels  ── editable label threshold    │
+                              │  /models, /model    ── list + select active engine │
+                              └────────────────────────────────────────────────────┘
 ```
 
 For the conceptual deep-dive (what YOLO actually does, why ByteTrack matters,
@@ -276,7 +309,8 @@ aquascope/
 ├── dataset/user_recorded/      # Labels produced by the dashboard's labeling tab
 ├── fish_logs/                  # Runtime output: JSON stats + screenshots
 ├── Dockerfile                  # Laptop-mode Docker image
-└── .env                        # JETSON_HOST / JETSON_USER / JETSON_PASSWORD (gitignored)
+├── .env.example                # Template for the gitignored .env
+└── LICENSE                     # GNU AGPL-3.0 (same family as YOLOv8)
 ```
 
 </details>
@@ -302,6 +336,13 @@ aquascope/
 ```
 
 Snapshots taken from the dashboard live in `fish_logs/screenshots/`.
+
+Every successful training run is also persisted to
+`models/best_v<N>.status.json` — the full final status (per-epoch loss
+breakdown, GPU/RAM samples, validation metrics, device + dataset +
+hyperparameters). The Analytics tab reads these directly via
+`/train/history` so you can re-open any past run's charts without
+keeping the training process alive.
 
 ## License
 

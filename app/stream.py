@@ -18,6 +18,8 @@ Endpoints:
   /label/predictions — JSON list of the most recent model boxes for the manual-label modal
   /train/labels      — current user-recorded label count + min required + ETA
   /train/min-labels  — get/set the min-labels-to-train threshold (?v=N)
+  /train/history     — list saved per-version training runs; ?version=N for detail
+  /inference/history — aggregate fish_logs/*.json into time series + top-fish leaderboard
   /train/start       — spawn training subprocess (returns 409 if already running)
   /train/status      — poll training progress (state/epoch/eta/message/version)
   /train/cancel      — terminate the running training subprocess
@@ -46,9 +48,6 @@ _stats_lock = threading.Lock()
 
 _reset_flag = False
 _reset_lock = threading.Lock()
-
-_hat_mode = False
-_hat_lock = threading.Lock()
 
 _trails_enabled = False
 _trails_lock = threading.Lock()
@@ -118,11 +117,6 @@ _RESOLUTIONS = {
     "720p":  (1280, 720),
     "1080p": (1920, 1080),
 }
-
-
-def hat_mode_enabled() -> bool:
-    with _hat_lock:
-        return _hat_mode
 
 
 def trails_mode_enabled() -> bool:
@@ -312,6 +306,7 @@ def get_train_status() -> dict:
             status = json.load(f)
     except (OSError, json.JSONDecodeError):
         pass
+    global _train_unacked
     with _train_lock:
         if _train_proc is not None:
             rc = _train_proc.poll()
@@ -319,6 +314,16 @@ def get_train_status() -> dict:
                 # Process exited but status file wasn't updated.
                 status["state"] = "done" if rc == 0 else "failed"
                 status.setdefault("message", f"subprocess exited rc={rc}")
+        # Auto-acknowledge the moment the subprocess is no longer running.
+        # Previously _train_unacked stayed True until the user clicked Close
+        # on the modal, which meant a) inference stayed paused for every
+        # user even though training was over, b) other users with the modal
+        # open had no way to know it ended. Now: as soon as state lands in
+        # done/failed, we clear the flag so the tracker resumes inference
+        # globally; the modal can still display the success/failure
+        # message and dismiss itself.
+        if status.get("state") in ("done", "failed") and _train_unacked:
+            _train_unacked = False
         # Synthesize elapsed_sec from the wall clock so the timer ticks every
         # second from the moment the user clicks Train, not just at epoch
         # boundaries (the subprocess can spend 30+s loading torch + the model
@@ -626,8 +631,6 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_json(_stats, _stats_lock)
         elif p == "/reset":
             self._serve_reset()
-        elif p == "/hat":
-            self._serve_hat()
         elif p == "/trails":
             self._serve_trails()
         elif p == "/enhance":
@@ -660,6 +663,10 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_train_labels()
         elif p == "/train/min-labels":
             self._serve_train_min_labels()
+        elif p == "/train/history":
+            self._serve_train_history()
+        elif p == "/inference/history":
+            self._serve_inference_history()
         elif p == "/train/start":
             self._serve_train_start()
         elif p == "/train/status":
@@ -700,13 +707,6 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
         with _reset_lock:
             _reset_flag = True
         self._json_response(b'{"status":"reset requested"}')
-
-    def _serve_hat(self):
-        global _hat_mode
-        with _hat_lock:
-            _hat_mode = not _hat_mode
-            state = _hat_mode
-        self._json_response(json.dumps({"hat": state}).encode())
 
     def _serve_trails(self):
         global _trails_enabled
@@ -869,6 +869,142 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             except (ValueError, TypeError):
                 pass
         body = json.dumps({"min_required": min_labels_required()}).encode()
+        self._json_response(body)
+
+    def _serve_train_history(self):
+        """Per-version training history persisted by train_jetson.py at the
+        end of each successful run. Two query modes:
+
+          GET /train/history            → {"versions": [<N>, ...]}
+          GET /train/history?version=N  → the saved status JSON for that N
+                                          (404 if no status.json for it).
+        """
+        qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+        params = parse_qs(qs)
+        # Per-version detail
+        if "version" in params:
+            try:
+                v = int(params["version"][0])
+            except (ValueError, TypeError):
+                self._json_response(b'{"error":"bad version"}')
+                return
+            path = os.path.join(_models_dir, f"best_v{v}.status.json")
+            try:
+                with open(path) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"error":"no history for that version"}')
+                return
+            self._json_response(json.dumps(data).encode())
+            return
+        # List mode — every best_v<N>.status.json present in models/.
+        import re
+        versions: list[int] = []
+        pat = re.compile(r"^best_v(\d+)\.status\.json$")
+        try:
+            for name in os.listdir(_models_dir):
+                m = pat.match(name)
+                if m:
+                    versions.append(int(m.group(1)))
+        except OSError:
+            pass
+        versions.sort(reverse=True)             # newest first
+        self._json_response(json.dumps({"versions": versions}).encode())
+
+    def _serve_inference_history(self):
+        """Aggregate the rolling fish_logs/fish_stats_*.json snapshots into
+        a single payload for the Analytics page:
+
+          {
+            "samples":   [{ts, total_frames, unique_fish, active_fish}, ...],
+            "top_fish":  [{id, frame_count, distance_px, duration_sec}, ...],
+            "latest":    {ts, total_frames, unique_fish, active_fish}
+          }
+
+        Each log file is a periodic snapshot of the tracker's state (written
+        every ~60 s). We only read the most recent N files so this endpoint
+        stays cheap even after weeks of uptime."""
+        log_dir = os.path.dirname(_screenshot_dir) or "fish_logs"
+        try:
+            names = sorted(
+                n for n in os.listdir(log_dir)
+                if n.startswith("fish_stats_") and n.endswith(".json")
+            )
+        except OSError:
+            names = []
+        # Cap at the most recent 200 snapshots (≈ 3 h of dashboard uptime
+        # at one snapshot/min — plenty for a chart, cheap to serialize).
+        names = names[-200:]
+
+        samples: list[dict] = []
+        latest_fish: dict = {}
+        latest_ts: str = ""
+        for n in names:
+            try:
+                with open(os.path.join(log_dir, n)) as f:
+                    data = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                continue
+            ts = data.get("timestamp") or n.replace("fish_stats_", "").replace(".json", "")
+            fish = data.get("fish") or {}
+            # "Active" = last_seen within 30 s of the snapshot's timestamp.
+            # Cheap to compute and gives a useful "how many fish right now"
+            # number, distinct from the cumulative unique-IDs counter.
+            active = 0
+            try:
+                snap_t = datetime.strptime(ts, "%Y%m%d_%H%M%S")
+                for f in fish.values():
+                    ls = f.get("last_seen")
+                    if not ls:
+                        continue
+                    try:
+                        seen = datetime.fromisoformat(ls)
+                    except ValueError:
+                        continue
+                    if (snap_t - seen).total_seconds() <= 30:
+                        active += 1
+            except ValueError:
+                pass
+            samples.append({
+                "ts":           ts,
+                "total_frames": int(data.get("total_frames") or 0),
+                "unique_fish":  int(data.get("unique_fish") or 0),
+                "active_fish":  active,
+            })
+            latest_fish = fish
+            latest_ts = ts
+
+        # Top fish by frame_count from the most recent snapshot — gives
+        # the user a "who are my busiest fish?" leaderboard.
+        top_fish: list[dict] = []
+        for fid, f in latest_fish.items():
+            duration = 0.0
+            try:
+                first = datetime.fromisoformat(f.get("first_seen") or "")
+                last  = datetime.fromisoformat(f.get("last_seen")  or "")
+                duration = max(0.0, (last - first).total_seconds())
+            except ValueError:
+                pass
+            top_fish.append({
+                "id":           int(fid) if str(fid).isdigit() else fid,
+                "frame_count":  int(f.get("frame_count") or 0),
+                "distance_px":  float(f.get("total_distance_px") or 0.0),
+                "duration_sec": round(duration, 1),
+            })
+        top_fish.sort(key=lambda x: x["frame_count"], reverse=True)
+        top_fish = top_fish[:10]
+
+        latest = samples[-1] if samples else {
+            "ts": "", "total_frames": 0, "unique_fish": 0, "active_fish": 0,
+        }
+        body = json.dumps({
+            "samples":  samples,
+            "top_fish": top_fish,
+            "latest":   latest,
+        }).encode()
         self._json_response(body)
 
     def _serve_train_start(self):
@@ -1346,6 +1482,91 @@ body.snaps-tab #main{display:none !important}
 body.snaps-tab #snaps-panel{display:flex !important}
 body.settings-tab #main{display:none !important}
 body.settings-tab #settings-panel{display:flex !important}
+body.analytics-tab #main{display:none !important}
+body.analytics-tab #analytics-panel{display:flex !important}
+
+/* ── Analytics tab ── */
+#analytics-panel{
+  grid-area:main;
+  display:none;flex-direction:column;gap:10px;
+  padding:14px 18px;overflow:auto;
+  background:#0e1117;color-scheme:dark;
+}
+#analytics-panel-inner{
+  width:100%;max-width:1100px;align-self:center;
+  display:flex;flex-direction:column;gap:12px;
+}
+#analytics-header{
+  display:flex;align-items:center;justify-content:space-between;gap:14px;
+  flex-wrap:wrap;
+}
+#analytics-title{font-size:15px;font-weight:700;color:var(--accent)}
+#analytics-version-row{
+  display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim);
+}
+#analytics-version-select{
+  background:#1a2130;color:var(--text);border:1px solid var(--border);
+  padding:5px 24px 5px 10px;border-radius:5px;font-size:12px;cursor:pointer;
+  appearance:none;-webkit-appearance:none;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a5568'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 8px center;
+  min-width:140px;
+}
+.analytics-section{
+  display:flex;flex-direction:column;gap:10px;
+  background:#0d141d;
+  border:1px solid var(--border);border-radius:10px;
+  padding:14px 16px;
+}
+.analytics-section-head{
+  font-size:13px;font-weight:700;color:var(--accent);
+}
+.analytics-section-sub{
+  display:flex;flex-direction:column;gap:6px;
+}
+.analytics-summary{
+  display:grid;grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));
+  gap:10px;
+  border:1px solid var(--border);border-radius:8px;
+  padding:10px 14px;
+}
+.analytics-summary .stat-cell{display:flex;flex-direction:column;gap:2px}
+.analytics-summary .stat-cell .stat-lbl{
+  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);
+}
+.analytics-summary .stat-cell .stat-val{
+  font-family:var(--mono);font-size:14px;color:var(--text);
+}
+.analytics-empty{
+  color:var(--dim);font-size:13px;text-align:center;padding:24px 16px;
+  border:1px dashed var(--border);border-radius:8px;
+}
+.analytics-empty b{color:var(--text)}
+.analytics-empty code{
+  background:#0d141d;border:1px solid var(--border);
+  padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:11px;
+}
+#analytics-charts, #inference-charts{
+  display:grid;
+  grid-template-columns:repeat(auto-fill, minmax(260px, 1fr));
+  gap:12px;
+}
+#analytics-version-row{
+  display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim);
+  flex-wrap:wrap;
+}
+#inference-top-table{
+  width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);
+}
+#inference-top-table th, #inference-top-table td{
+  text-align:right;padding:6px 10px;border-bottom:1px solid rgba(30,45,61,0.55);
+}
+#inference-top-table th{
+  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);
+  font-family:var(--font);font-weight:600;
+}
+#inference-top-table th:first-child, #inference-top-table td:first-child{text-align:left}
+#inference-top-table tbody tr:last-child td{border-bottom:none}
 
 /* ── Settings tab ── */
 /* Settings page: capped width so it doesn't stretch across a 4K monitor,
@@ -1369,7 +1590,7 @@ body.settings-tab #settings-panel{display:flex !important}
 }
 #settings-title{font-size:15px;font-weight:700;color:var(--accent)}
 .settings-section{
-  background:transparent;
+  background:#0d141d;
   border:1px solid var(--border);border-radius:10px;
   padding:4px 14px;
 }
@@ -1500,7 +1721,7 @@ body.settings-tab #settings-panel{display:flex !important}
    monitor it reads as "white-ish blocks". Transparent fill + the existing
    border-color keeps the card outline but lets the page colour through. */
 #label-sidebar .card{
-  background:transparent;
+  background:#0d141d;
   border:1px solid var(--border);border-radius:8px;padding:10px 12px;
 }
 #label-sidebar .card-title{
@@ -1554,19 +1775,90 @@ body.settings-tab #settings-panel{display:flex !important}
 #train-eta-hint{
   color:var(--dim);font-size:11px;margin:4px 0 8px;
 }
+/* Helper text under the disabled Train button. Shown only while the
+   threshold hasn't been reached; refreshTrainLabels toggles its display. */
+#train-enable-note{
+  margin-top:8px;
+  font-size:11px;line-height:1.45;color:var(--dim);
+}
+#train-enable-note a{color:var(--accent);text-decoration:none}
+#train-enable-note a:hover{text-decoration:underline}
 #manual-streak{color:var(--dim);font-weight:500;font-size:11px}
+/* Step-by-step instructions panel under the canvas. Collapsible — by
+   default only the title bar is visible (so it doesn't eat canvas space);
+   click the chevron to expand the four numbered steps, ✕ to dismiss
+   entirely for the session. Expanded-state persists across reloads. */
 #manual-hint{
-  color:var(--dim);font-size:11px;
-  display:flex;flex-wrap:wrap;gap:6px;align-items:center;
-  flex-shrink:0;
-}
-#manual-hint .demo-chip{
-  display:inline-flex;align-items:center;gap:6px;
   background:#0d141d;border:1px solid var(--border);
-  border-radius:14px;padding:3px 9px;color:var(--text);
-  font-size:10.5px;
+  border-radius:8px;
+  font-size:11.5px;color:var(--text);
+  flex-shrink:0;overflow:hidden;
 }
-#manual-hint .demo-chip b{color:var(--accent);font-weight:600}
+#manual-hint.dismissed{display:none}
+#manual-hint .hint-title-bar{
+  display:flex;align-items:center;justify-content:space-between;gap:8px;
+  padding:6px 10px;
+}
+#manual-hint .hint-toggle{
+  display:inline-flex;align-items:center;gap:8px;
+  background:transparent;border:none;padding:0;cursor:pointer;
+  color:var(--dim);font-family:var(--font);
+  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;
+}
+#manual-hint .hint-toggle:hover{color:var(--text)}
+/* Default glyph is ▾ (chevron-down) so the affordance "click to expand
+   downward" is obvious at rest. On expand we rotate 180° → chevron-up
+   to mean "click to collapse". */
+#manual-hint .hint-chevron{
+  display:inline-block;color:var(--accent);
+  transition:transform 0.15s ease-out;
+  font-size:11px;line-height:1;
+}
+#manual-hint.expanded .hint-chevron{transform:rotate(180deg)}
+#manual-hint .hint-close{
+  background:transparent;border:none;cursor:pointer;
+  color:var(--dim);font-size:14px;line-height:1;padding:2px 6px;
+  border-radius:4px;
+}
+#manual-hint .hint-close:hover{
+  color:var(--danger);background:rgba(252,92,101,0.08);
+}
+#manual-hint .hint-steps{
+  display:none;
+  flex-direction:column;gap:6px;
+  padding:4px 12px 10px;
+  border-top:1px solid var(--border);
+  margin-top:2px;
+}
+#manual-hint.expanded .hint-steps{display:flex}
+#manual-hint .step{
+  display:flex;align-items:flex-start;gap:8px;line-height:1.45;
+}
+#manual-hint .step-num{
+  display:inline-flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+  width:18px;height:18px;border-radius:50%;
+  background:rgba(245,197,24,0.18);color:var(--accent);
+  border:1px solid rgba(245,197,24,0.4);
+  font-family:var(--mono);font-size:10px;font-weight:700;
+  margin-top:1px;
+}
+#manual-hint .step b{color:var(--accent);font-weight:600}
+#manual-hint .step .kbd{
+  display:inline-block;
+  font-family:var(--mono);font-size:10.5px;color:var(--text);
+  background:#1a2130;border:1px solid var(--border);
+  border-radius:3px;padding:0 5px;line-height:1.4;
+  margin:0 2px;
+}
+@media (min-width: 1100px){
+  /* On wide layouts, lay the four steps in two columns so the expanded
+     panel doesn't dominate the canvas card. */
+  #manual-hint.expanded .hint-steps{
+    display:grid;
+    grid-template-columns:1fr 1fr;gap:6px 18px;
+  }
+}
 
 /* Canvas wrap is intentionally invisible: no border, no background, no
    radius. The canvas IS the only visible content; any empty space (from
@@ -1701,15 +1993,15 @@ body.settings-tab #settings-panel{display:flex !important}
 }
 .train-tab{
   background:transparent;color:var(--dim);
-  border-bottom:none;
+  border:none;
   border-radius:6px 6px 0 0;
-  font-size:12px;font-weight:600;cursor:pointer;
+  font-size:12px;cursor:pointer;
   font-family:var(--font);position:relative;top:1px;
 }
 .train-tab:hover{color:var(--text)}
 .train-tab.active{
   color:var(--accent);
-  background:#0d141d;border-color:var(--border);
+  background:#0d141d;
 }
 .train-tab-pane{display:none;flex-direction:column;gap:10px;flex:1;min-height:0}
 .train-tab-pane.active{display:flex}
@@ -1852,7 +2144,7 @@ body.settings-tab #settings-panel{display:flex !important}
 /* Same override as #label-sidebar .card — drop the lighter gradient so
    the stats cards on Live Feed match Label-Fish's transparent-fill look
    (just an outline against the page bg). */
-#stats-panel .card{background:transparent}
+#stats-panel .card{background:#0d141d}
 .card{
   background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);
   border-radius:8px;padding:12px;
@@ -1878,22 +2170,6 @@ body.settings-tab #settings-panel{display:flex !important}
 }
 .tag-on{background:linear-gradient(90deg,rgba(0,212,170,0.22) 0%,rgba(0,212,170,0.08) 100%);color:var(--teal);border:1px solid rgba(0,212,170,0.3)}
 .tag-off{background:linear-gradient(90deg,rgba(74,85,104,0.25) 0%,rgba(74,85,104,0.08) 100%);color:var(--dim);border:1px solid var(--border)}
-#hat-btn{
-  width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
-  background:linear-gradient(135deg,rgba(245,197,24,0.10) 0%,rgba(245,197,24,0.03) 100%);color:var(--accent);
-  font-size:12px;cursor:pointer;transition:all 0.15s;font-family:var(--font);
-  margin-bottom:6px;
-}
-#hat-btn:hover{background:linear-gradient(135deg,rgba(245,197,24,0.22) 0%,rgba(245,197,24,0.08) 100%)}
-#hat-btn.on{background:linear-gradient(135deg,rgba(245,197,24,0.30) 0%,rgba(245,197,24,0.12) 100%);border-color:var(--accent)}
-#trails-btn{
-  width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
-  background:linear-gradient(135deg,rgba(79,195,247,0.10) 0%,rgba(79,195,247,0.03) 100%);color:var(--blue);
-  font-size:12px;cursor:pointer;transition:all 0.15s;font-family:var(--font);
-  margin-bottom:6px;
-}
-#trails-btn:hover{background:linear-gradient(135deg,rgba(79,195,247,0.22) 0%,rgba(79,195,247,0.08) 100%)}
-#trails-btn.on{background:linear-gradient(135deg,rgba(79,195,247,0.30) 0%,rgba(79,195,247,0.12) 100%);border-color:var(--blue)}
 #enhance-btn{
   width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
   background:linear-gradient(135deg,rgba(0,212,170,0.10) 0%,rgba(0,212,170,0.03) 100%);color:var(--teal);
@@ -2023,7 +2299,7 @@ body.settings-tab #settings-panel{display:flex !important}
 
   <div class="nav-section">Monitor</div>
   <div class="nav-item active" id="nav-live" onclick="switchTab('live')"><span class="nav-icon">📹</span>Live Feed</div>
-  <div class="nav-item"><span class="nav-icon">📊</span>Analytics</div>
+  <div class="nav-item" id="nav-analytics" onclick="switchTab('analytics')"><span class="nav-icon">📊</span>Analytics</div>
   <div class="nav-item" id="nav-snaps" onclick="switchTab('snaps')"><span class="nav-icon">🖼️</span>Snapshots</div>
 
   <div class="nav-section">Training</div>
@@ -2142,9 +2418,7 @@ body.settings-tab #settings-panel{display:flex !important}
         <input id="conf-slider" type="range" min="5" max="95" step="5" value="35" oninput="onConfSlider(this.value)">
       </div>
     </div>
-    <button id="trails-btn" onclick="toggleTrails()">〰 Trails: OFF</button>
     <button id="enhance-btn" onclick="toggleEnhance()">✨ Enhance: OFF</button>
-    <button id="hat-btn" onclick="toggleHat()">🎩 Party Hats: OFF</button>
     <button id="reset-btn" onclick="doReset()">↺ Reset Trails</button>
   </div>
 </main>
@@ -2159,12 +2433,32 @@ body.settings-tab #settings-panel{display:flex !important}
       <div id="manual-empty">Waiting for a live frame… start the live feed if it's stopped, then come back.</div>
     </div>
     <div id="manual-hint">
-      <span class="demo-chip"><b>✕</b> remove wrong prediction</span>
-      <span class="demo-chip"><b>drag</b> draw new box</span>
-      <span class="demo-chip"><b>✋</b> move</span>
-      <span class="demo-chip"><b>corners</b> resize</span>
-      <span class="demo-chip"><b>+ Add another</b> stage</span>
-      <span class="demo-chip"><b>Save &amp; next</b> commit</span>
+      <div class="hint-title-bar">
+        <button class="hint-toggle" onclick="toggleManualHint()" aria-expanded="false">
+          <span class="hint-chevron">▾</span>
+          How to label this frame
+        </button>
+        <button class="hint-close" onclick="dismissManualHint()"
+                title="Hide these instructions" aria-label="Hide instructions">✕</button>
+      </div>
+      <div class="hint-steps">
+        <div class="step">
+          <span class="step-num">1</span>
+          <span>Tap the red <b>✕</b> on any predicted box that isn't a fish.</span>
+        </div>
+        <div class="step">
+          <span class="step-num">2</span>
+          <span><b>Click + drag</b> on a fish the model missed to draw a new box. (On touch: tap once to drop a box, then drag the corners.)</span>
+        </div>
+        <div class="step">
+          <span class="step-num">3</span>
+          <span>Refine: drag corners to <b>resize</b>, the <b>✋</b> in the middle to <b>move</b>. Use <span class="kbd">+ Add another</span> when you need multiple boxes per frame.</span>
+        </div>
+        <div class="step">
+          <span class="step-num">4</span>
+          <span>Hit <span class="kbd">Save &amp; next</span> to commit the labels and pull a fresh frame. The <b>Saved</b> counter on the right ticks up — when it hits the threshold, <b>Train model</b> unlocks.</span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2212,6 +2506,74 @@ body.settings-tab #settings-panel{display:flex !important}
       </select>
       <div id="train-eta-hint">—</div>
       <button id="train-btn" disabled onclick="confirmTraining()">🧠 Train model</button>
+      <div id="train-enable-note">
+        Training unlocks once you've saved the labels currently set in
+        <a href="javascript:switchTab('settings')">Settings</a>.
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- Analytics panel -->
+<main id="analytics-panel">
+  <div id="analytics-panel-inner">
+    <div id="analytics-header">
+      <div id="analytics-title">📊 Analytics</div>
+    </div>
+
+    <!-- Inference activity (from fish_logs/*.json) -->
+    <div class="analytics-section">
+      <div class="analytics-section-head">🐟 Live inference activity</div>
+      <div id="inference-summary" class="analytics-summary">
+        <div class="stat-cell"><span class="stat-lbl">Snapshot</span><span class="stat-val" id="in-ts">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Total frames</span><span class="stat-val" id="in-frames">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Unique IDs</span><span class="stat-val" id="in-unique">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Active right now</span><span class="stat-val" id="in-active">—</span></div>
+      </div>
+      <div id="inference-empty" class="analytics-empty" style="display:none">
+        No inference logs yet — the tracker writes
+        <code>fish_logs/fish_stats_*.json</code> every ~60 s while running.
+      </div>
+      <div id="inference-charts"></div>
+      <div id="inference-top" class="analytics-section-sub" style="display:none">
+        <div class="analytics-section-head" style="font-size:11px">Top fish by frame count (most recent snapshot)</div>
+        <table id="inference-top-table">
+          <thead>
+            <tr><th>Track #</th><th>Frames</th><th>Distance (px)</th><th>Seen for</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Training history (per saved model version) -->
+    <div class="analytics-section">
+      <div class="analytics-section-head">🧠 Training runs</div>
+      <div id="analytics-version-row">
+        <label for="analytics-version-select">Model version</label>
+        <select id="analytics-version-select" onchange="loadAnalyticsModel(this.value)">
+          <option>loading…</option>
+        </select>
+      </div>
+      <div id="analytics-empty" class="analytics-empty">
+        No training history yet. Train a model from the
+        <a href="javascript:switchTab('train')" style="color:var(--accent)">Label Fish</a>
+        tab and a per-version summary will appear here.
+      </div>
+      <div id="analytics-summary" class="analytics-summary" style="display:none">
+        <div class="stat-cell"><span class="stat-lbl">Version</span><span class="stat-val" id="an-version">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Final state</span><span class="stat-val" id="an-state">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Epochs</span><span class="stat-val" id="an-epochs">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Final loss</span><span class="stat-val" id="an-loss">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Final mAP@50</span><span class="stat-val" id="an-map50">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Precision</span><span class="stat-val" id="an-precision">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Recall</span><span class="stat-val" id="an-recall">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Elapsed</span><span class="stat-val" id="an-elapsed">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Dataset</span><span class="stat-val" id="an-dataset">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Device</span><span class="stat-val" id="an-device">—</span></div>
+        <div class="stat-cell"><span class="stat-lbl">Image size</span><span class="stat-val" id="an-imgsz">—</span></div>
+      </div>
+      <div id="analytics-charts"></div>
     </div>
   </div>
 </main>
@@ -2272,10 +2634,6 @@ body.settings-tab #settings-panel{display:flex !important}
       <div class="settings-row">
         <label class="settings-lbl">Underwater enhance</label>
         <button class="toggle-btn" id="settings-enhance-btn" onclick="toggleEnhance()">OFF</button>
-      </div>
-      <div class="settings-row">
-        <label class="settings-lbl">Party hats</label>
-        <button class="toggle-btn" id="settings-hat-btn" onclick="toggleHat()">OFF</button>
       </div>
     </div>
 
@@ -2436,10 +2794,9 @@ function _syncSettingsToggle(key, on) {
 }
 
 function toggleTrails() {
+  // Trails lives only in Settings now — there's no Live-Feed-sidebar
+  // button to update; just sync the Settings toggle.
   fetch('/trails').then(r => r.json()).then(d => {
-    const btn = document.getElementById('trails-btn');
-    btn.textContent = '〰 Trails: ' + (d.trails ? 'ON' : 'OFF');
-    btn.classList.toggle('on', d.trails);
     _syncSettingsToggle('trails', d.trails);
   });
 }
@@ -2529,15 +2886,6 @@ function toggleEnhance() {
     btn.textContent = '✨ Enhance: ' + (d.enhance ? 'ON' : 'OFF');
     btn.classList.toggle('on', d.enhance);
     _syncSettingsToggle('enhance', d.enhance);
-  });
-}
-
-function toggleHat() {
-  fetch('/hat').then(r => r.json()).then(d => {
-    const btn = document.getElementById('hat-btn');
-    btn.textContent = '🎩 Party Hats: ' + (d.hat ? 'ON' : 'OFF');
-    btn.classList.toggle('on', d.hat);
-    _syncSettingsToggle('hat', d.hat);
   });
 }
 
@@ -2718,13 +3066,14 @@ function switchTab(tab) {
   // @media rule on #main uses !important (needed to override the
   // later-in-source desktop grid rule), which inline styles can't beat.
   const body = document.body;
-  body.classList.toggle('train-tab',    tab === 'train');
-  body.classList.toggle('snaps-tab',    tab === 'snaps');
-  body.classList.toggle('settings-tab', tab === 'settings');
+  body.classList.toggle('train-tab',     tab === 'train');
+  body.classList.toggle('snaps-tab',     tab === 'snaps');
+  body.classList.toggle('settings-tab',  tab === 'settings');
+  body.classList.toggle('analytics-tab', tab === 'analytics');
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
   const navMap = {
-    live: 'nav-live', train: 'nav-train',
-    snaps: 'nav-snaps', settings: 'nav-settings',
+    live: 'nav-live', train: 'nav-train', snaps: 'nav-snaps',
+    settings: 'nav-settings', analytics: 'nav-analytics',
   };
   const navId = navMap[tab];
   if (navId) {
@@ -2733,12 +3082,27 @@ function switchTab(tab) {
   }
   // Close the mobile nav drawer once a tab is picked.
   body.classList.remove('nav-open');
-  // Auto-load the latest frame + predictions when entering the labeling
-  // tab so the user lands on the predicted-frame screen instead of an
-  // empty placeholder.
-  if (tab === 'train')    manualActivate();
-  if (tab === 'snaps')    renderSnapsGrid();
-  if (tab === 'settings') syncSettingsFromInline();
+  if (tab === 'train')     manualActivate();
+  if (tab === 'snaps')     renderSnapsGrid();
+  if (tab === 'settings')  syncSettingsFromInline();
+  if (tab === 'analytics') {
+    loadAnalyticsVersions();
+    loadInferenceHistory();
+    // Refresh the live-inference section every 30 s while the tab stays
+    // open; the training-history section is static once loaded.
+    if (_inferenceRefreshTimer) clearInterval(_inferenceRefreshTimer);
+    _inferenceRefreshTimer = setInterval(() => {
+      if (document.body.classList.contains('analytics-tab')) {
+        loadInferenceHistory();
+      } else if (_inferenceRefreshTimer) {
+        clearInterval(_inferenceRefreshTimer);
+        _inferenceRefreshTimer = 0;
+      }
+    }, 30000);
+  } else if (_inferenceRefreshTimer) {
+    clearInterval(_inferenceRefreshTimer);
+    _inferenceRefreshTimer = 0;
+  }
 }
 
 // Copy live state from the inline (Live Feed / Label) controls into the
@@ -2759,7 +3123,7 @@ function syncSettingsFromInline() {
   const conf = document.getElementById('conf-slider');
   if (conf) _updateConfUI(parseInt(conf.value, 10));
   // Toggles
-  ['trails', 'enhance', 'hat'].forEach(k => {
+  ['trails', 'enhance'].forEach(k => {
     const src = document.getElementById(k + '-btn');
     if (src) _syncSettingsToggle(k, src.classList.contains('on'));
   });
@@ -2954,6 +3318,48 @@ function manualUpdateStreak() {
 }
 
 // Activate the inline labeling card (called from switchTab when the user
+// ── "How to label this frame" disclosure ─────────────────
+//
+// The hint card defaults to collapsed (title bar only) so it doesn't eat
+// canvas space. The user can:
+//   - Click the title bar to expand/collapse — choice persists across
+//     reloads via localStorage ('manualHintExpanded').
+//   - Click the ✕ to dismiss for this session — it'll come back on the
+//     next page load, so users who haven't yet seen the instructions
+//     don't miss them on a future visit.
+function _hintEl() { return document.getElementById('manual-hint'); }
+
+function toggleManualHint() {
+  const el = _hintEl();
+  if (!el) return;
+  const expanded = !el.classList.contains('expanded');
+  el.classList.toggle('expanded', expanded);
+  const btn = el.querySelector('.hint-toggle');
+  if (btn) btn.setAttribute('aria-expanded', String(expanded));
+  try { localStorage.setItem('manualHintExpanded', expanded ? '1' : '0'); }
+  catch (_) {}
+}
+
+function dismissManualHint() {
+  const el = _hintEl();
+  if (el) el.classList.add('dismissed');
+}
+
+// Restore expand-state once, at module load.
+(function _initManualHint(){
+  try {
+    const v = localStorage.getItem('manualHintExpanded');
+    if (v === '1') {
+      const el = _hintEl();
+      if (el) {
+        el.classList.add('expanded');
+        const btn = el.querySelector('.hint-toggle');
+        if (btn) btn.setAttribute('aria-expanded', 'true');
+      }
+    }
+  } catch (_) {}
+})();
+
 // opens the Label tab). Loads the latest frame + predictions; if no frame
 // is available yet, leaves the placeholder visible so the user knows why.
 function manualActivate() {
@@ -3268,6 +3674,22 @@ function refreshTrainLabels() {
     const hint = document.getElementById('train-eta-hint');
     const etaTxt = d.estimate ? `~${d.estimate.low_min}–${d.estimate.high_min} min` : '—';
     if (hint && d.estimate) hint.textContent = etaTxt;
+    // Helper text under the Train button: visible only while still below
+    // the threshold. Rewrites the message to show current count + target.
+    const note = document.getElementById('train-enable-note');
+    if (note) {
+      if (d.ready) {
+        note.style.display = 'none';
+      } else {
+        note.style.display = '';
+        const need = Math.max(0, (d.min_required || 0) - (d.count || 0));
+        note.innerHTML =
+          'Save ' + need + ' more label' + (need === 1 ? '' : 's') +
+          ' to unlock training. The minimum is currently ' +
+          '<b>' + d.min_required + '</b> ' +
+          '(change it in <a href="javascript:switchTab(\'settings\')">Settings</a>).';
+      }
+    }
     // Mirror to Settings: count and threshold are now separate fields.
     const sCount = document.getElementById('settings-label-count');
     if (sCount) sCount.textContent = String(d.count);
@@ -3361,10 +3783,14 @@ function openTrainModal() {
 }
 
 function closeTrainModal() {
-  // Tell the tracker the user has acknowledged the training-finished modal —
-  // this is what triggers inference to actually resume on the Jetson side.
+  // Tell the tracker the user has acknowledged the training-finished modal.
+  // (Server-side this is now a no-op once training has ended — the unacked
+  // flag is cleared automatically when the subprocess exits — but we still
+  // fire it so a Close-clicked-while-active path also resumes inference.)
   fetch('/train/acknowledge').catch(() => {});
   trainModalOpen = false;
+  _sawTrainingActive = false;
+  if (_autoDismissTimer) { clearTimeout(_autoDismissTimer); _autoDismissTimer = 0; }
   document.getElementById('train-overlay').classList.remove('open');
   if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
   document.querySelectorAll(
@@ -3648,31 +4074,103 @@ const TRAIN_CHARTS = [
       };
     },
   },
+  // ↓ Analytics-only: validation metrics from Ultralytics' results.csv,
+  //   populated by train_jetson.py at the end of each run. Skipped during
+  //   the live training modal (`analyticsOnly: true`) so the user doesn't
+  //   stare at two permanently-empty cards while training is running.
+  {
+    id: 'val-map',
+    title: 'Validation mAP',
+    legend: true,
+    analyticsOnly: true,
+    build(s) {
+      const m = s.metrics || [];
+      const series = [
+        { name: 'mAP@50',     color: '#00d4aa',
+          points: m.filter(d => d.map50    != null).map(d => ({ x: d.epoch, y: d.map50    })) },
+        { name: 'mAP@50-95',  color: '#f5c518',
+          points: m.filter(d => d.map50_95 != null).map(d => ({ x: d.epoch, y: d.map50_95 })) },
+      ];
+      const last = m.length ? m[m.length - 1] : null;
+      return {
+        series, opts: { yMin: 0, yMax: 1 },
+        now: last
+          ? ('mAP@50 ' + (last.map50    != null ? last.map50.toFixed(3)    : '—') +
+             ' · mAP@50-95 ' + (last.map50_95 != null ? last.map50_95.toFixed(3) : '—'))
+          : '—',
+      };
+    },
+    legendFor() {
+      return [
+        { name: 'mAP@50',    color: '#00d4aa' },
+        { name: 'mAP@50-95', color: '#f5c518' },
+      ];
+    },
+  },
+  {
+    id: 'val-pr',
+    title: 'Precision / recall',
+    legend: true,
+    analyticsOnly: true,
+    build(s) {
+      const m = s.metrics || [];
+      const series = [
+        { name: 'precision', color: '#4fc3f7',
+          points: m.filter(d => d.precision != null).map(d => ({ x: d.epoch, y: d.precision })) },
+        { name: 'recall',    color: '#fc5c65',
+          points: m.filter(d => d.recall    != null).map(d => ({ x: d.epoch, y: d.recall    })) },
+      ];
+      const last = m.length ? m[m.length - 1] : null;
+      return {
+        series, opts: { yMin: 0, yMax: 1 },
+        now: last
+          ? ('P ' + (last.precision != null ? last.precision.toFixed(3) : '—') +
+             ' · R ' + (last.recall    != null ? last.recall.toFixed(3)    : '—'))
+          : '—',
+      };
+    },
+    legendFor() {
+      return [
+        { name: 'precision', color: '#4fc3f7' },
+        { name: 'recall',    color: '#fc5c65' },
+      ];
+    },
+  },
 ];
 
-function _buildTrainChartCards() {
-  const grid = document.getElementById('train-pane-charts');
+// Generic chart-grid builder. `prefix` namespaces the canvas + readout IDs
+// so multiple grids (live training modal vs. Analytics page) can render
+// the same TRAIN_CHARTS config side-by-side without ID collisions.
+// `kind` is 'live' (skip cfg.analyticsOnly entries) or 'analytics' (keep
+// everything).
+function _buildChartGrid(gridId, prefix, kind) {
+  const grid = document.getElementById(gridId);
   if (!grid || grid.dataset.built === '1') return;
   for (const cfg of TRAIN_CHARTS) {
+    if (cfg.analyticsOnly && kind !== 'analytics') continue;
     const card = document.createElement('div');
     card.className = 'train-chart-card';
     const legendHtml = cfg.legend
-      ? '<div class="train-chart-legend" id="' + cfg.id + '-legend"></div>'
+      ? '<div class="train-chart-legend" id="' + prefix + cfg.id + '-legend"></div>'
       : '';
     card.innerHTML =
       '<div class="train-chart-head">' +
         '<span>' + cfg.title + '</span>' +
-        '<span class="chart-now" id="' + cfg.id + '-now">—</span>' +
+        '<span class="chart-now" id="' + prefix + cfg.id + '-now">—</span>' +
       '</div>' +
-      '<canvas id="' + cfg.id + '-chart" height="90"></canvas>' +
+      '<canvas id="' + prefix + cfg.id + '-chart" height="90"></canvas>' +
       legendHtml;
     grid.appendChild(card);
   }
   grid.dataset.built = '1';
 }
 
-function _renderChartLegend(cfg, items) {
-  const el = document.getElementById(cfg.id + '-legend');
+function _buildTrainChartCards() {
+  _buildChartGrid('train-pane-charts', '', 'live');
+}
+
+function _renderChartLegend(cfg, items, prefix) {
+  const el = document.getElementById((prefix || '') + cfg.id + '-legend');
   if (!el) return;
   el.innerHTML = '';
   for (const it of items) {
@@ -3682,18 +4180,245 @@ function _renderChartLegend(cfg, items) {
   }
 }
 
-function drawTrainCharts(s) {
-  _buildTrainChartCards();
+// Render every chart in TRAIN_CHARTS into `prefix`-namespaced DOM (used by
+// both the live training modal and the static Analytics page). `kind`
+// matches what _buildChartGrid used: 'live' skips analyticsOnly entries.
+function _drawChartsWithPrefix(s, prefix, kind) {
   for (const cfg of TRAIN_CHARTS) {
+    if (cfg.analyticsOnly && kind !== 'analytics') continue;
     const r = cfg.build(s) || { series: [], opts: {}, now: '—' };
-    _drawLineChart(cfg.id + '-chart', r.series, r.opts);
-    const now = document.getElementById(cfg.id + '-now');
+    _drawLineChart(prefix + cfg.id + '-chart', r.series, r.opts);
+    const now = document.getElementById(prefix + cfg.id + '-now');
     if (now) now.textContent = r.now;
     if (cfg.legend) {
-      _renderChartLegend(cfg, cfg.legendFor ? cfg.legendFor(s) : []);
+      _renderChartLegend(cfg, cfg.legendFor ? cfg.legendFor(s) : [], prefix);
     }
   }
 }
+
+function drawTrainCharts(s) {
+  _buildTrainChartCards();
+  _drawChartsWithPrefix(s, '', 'live');
+}
+
+// ── Analytics page ───────────────────────────────────────
+// Per-version training history is persisted by train_jetson.py at the end
+// of each successful run to `models/best_v<N>.status.json`. The Analytics
+// tab lists those versions in a dropdown and renders the same 5-chart
+// layout used by the live training modal, but pointed at the historic
+// status. Helpers reuse TRAIN_CHARTS + _drawLineChart with an "an-"
+// prefix so DOM IDs don't clash with the live modal.
+function _fmtSec(n) {
+  if (n == null || !isFinite(n)) return '—';
+  n = Math.max(0, Math.round(n));
+  const m = Math.floor(n / 60), s = n % 60;
+  return m + 'm ' + s + 's';
+}
+
+// Two chart configs for the inference-activity section. Independent of
+// TRAIN_CHARTS — different x-axis (snapshot index), different series.
+const INFERENCE_CHARTS = [
+  {
+    id: 'active',
+    title: 'Active fish (right now)',
+    series: (samples) => [{
+      name: 'active', color: '#00d4aa',
+      points: samples.map((s, i) => ({ x: i, y: s.active_fish || 0 })),
+    }],
+    opts: { yMin: 0 },
+    now: (samples) => {
+      const last = samples.length ? samples[samples.length - 1] : null;
+      return last ? (last.active_fish + ' active') : '—';
+    },
+  },
+  {
+    id: 'unique',
+    title: 'Unique IDs (cumulative)',
+    series: (samples) => [{
+      name: 'unique', color: '#f5c518',
+      points: samples.map((s, i) => ({ x: i, y: s.unique_fish || 0 })),
+    }],
+    opts: { yMin: 0 },
+    now: (samples) => {
+      const last = samples.length ? samples[samples.length - 1] : null;
+      return last ? (last.unique_fish + ' total') : '—';
+    },
+  },
+  {
+    id: 'frames',
+    title: 'Total frames processed',
+    series: (samples) => [{
+      name: 'frames', color: '#4fc3f7',
+      points: samples.map((s, i) => ({ x: i, y: s.total_frames || 0 })),
+    }],
+    opts: { yMin: 0 },
+    now: (samples) => {
+      const last = samples.length ? samples[samples.length - 1] : null;
+      return last ? last.total_frames.toLocaleString() : '—';
+    },
+  },
+];
+
+let _inferenceRefreshTimer = 0;
+
+function _buildInferenceChartCards() {
+  const grid = document.getElementById('inference-charts');
+  if (!grid || grid.dataset.built === '1') return;
+  for (const cfg of INFERENCE_CHARTS) {
+    const card = document.createElement('div');
+    card.className = 'train-chart-card';
+    card.innerHTML =
+      '<div class="train-chart-head">' +
+        '<span>' + cfg.title + '</span>' +
+        '<span class="chart-now" id="inf-' + cfg.id + '-now">—</span>' +
+      '</div>' +
+      '<canvas id="inf-' + cfg.id + '-chart" height="90"></canvas>';
+    grid.appendChild(card);
+  }
+  grid.dataset.built = '1';
+}
+
+function _fmtDuration(sec) {
+  if (!isFinite(sec) || sec <= 0) return '—';
+  sec = Math.round(sec);
+  if (sec < 60) return sec + 's';
+  const m = Math.floor(sec / 60), s = sec % 60;
+  if (m < 60) return m + 'm ' + s + 's';
+  const h = Math.floor(m / 60), mr = m % 60;
+  return h + 'h ' + mr + 'm';
+}
+
+function loadInferenceHistory() {
+  fetch('/inference/history').then(r => r.json()).then(d => {
+    const samples = (d && d.samples) || [];
+    const summary = document.getElementById('inference-summary');
+    const empty   = document.getElementById('inference-empty');
+    const top     = document.getElementById('inference-top');
+    if (!samples.length) {
+      if (summary) summary.style.display = 'none';
+      if (empty)   empty.style.display = '';
+      if (top)     top.style.display = 'none';
+      return;
+    }
+    if (summary) summary.style.display = '';
+    if (empty)   empty.style.display = 'none';
+
+    const latest = d.latest || samples[samples.length - 1];
+    const set = (id, v) => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = v;
+    };
+    // Render snapshot ts as HH:MM:SS for readability.
+    const ts = latest.ts || '';
+    const tsFmt = ts.length === 15
+      ? (ts.slice(9, 11) + ':' + ts.slice(11, 13) + ':' + ts.slice(13, 15))
+      : ts;
+    set('in-ts',     tsFmt);
+    set('in-frames', (latest.total_frames || 0).toLocaleString());
+    set('in-unique', latest.unique_fish || 0);
+    set('in-active', latest.active_fish || 0);
+
+    _buildInferenceChartCards();
+    for (const cfg of INFERENCE_CHARTS) {
+      _drawLineChart('inf-' + cfg.id + '-chart',
+                     cfg.series(samples), cfg.opts);
+      const now = document.getElementById('inf-' + cfg.id + '-now');
+      if (now) now.textContent = cfg.now(samples);
+    }
+
+    // Top-fish table.
+    const tbody = document.querySelector('#inference-top-table tbody');
+    const tops = d.top_fish || [];
+    if (tbody) {
+      tbody.innerHTML = '';
+      for (const f of tops) {
+        const tr = document.createElement('tr');
+        tr.innerHTML =
+          '<td>#' + f.id + '</td>' +
+          '<td>' + (f.frame_count || 0).toLocaleString() + '</td>' +
+          '<td>' + Math.round(f.distance_px || 0).toLocaleString() + '</td>' +
+          '<td>' + _fmtDuration(f.duration_sec) + '</td>';
+        tbody.appendChild(tr);
+      }
+    }
+    if (top) top.style.display = tops.length ? '' : 'none';
+  }).catch(() => {});
+}
+
+function loadAnalyticsVersions() {
+  fetch('/train/history').then(r => r.json()).then(d => {
+    const sel = document.getElementById('analytics-version-select');
+    const empty = document.getElementById('analytics-empty');
+    const summary = document.getElementById('analytics-summary');
+    const charts = document.getElementById('analytics-charts');
+    if (!sel) return;
+    const versions = (d && d.versions) || [];
+    sel.innerHTML = '';
+    if (!versions.length) {
+      if (empty) empty.style.display = '';
+      if (summary) summary.style.display = 'none';
+      if (charts) charts.innerHTML = '';
+      const opt = document.createElement('option');
+      opt.textContent = '(no history)'; opt.disabled = true;
+      sel.appendChild(opt);
+      return;
+    }
+    if (empty) empty.style.display = 'none';
+    for (const v of versions) {
+      const opt = document.createElement('option');
+      opt.value = String(v);
+      opt.textContent = 'best_v' + v;
+      sel.appendChild(opt);
+    }
+    // Default: newest version. Build the chart grid once and load it.
+    sel.value = String(versions[0]);
+    _buildChartGrid('analytics-charts', 'an-', 'analytics');
+    loadAnalyticsModel(versions[0]);
+  }).catch(() => {});
+}
+
+function loadAnalyticsModel(version) {
+  if (version == null || version === '') return;
+  fetch('/train/history?version=' + encodeURIComponent(version))
+    .then(r => r.ok ? r.json() : null)
+    .then(s => {
+      if (!s) return;
+      // Populate the summary cells.
+      const last = (s.loss_samples && s.loss_samples.length)
+        ? s.loss_samples[s.loss_samples.length - 1] : null;
+      const set = (id, v) => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = v;
+      };
+      set('an-version',  'v' + (s.version != null ? s.version : version));
+      set('an-state',    s.state || '—');
+      set('an-epochs',   (s.total_epochs != null ? s.total_epochs : '—'));
+      set('an-loss',     last && last.total != null ? last.total.toFixed(3) : '—');
+      const metrics = s.metrics || [];
+      const finalM = metrics.length ? metrics[metrics.length - 1] : null;
+      set('an-map50',     finalM && finalM.map50     != null ? finalM.map50.toFixed(3)     : '—');
+      set('an-precision', finalM && finalM.precision != null ? finalM.precision.toFixed(3) : '—');
+      set('an-recall',    finalM && finalM.recall    != null ? finalM.recall.toFixed(3)    : '—');
+      set('an-elapsed',  _fmtSec(s.elapsed_sec));
+      const ds = s.dataset_size != null
+        ? (s.dataset_size + ' (' + (s.train_size||0) + '/' + (s.val_size||0) + ')')
+        : '—';
+      set('an-dataset',  ds);
+      set('an-device',   s.device || '—');
+      set('an-imgsz',    s.imgsz != null ? (s.imgsz + ' px') : '—');
+      const summary = document.getElementById('analytics-summary');
+      if (summary) summary.style.display = '';
+      // Render the same chart suite as the training modal.
+      _drawChartsWithPrefix(s, 'an-', 'analytics');
+    }).catch(() => {});
+}
+
+// Re-draw the analytics charts on resize too (canvas needs explicit refit).
+window.addEventListener('resize', () => {
+  if (!document.body.classList.contains('analytics-tab')) return;
+  const sel = document.getElementById('analytics-version-select');
+  if (sel && sel.value) loadAnalyticsModel(sel.value);
+});
 
 function updateTrainStages(s) {
   const cur = s.current_epoch || 0;
@@ -3812,13 +4537,59 @@ function setFeedDisabled(disabled) {
   if (overlay) overlay.style.display = disabled ? 'flex' : 'none';
 }
 
-// On page load, see if a training run is already in progress (e.g. user reloaded mid-run).
-fetch('/train/status').then(r => r.json()).then(s => {
-  if (s.running || s.state === 'training' || s.state === 'starting' || s.state === 'exporting') {
-    openTrainModal();
-    startTrainPolling();
-  }
-}).catch(() => {});
+// Broadcast watcher: every connected dashboard polls /train/status on a
+// slow tick and auto-opens the training modal when SOMEONE ELSE starts a
+// run. The modal is a full-page overlay, so once it's open the user sees
+// the live stages/charts regardless of which tab they were on; we also
+// flip them to the Label-Fish tab for visual context. The poll is cheap
+// (~once every 3 s) and stops contributing once the modal's own faster
+// poll (startTrainPolling, 2 s) takes over.
+function _isTrainingActive(s) {
+  return !!(s && (s.running || s.state === 'training'
+                  || s.state === 'starting' || s.state === 'exporting'));
+}
+// Tracks whether this client has SEEN training go active. We use it to
+// decide whether a current "not active" status counts as "training ended"
+// (close the modal) vs "no training has ever been started" (do nothing).
+let _sawTrainingActive = false;
+let _autoDismissTimer = 0;
+
+function watchTrainBroadcast() {
+  fetch('/train/status').then(r => r.json()).then(s => {
+    const active = _isTrainingActive(s);
+    if (active) {
+      _sawTrainingActive = true;
+      if (!trainModalOpen) {
+        // Someone else started a run — open the modal here too.
+        if (typeof switchTab === 'function') switchTab('train');
+        openTrainModal();
+        startTrainPolling();
+      }
+    } else if (trainModalOpen && _sawTrainingActive) {
+      // Training was active and just ended (done / failed / status file
+      // cleared). Inference is already resuming server-side because
+      // get_train_status auto-clears _train_unacked, so the only job left
+      // is to close this client's modal. We let updateTrainModal repaint
+      // the done/failed message once, then auto-dismiss after a short
+      // grace period so the user can read it. Cancel/Close button is
+      // also wired so impatient users can dismiss immediately.
+      if (s && (s.state === 'done' || s.state === 'failed')) {
+        updateTrainModal(s);          // paint final message + show Close
+      }
+      if (!_autoDismissTimer) {
+        _autoDismissTimer = setTimeout(() => {
+          _autoDismissTimer = 0;
+          if (trainModalOpen) closeTrainModal();
+        }, 4000);
+      }
+    }
+  }).catch(() => {});
+}
+// One immediate check on page load (handles "user reloaded mid-run"),
+// then a slow recurring poll so any user opening the dashboard, OR
+// already on the dashboard, sees a training run someone else started.
+watchTrainBroadcast();
+setInterval(watchTrainBroadcast, 3000);
 
 // ── 3-minute session limit ──────────────────────────────
 const STREAM_LIMIT_MS = 180000;
