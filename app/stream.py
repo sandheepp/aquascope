@@ -4656,6 +4656,61 @@ class _ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
 
 
 # ── Public API ────────────────────────────────────────────
+_LOG_CLEANUP_INTERVAL_SEC = 3 * 3600    # 3 hours between sweeps
+_LOG_RETENTION_HOURS = 3                # delete fish_stats_*.json older than this
+
+
+def _cleanup_old_fish_logs(log_dir: str | None = None,
+                           retention_hours: float = _LOG_RETENTION_HOURS) -> int:
+    """Delete fish_stats_*.json files older than `retention_hours` from
+    `log_dir`. Returns the number of files removed. The tracker writes one
+    snapshot per minute, so without periodic pruning the directory grows
+    unbounded and the /inference/history endpoint slows down."""
+    log_dir = log_dir or (os.path.dirname(_screenshot_dir) or "fish_logs")
+    if not os.path.isdir(log_dir):
+        return 0
+    cutoff = time.time() - retention_hours * 3600
+    removed = 0
+    try:
+        names = os.listdir(log_dir)
+    except OSError:
+        return 0
+    for name in names:
+        if not (name.startswith("fish_stats_") and name.endswith(".json")):
+            continue
+        path = os.path.join(log_dir, name)
+        try:
+            if os.path.getmtime(path) < cutoff:
+                os.remove(path)
+                removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _start_log_cleanup_thread() -> threading.Thread:
+    """Daemon thread that runs _cleanup_old_fish_logs every 3 hours, with
+    an initial sweep ~30 s after startup. Daemon, so it doesn't block
+    shutdown. Failures are logged but never propagated."""
+    def _run():
+        # Small initial delay so we don't race the tracker writing its
+        # first snapshot. After that, sweep on a 3-hour cadence forever.
+        time.sleep(30)
+        while True:
+            try:
+                removed = _cleanup_old_fish_logs()
+                if removed:
+                    print(f"[CLEANUP] Pruned {removed} fish_stats_*.json "
+                          f"files older than {_LOG_RETENTION_HOURS}h.")
+            except Exception as e:                          # noqa: BLE001
+                print(f"[CLEANUP] Error during log cleanup: {e}")
+            time.sleep(_LOG_CLEANUP_INTERVAL_SEC)
+
+    t = threading.Thread(target=_run, daemon=True, name="aq-log-cleanup")
+    t.start()
+    return t
+
+
 def start_stream(port: int) -> None:
     # Clear stale training artifacts from a previous dashboard process so the
     # page loads straight into inference instead of replaying a stale modal.
@@ -4666,6 +4721,9 @@ def start_stream(port: int) -> None:
             os.remove(path)
         except OSError:
             pass
+    # Periodic prune of fish_stats_*.json so the log dir + the
+    # /inference/history scan stay bounded over long uptimes.
+    _start_log_cleanup_thread()
     server = _ThreadingHTTPServer(("0.0.0.0", port), _MJPEGHandler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
