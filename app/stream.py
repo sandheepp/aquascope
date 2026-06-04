@@ -1206,3443 +1206,1967 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
 
     def _serve_index(self):
         html = r"""<!doctype html>
-<html lang="en"><head>
+<html lang="en">
+<head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AquaScope</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AquaScope — Neural Tank Monitor</title>
 <style>
+/* ============================================================
+   AquaScope — Cyber/Lab Design System
+   Dark, neon aquatic data-viz. Teal/cyan on near-black.
+   ============================================================ */
+
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
 :root {
-  --bg:      #0e1117;
-  --sidebar: #13181f;
-  --card:    #181e27;
-  --border:  #1e2d3d;
-  --accent:  #f5c518;
-  --teal:    #00d4aa;
-  --blue:    #4fc3f7;
-  --dim:     #4a5568;
-  --text:    #c8d8e8;
-  --danger:  #fc5c65;
-  --font:    'Segoe UI', system-ui, sans-serif;
-  --mono:    'Courier New', monospace;
-}
-*{margin:0;padding:0;box-sizing:border-box}
-/* `color-scheme: dark` on the root opts the page out of light-mode UA
-   defaults (form controls, scrollbars, the viewport canvas colour). Without
-   it, browsers in forced-light or auto-color mode were painting the area
-   behind the label panel white whenever an inner element had a transparent
-   background. Pair it with an explicit bg-color fallback so even if the
-   gradient fails to paint for any reason, the fallback is dark. */
-html{color-scheme:dark;background:#0e1117}
-body{
-  background-color:#0e1117;
-  background-image:linear-gradient(160deg,#0b1520 0%,#0e1117 40%,#0a1a1a 100%);
-  color:var(--text);
-  font-family:var(--font);font-size:13px;
-  display:grid;
-  grid-template-columns: 200px 1fr;
-  grid-template-rows: 52px 1fr 140px;
-  grid-template-areas:
-    "sidebar topbar"
-    "sidebar main"
-    "sidebar filmstrip";
-  height:100vh;overflow:hidden;
+  /* ── Surfaces ── */
+  --bg-0:      #05090d;   /* deepest backdrop */
+  --bg-1:      #070d12;   /* app background */
+  --panel:     #0a141b;   /* card surface */
+  --panel-2:   #0d1c25;   /* raised surface */
+  --panel-3:   #102530;   /* hover / active surface */
+  --inset:     #04080b;   /* recessed wells (feed, charts) */
+
+  /* ── Lines ── */
+  --border:    #143038;
+  --border-2:  #1c424d;
+  --grid:      rgba(0, 229, 204, 0.05);
+
+  /* ── Text ── */
+  --text:      #d2ecea;
+  --text-2:    #8fb3b3;
+  --dim:       #5a7d80;
+  --faint:     #3c585c;
+
+  /* ── Accents (aquatic) ── */
+  --teal:      #00e5cc;   /* primary */
+  --teal-2:    #19f0d6;
+  --cyan:      #2ad4ff;   /* data viz secondary */
+  --aqua:      #57f5b6;   /* data viz tertiary */
+  --deep:      #4aa8ff;   /* cool blue */
+
+  /* ── Status ── */
+  --good:      #45e0a8;
+  --warn:      #ffc857;
+  --alert:     #ff6f6f;
+  --crit:      #ff4d6d;
+
+  /* ── Glows ── */
+  --glow-teal: 0 0 0 1px rgba(0,229,204,.35), 0 0 18px -2px rgba(0,229,204,.45);
+  --glow-soft: 0 0 24px -6px rgba(0,229,204,.30);
+
+  --font:  'Space Grotesk', system-ui, sans-serif;
+  --mono:  'JetBrains Mono', ui-monospace, monospace;
+
+  --r-sm: 6px;
+  --r:    10px;
+  --r-lg: 14px;
 }
 
-/* ── Mobile ── */
-@media (max-width: 700px) {
-  /* Let <html> scroll, NOT <body>. Putting overflow-y:auto on body breaks
-     position:fixed children on iOS Safari — fixed elements end up
-     positioned relative to body's scroll container instead of the
-     viewport, which made the training/manual modals render below the
-     live feed instead of overlaying it. */
-  html{ overflow-y:auto;overflow-x:hidden;width:100% }
-  body{
-    display:flex;flex-direction:column;
-    height:auto;min-height:100vh;
-    overflow-x:hidden;width:100%;
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+html, body { height: 100%; }
+
+body {
+  background: var(--bg-1);
+  color: var(--text);
+  font-family: var(--font);
+  font-size: 14px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+/* ambient grid + radial wash behind everything */
+#app-bg {
+  position: fixed; inset: 0; z-index: 0; pointer-events: none;
+  background:
+    radial-gradient(900px 600px at 78% -8%, rgba(0,229,204,.08), transparent 60%),
+    radial-gradient(700px 500px at 8% 108%, rgba(74,168,255,.07), transparent 60%),
+    linear-gradient(180deg, #070f15 0%, #05090d 100%);
+}
+#app-bg::after {
+  content: ""; position: absolute; inset: 0;
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 44px 44px;
+  mask-image: radial-gradient(120% 120% at 50% 0%, #000 40%, transparent 100%);
+}
+
+::selection { background: rgba(0,229,204,.3); color: #fff; }
+
+/* scrollbars */
+* { scrollbar-width: thin; scrollbar-color: var(--border-2) transparent; }
+*::-webkit-scrollbar { width: 9px; height: 9px; }
+*::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 8px; border: 2px solid transparent; background-clip: content-box; }
+*::-webkit-scrollbar-thumb:hover { background: #2a5b66; background-clip: content-box; }
+
+/* ── typographic helpers ── */
+.mono { font-family: var(--mono); }
+.eyebrow {
+  font-family: var(--mono);
+  font-size: 10px; letter-spacing: .22em; text-transform: uppercase;
+  color: var(--dim);
+}
+.tabular { font-variant-numeric: tabular-nums; font-family: var(--mono); }
+
+/* ── App layout ── */
+#root { position: relative; z-index: 1; height: 100%; }
+
+.shell {
+  display: grid;
+  grid-template-columns: 232px 1fr;
+  height: 100vh;
+}
+
+/* ============================================================
+   Sidebar
+   ============================================================ */
+.sidebar {
+  background: linear-gradient(180deg, #08121a 0%, #060c11 100%);
+  border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  padding: 18px 0 14px;
+  position: relative;
+  z-index: 30;
+}
+.brand {
+  display: flex; align-items: center; gap: 11px;
+  padding: 4px 18px 18px;
+}
+.brand-mark {
+  width: 34px; height: 34px; flex: none;
+  display: grid; place-items: center;
+  border-radius: 9px;
+  background: radial-gradient(circle at 30% 25%, #0c2730, #07151c);
+  border: 1px solid var(--border-2);
+  box-shadow: inset 0 0 12px rgba(0,229,204,.18);
+  position: relative;
+}
+.brand-mark svg { width: 21px; height: 21px; }
+.brand-mark::after {
+  content:""; position:absolute; inset:0; border-radius:9px;
+  box-shadow: 0 0 16px -4px rgba(0,229,204,.6);
+}
+.brand-name {
+  font-weight: 700; font-size: 17px; letter-spacing: .02em;
+  line-height: 1;
+}
+.brand-name b { color: var(--teal); font-weight: 700; }
+.brand-sub {
+  font-family: var(--mono); font-size: 9px; letter-spacing: .2em;
+  color: var(--dim); text-transform: uppercase; margin-top: 3px; white-space: nowrap;
+}
+
+.nav-group { padding: 6px 12px; }
+.nav-label {
+  font-family: var(--mono); font-size: 9px; letter-spacing: .2em;
+  text-transform: uppercase; color: var(--faint);
+  padding: 12px 8px 7px;
+}
+.nav-item {
+  display: flex; align-items: center; gap: 11px;
+  padding: 9px 10px; border-radius: var(--r-sm);
+  color: var(--text-2); cursor: pointer;
+  font-size: 13.5px; font-weight: 500;
+  position: relative; transition: background .14s, color .14s;
+  user-select: none;
+}
+.nav-item span { white-space: nowrap; }
+.nav-item .ni-icon { width: 18px; height: 18px; flex: none; opacity: .75; }
+.nav-item:hover { background: rgba(255,255,255,.03); color: var(--text); }
+.nav-item:hover .ni-icon { opacity: 1; }
+.nav-item.active {
+  color: var(--teal); background: linear-gradient(90deg, rgba(0,229,204,.12), rgba(0,229,204,.02));
+}
+.nav-item.active .ni-icon { opacity: 1; color: var(--teal); }
+.nav-item.active::before {
+  content: ""; position: absolute; left: -12px; top: 6px; bottom: 6px;
+  width: 3px; border-radius: 0 3px 3px 0; background: var(--teal);
+  box-shadow: 0 0 10px var(--teal);
+}
+.nav-badge {
+  margin-left: auto; font-family: var(--mono); font-size: 10px;
+  background: rgba(0,229,204,.14); color: var(--teal);
+  padding: 1px 6px; border-radius: 20px; border: 1px solid rgba(0,229,204,.25);
+}
+.nav-badge.alert { background: rgba(255,111,111,.14); color: var(--alert); border-color: rgba(255,111,111,.3); }
+
+.nav-spacer { flex: 1; }
+
+.dev-card {
+  margin: 8px 14px 0; padding: 11px 12px;
+  border: 1px solid var(--border); border-radius: var(--r);
+  background: var(--panel);
+}
+.dev-row { display: flex; align-items: center; justify-content: space-between; font-size: 11px; }
+.dev-row + .dev-row { margin-top: 7px; }
+.dev-row .lbl { color: var(--dim); font-family: var(--mono); font-size: 10px; letter-spacing: .06em; }
+.dev-row .val { font-family: var(--mono); color: var(--text); white-space: nowrap; }
+.dev-bar { height: 4px; border-radius: 3px; background: #0a181d; overflow: hidden; margin-top: 4px; }
+.dev-bar > i { display: block; height: 100%; border-radius: 3px; }
+
+.conn {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px 20px 2px; font-size: 11px; color: var(--text-2);
+  font-family: var(--mono);
+}
+.dot { width: 7px; height: 7px; border-radius: 50%; background: var(--good); box-shadow: 0 0 8px var(--good); }
+.dot.live { animation: pulse 1.8s infinite; }
+@keyframes pulse { 0%,100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.8); } }
+
+/* ============================================================
+   Main column
+   ============================================================ */
+.main { display: flex; flex-direction: column; min-width: 0; height: 100vh; }
+
+.topbar {
+  height: 58px; flex: none;
+  display: flex; align-items: center; gap: 16px;
+  padding: 0 22px;
+  border-bottom: 1px solid var(--border);
+  background: rgba(7,13,18,.72);
+  backdrop-filter: blur(10px);
+  position: relative; z-index: 20;
+}
+.tb-title { font-size: 17px; font-weight: 600; letter-spacing: -.01em; white-space: nowrap; }
+.tb-sub { font-family: var(--mono); font-size: 11px; color: var(--dim); margin-top: 1px; white-space: nowrap; }
+.live-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em;
+  color: var(--teal); padding: 4px 9px; border-radius: 20px; white-space: nowrap; flex: none;
+  border: 1px solid rgba(0,229,204,.3); background: rgba(0,229,204,.07);
+}
+.tb-spacer { flex: 1; }
+.tb-right { display: flex; align-items: center; gap: 14px; }
+.clock { font-family: var(--mono); font-size: 13px; color: var(--cyan); }
+.clock .date { color: var(--dim); font-size: 11px; }
+
+.btn {
+  font-family: var(--font); font-size: 13px; font-weight: 500;
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 7px 13px; border-radius: var(--r-sm); cursor: pointer;
+  border: 1px solid var(--border-2); background: var(--panel-2); color: var(--text);
+  transition: all .14s;
+}
+.btn:hover { background: var(--panel-3); border-color: #2a5b66; }
+.btn svg { width: 15px; height: 15px; }
+.btn-primary {
+  background: linear-gradient(135deg, var(--teal), #00bfab);
+  color: #022; border: none; font-weight: 600;
+  box-shadow: 0 0 0 1px rgba(0,229,204,.3), 0 6px 18px -8px rgba(0,229,204,.7);
+}
+.btn-primary:hover { filter: brightness(1.08); }
+.btn-ghost { background: transparent; border-color: var(--border); }
+.btn-icon { padding: 7px; }
+
+.content {
+  flex: 1; overflow-y: auto; overflow-x: hidden;
+  padding: 22px;
+  position: relative;
+}
+
+/* ============================================================
+   Cards / panels
+   ============================================================ */
+.card {
+  background: linear-gradient(160deg, var(--panel-2) 0%, var(--panel) 100%);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  position: relative;
+}
+.card.pad { padding: 16px; }
+.card-h {
+  display: flex; align-items: center; gap: 10px; min-width: 0;
+  padding: 13px 16px; border-bottom: 1px solid var(--border);
+}
+.card-h .ch-title { font-size: 13px; font-weight: 600; letter-spacing: .01em; white-space: nowrap; flex: none; }
+.card-h .ch-sub { font-family: var(--mono); font-size: 10px; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; text-align: right; }
+.card-h .ch-spacer { flex: 1; }
+
+.kpi { padding: 15px 16px 16px; }
+.kpi-top { display: flex; align-items: center; justify-content: space-between; }
+.kpi-label { font-family: var(--mono); font-size: 9.5px; letter-spacing: .11em; text-transform: uppercase; color: var(--dim); white-space: nowrap; }
+.kpi-val { font-family: var(--mono); font-size: 30px; font-weight: 600; line-height: 1; margin-top: 12px; letter-spacing: -.02em; }
+.kpi-val .unit { font-size: 14px; color: var(--dim); margin-left: 4px; }
+.kpi-delta { font-family: var(--mono); font-size: 11px; margin-top: 7px; display: flex; align-items: center; gap: 5px; }
+.up { color: var(--good); }
+.down { color: var(--alert); }
+.flat { color: var(--dim); }
+
+.chip {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-family: var(--mono); font-size: 10px; letter-spacing: .06em;
+  padding: 3px 8px; border-radius: 20px;
+  border: 1px solid var(--border-2); color: var(--text-2);
+}
+.chip.on { color: var(--teal); border-color: rgba(0,229,204,.35); background: rgba(0,229,204,.08); }
+.chip.warn { color: var(--warn); border-color: rgba(255,200,87,.3); background: rgba(255,200,87,.07); }
+.chip.alert { color: var(--alert); border-color: rgba(255,111,111,.3); background: rgba(255,111,111,.07); }
+
+/* grids */
+.grid { display: grid; gap: 14px; }
+.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+/* toggles */
+.toggle {
+  width: 38px; height: 21px; border-radius: 20px; flex: none;
+  background: #0c1c22; border: 1px solid var(--border-2);
+  position: relative; cursor: pointer; transition: all .18s;
+}
+.toggle > i {
+  position: absolute; top: 2px; left: 2px; width: 15px; height: 15px;
+  border-radius: 50%; background: var(--dim); transition: all .18s;
+}
+.toggle.on { background: rgba(0,229,204,.2); border-color: var(--teal); }
+.toggle.on > i { left: 19px; background: var(--teal); box-shadow: 0 0 8px var(--teal); }
+
+/* range slider */
+input[type=range].rng {
+  -webkit-appearance: none; appearance: none; width: 100%; height: 4px;
+  border-radius: 3px; outline: none; cursor: pointer; background: #0e2228;
+}
+input[type=range].rng::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 15px; height: 15px; border-radius: 50%;
+  background: var(--teal); border: 2px solid #04141a; box-shadow: 0 0 8px rgba(0,229,204,.7); cursor: pointer;
+}
+input[type=range].rng::-moz-range-thumb {
+  width: 15px; height: 15px; border-radius: 50%; background: var(--teal);
+  border: 2px solid #04141a; cursor: pointer;
+}
+
+select.sel {
+  width: 100%; padding: 8px 30px 8px 11px; border-radius: var(--r-sm);
+  border: 1px solid var(--border-2); background: var(--panel); color: var(--text);
+  font-family: var(--mono); font-size: 12px; cursor: pointer; outline: none;
+  appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%235a7d80'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 11px center;
+}
+select.sel:focus { border-color: var(--teal); }
+
+/* corner brackets */
+.bracket { position: absolute; width: 14px; height: 14px; border-color: var(--teal); border-style: solid; opacity: .55; pointer-events: none; }
+.bracket.tl { top: 9px; left: 9px; border-width: 1.5px 0 0 1.5px; }
+.bracket.tr { top: 9px; right: 9px; border-width: 1.5px 1.5px 0 0; }
+.bracket.bl { bottom: 9px; left: 9px; border-width: 0 0 1.5px 1.5px; }
+.bracket.br { bottom: 9px; right: 9px; border-width: 0 1.5px 1.5px 0; }
+
+/* fade-in (capture-safe: never animates opacity to 0, so DOM-clone screenshots stay visible) */
+.view { animation: viewIn .35s ease; }
+@keyframes viewIn { from { transform: translateY(7px); } to { transform: none; } }
+
+.section-title { font-size: 12px; font-family: var(--mono); letter-spacing: .14em; text-transform: uppercase; color: var(--dim); margin: 4px 2px 2px; }
+
+/* mobile nav (hidden on desktop) */
+.mobile-bar { display: none; }
+.hamburger { display: none; }
+.scrim { display: none; }
+
+/* ============================================================
+   Responsive
+   ============================================================ */
+@media (max-width: 1180px) {
+  .cols-4 { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 900px) {
+  .shell { grid-template-columns: 1fr; }
+  .sidebar {
+    position: fixed; top: 0; bottom: 0; left: 0; width: 232px;
+    transform: translateX(-100%); transition: transform .25s ease; z-index: 60;
   }
-  /* Anchor the fixed overlays to the viewport with explicit width/height
-     and a high z-index so nothing in the mobile flex layout wins. */
-  #train-overlay,
-  #train-confirm-overlay,
-  #fs-overlay,
-  #modal{
-    position:fixed !important;top:0 !important;left:0 !important;
-    width:100vw !important;height:100vh !important;height:100dvh !important;
-    z-index:1000 !important;
+  .sidebar.open { transform: none; box-shadow: 0 0 60px rgba(0,0,0,.7); }
+  .scrim.show { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 55; }
+  .hamburger { display: inline-flex; }
+  .content { padding: 16px; padding-bottom: 80px; }
+  .cols-3 { grid-template-columns: 1fr; }
+  .cols-2 { grid-template-columns: 1fr; }
+  .clock .date { display: none; }
+}
+@media (max-width: 560px) {
+  .cols-4 { grid-template-columns: 1fr 1fr; }
+  .tb-sub { display: none; }
+}
+
+/* ============================================================
+   AquaScope — View-specific styles
+   ============================================================ */
+
+.row-between { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.dimc { color: var(--dim); }
+
+/* segmented control */
+.seg { display: inline-flex; background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 3px; gap: 2px; }
+.seg-btn {
+  font-family: var(--mono); font-size: 11px; padding: 5px 12px; border-radius: 6px;
+  border: none; background: transparent; color: var(--dim); cursor: pointer; transition: all .14s;
+}
+.seg-btn:hover { color: var(--text-2); }
+.seg-btn.on { background: rgba(0,229,204,.14); color: var(--teal); }
+
+/* shared confidence bar */
+.conf-bar { display: inline-block; width: 54px; height: 4px; border-radius: 3px; background: #0e2228; overflow: hidden; vertical-align: middle; margin-right: 7px; }
+.conf-bar > i { display: block; height: 100%; border-radius: 3px; }
+
+/* ============================================================
+   LIVE VIEW
+   ============================================================ */
+.live-grid { display: grid; grid-template-columns: 1fr 340px; gap: 16px; align-items: start; }
+.feed-wrap {
+  position: relative; aspect-ratio: 16 / 9; width: 100%;
+  background: var(--inset); border: 1px solid var(--border-2); border-radius: var(--r-lg);
+  overflow: hidden; box-shadow: var(--glow-soft);
+}
+.scanlines { position: absolute; inset: 0; pointer-events: none; background: repeating-linear-gradient(to bottom, transparent 0 3px, rgba(0,0,0,.10) 3px 4px); }
+.feed-top { position: absolute; top: 12px; left: 12px; right: 12px; display: flex; align-items: center; gap: 10px; pointer-events: none; }
+.rec { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 10.5px; letter-spacing: .14em; color: var(--alert); background: rgba(8,12,16,.7); padding: 4px 9px; border-radius: 20px; border: 1px solid rgba(255,111,111,.3); }
+.rec > i { width: 7px; height: 7px; border-radius: 50%; background: var(--alert); box-shadow: 0 0 8px var(--alert); animation: pulse 1.6s infinite; }
+.feed-tag { margin-left: auto; font-size: 10px; color: var(--teal); background: rgba(8,12,16,.7); padding: 4px 9px; border-radius: 20px; border: 1px solid var(--border-2); }
+.snap-btn {
+  position: absolute; bottom: 14px; right: 14px;
+  display: inline-flex; align-items: center; gap: 7px; cursor: pointer;
+  font-family: var(--font); font-size: 12.5px; font-weight: 600; color: #022;
+  padding: 8px 13px; border-radius: 8px; border: none;
+  background: linear-gradient(135deg, var(--teal), #00bfab);
+  box-shadow: 0 6px 18px -8px rgba(0,229,204,.8);
+}
+.snap-btn:hover { filter: brightness(1.08); }
+.snap-btn svg { width: 15px; height: 15px; }
+
+.filmstrip { display: flex; gap: 9px; overflow-x: auto; padding-bottom: 4px; }
+.film-thumb { flex: none; width: 116px; }
+.film-img { height: 66px; border-radius: 7px; border: 1px solid var(--border-2); display: grid; place-items: center; overflow: hidden; }
+.film-cap { display: block; font-size: 9.5px; color: var(--dim); margin-top: 5px; }
+
+.fish-list { padding: 8px; overflow-y: auto; display: flex; flex-direction: column; gap: 5px; max-height: 320px; }
+.fish-row { display: flex; align-items: center; gap: 10px; padding: 8px 9px; border-radius: 8px; border: 1px solid var(--border); background: var(--panel); transition: border-color .15s; }
+.fish-row:hover { border-color: var(--border-2); }
+.fish-swatch { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+.fish-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.fish-meta { font-size: 10.5px; color: var(--dim); margin-top: 1px; }
+.fish-conf { margin-left: auto; font-size: 12px; color: var(--teal); }
+.ctl-row { display: flex; align-items: center; justify-content: space-between; padding: 7px 4px; cursor: pointer; font-size: 13px; border-radius: 6px; }
+.ctl-row:hover { background: rgba(255,255,255,.02); }
+
+/* ============================================================
+   ANALYTICS — per-fish table
+   ============================================================ */
+.heat-legend { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 10px; color: var(--dim); }
+.heat-bar { flex: none; width: 110px; height: 7px; border-radius: 4px; background: linear-gradient(90deg, rgba(0,229,204,.06), rgba(0,229,204,.9)); }
+
+.ptable { padding: 6px 8px 10px; }
+.pt-head, .pt-row { display: grid; grid-template-columns: 1.6fr 1.2fr 1.1fr 1fr .9fr 1.2fr; gap: 10px; align-items: center; padding: 9px 10px; }
+.pt-head { font-family: var(--mono); font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase; color: var(--faint); border-bottom: 1px solid var(--border); }
+.pt-row { border-bottom: 1px solid rgba(20,48,56,.5); font-size: 12.5px; }
+.pt-row:hover { background: rgba(0,229,204,.03); }
+.pt-row:last-child { border-bottom: none; }
+.pt-name { display: flex; align-items: center; gap: 9px; font-weight: 500; }
+.pt-name em { color: var(--dim); font-style: normal; font-size: 11px; }
+.pt-row .mono { font-size: 12px; }
+
+/* ============================================================
+   AI INSIGHTS
+   ============================================================ */
+.insights-grid { display: grid; grid-template-columns: 1fr 380px; gap: 16px; align-items: stretch; }
+.ai-orb { width: 18px; height: 18px; border-radius: 50%; flex: none; background: radial-gradient(circle at 35% 30%, #7CFFCB, var(--teal) 55%, #007a6c); box-shadow: 0 0 10px rgba(0,229,204,.8); position: relative; }
+.ai-orb::after { content: ""; position: absolute; inset: -3px; border-radius: 50%; border: 1px solid rgba(0,229,204,.4); animation: pulse 2s infinite; }
+
+.health-card { padding: 16px; display: flex; flex-direction: column; align-items: center; }
+.health-sub { width: 100%; margin-top: 14px; display: flex; flex-direction: column; gap: 8px; }
+.hs-row { display: grid; grid-template-columns: 64px 1fr 26px; gap: 8px; align-items: center; font-size: 11px; }
+.hs-bar { height: 5px; border-radius: 3px; background: #0e2228; overflow: hidden; }
+.hs-bar > i { display: block; height: 100%; border-radius: 3px; transition: width .6s; }
+
+.summary-card { display: flex; flex-direction: column; }
+.summary-body { padding: 14px 16px; font-size: 13.5px; line-height: 1.6; color: var(--text-2); }
+.summary-body b { color: var(--text); }
+.summary-tags { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 14px; }
+
+.feed-list { padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.insight { display: flex; gap: 12px; padding: 13px; border-radius: 10px; border: 1px solid var(--border); background: var(--panel); position: relative; overflow: hidden; }
+.insight::before { content: ""; position: absolute; left: 0; top: 0; bottom: 0; width: 3px; }
+.insight.alert::before { background: var(--alert); } .insight.warn::before { background: var(--warn); }
+.insight.good::before { background: var(--good); } .insight.info::before { background: var(--cyan); }
+.ins-icon { width: 34px; height: 34px; flex: none; border-radius: 9px; border: 1px solid; display: grid; place-items: center; background: var(--inset); }
+.ins-top { display: flex; align-items: center; gap: 9px; }
+.ins-title { font-size: 13.5px; font-weight: 600; }
+.ins-tag { font-size: 9.5px; color: var(--dim); border: 1px solid var(--border-2); padding: 1px 6px; border-radius: 20px; }
+.ins-time { margin-left: auto; font-size: 10.5px; color: var(--faint); }
+.ins-body { font-size: 12.5px; color: var(--text-2); line-height: 1.55; margin-top: 5px; }
+.ins-conf { display: flex; align-items: center; gap: 8px; margin-top: 9px; font-size: 10px; }
+
+/* Ask your tank */
+.ask-card { display: flex; flex-direction: column; min-height: 520px; }
+.ask-body { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+.bubble { max-width: 88%; font-size: 13px; line-height: 1.55; padding: 11px 13px; border-radius: 13px; }
+.bubble.ai { align-self: flex-start; background: var(--panel); border: 1px solid var(--border-2); border-bottom-left-radius: 4px; color: var(--text); }
+.bubble.user { align-self: flex-end; background: linear-gradient(135deg, rgba(0,229,204,.18), rgba(0,229,204,.08)); border: 1px solid rgba(0,229,204,.3); border-bottom-right-radius: 4px; color: var(--text); }
+.caret { color: var(--teal); animation: blink 1s steps(2) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.ask-sugg { display: flex; flex-wrap: wrap; gap: 7px; padding: 0 14px 12px; }
+.sugg { font-family: var(--font); font-size: 11.5px; color: var(--text-2); background: var(--panel); border: 1px solid var(--border-2); padding: 6px 11px; border-radius: 20px; cursor: pointer; transition: all .14s; }
+.sugg:hover { border-color: var(--teal); color: var(--teal); }
+.ask-input { display: flex; gap: 8px; padding: 12px 14px; border-top: 1px solid var(--border); }
+.ask-input input { flex: 1; background: var(--inset); border: 1px solid var(--border-2); border-radius: 8px; padding: 9px 13px; color: var(--text); font-family: var(--font); font-size: 13px; outline: none; }
+.ask-input input:focus { border-color: var(--teal); }
+.ask-input button svg { width: 16px; height: 16px; }
+
+/* ============================================================
+   TRAINING
+   ============================================================ */
+.training-grid { display: grid; grid-template-columns: 1fr 360px; gap: 16px; align-items: start; }
+.triage-body { padding: 16px; display: flex; flex-direction: column; align-items: center; gap: 16px; }
+.crop-frame { position: relative; width: 100%; aspect-ratio: 4/3; max-width: 560px; border-radius: 10px; overflow: hidden; border: 1px solid var(--border-2); }
+.crop-box { position: absolute; border: 1.6px solid; border-radius: 3px; }
+.crop-label { position: absolute; top: -18px; left: -1px; font-size: 10px; color: #04141a; padding: 1px 6px; border-radius: 3px 3px 0 0; white-space: nowrap; }
+.crop-conf { position: absolute; bottom: 8px; right: 10px; font-size: 10px; color: var(--teal); background: rgba(8,12,16,.7); padding: 3px 7px; border-radius: 20px; }
+.triage-q { font-size: 16px; font-weight: 600; }
+.triage-actions { display: flex; gap: 14px; }
+.tri-btn { display: inline-flex; align-items: center; gap: 9px; font-family: var(--font); font-size: 15px; font-weight: 600; padding: 12px 30px; border-radius: 10px; cursor: pointer; border: 1px solid; transition: all .14s; }
+.tri-btn svg { width: 19px; height: 19px; }
+.tri-btn em { font-style: normal; font-size: 10px; opacity: .7; border: 1px solid currentColor; border-radius: 4px; padding: 1px 5px; }
+.tri-btn.accept { color: var(--good); border-color: rgba(69,224,168,.4); background: rgba(69,224,168,.08); }
+.tri-btn.accept:hover { background: rgba(69,224,168,.16); }
+.tri-btn.reject { color: var(--alert); border-color: rgba(255,111,111,.4); background: rgba(255,111,111,.08); }
+.tri-btn.reject:hover { background: rgba(255,111,111,.16); }
+.triage-empty { padding: 50px 30px; color: var(--dim); text-align: center; font-size: 13px; }
+
+.mini-stat { display: flex; flex-direction: column; gap: 5px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+.mini-stat .tabular { font-size: 18px; font-weight: 600; }
+
+.model-list { padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+.model-row { display: flex; align-items: center; gap: 12px; padding: 11px 12px; border-radius: 9px; border: 1px solid var(--border); background: var(--panel); }
+.model-row.active { border-color: rgba(0,229,204,.35); background: linear-gradient(90deg, rgba(0,229,204,.06), var(--panel)); }
+.model-name { font-size: 12.5px; display: flex; align-items: center; }
+.model-meta { font-size: 10px; color: var(--dim); margin-top: 3px; }
+.model-stats { margin-left: auto; display: flex; gap: 16px; text-align: right; }
+.model-stats > div { display: flex; flex-direction: column; gap: 2px; }
+.model-stats .tabular { font-size: 14px; font-weight: 600; }
+
+/* train modal */
+.modal-scrim { position: fixed; inset: 0; background: rgba(2,6,9,.8); backdrop-filter: blur(4px); z-index: 200; display: grid; place-items: center; padding: 20px; animation: viewIn .2s; }
+.train-modal { width: min(620px, 96vw); max-height: 92vh; overflow-y: auto; box-shadow: 0 24px 70px rgba(0,0,0,.7); }
+.tm-stat-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 14px; }
+.tm-big { font-size: 24px; font-weight: 700; margin-top: 4px; }
+.tm-bar { height: 8px; border-radius: 5px; background: #0e2228; overflow: hidden; }
+.tm-bar > i { display: block; height: 100%; border-radius: 5px; background: linear-gradient(90deg, var(--cyan), var(--teal)); transition: width .3s; box-shadow: 0 0 10px var(--teal); }
+.tm-log { background: var(--inset); border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; font-family: var(--mono); font-size: 11px; line-height: 1.6; color: var(--text-2); height: 150px; overflow-y: auto; }
+.tm-log .log-ok { color: var(--teal); }
+
+/* ============================================================
+   DEVICE HEALTH
+   ============================================================ */
+.device-banner { display: flex; align-items: center; gap: 16px; }
+.dev-icon { width: 52px; height: 52px; flex: none; border-radius: 12px; display: grid; place-items: center; background: var(--inset); border: 1px solid var(--border-2); box-shadow: inset 0 0 14px rgba(0,229,204,.15); }
+.dev-icon svg { width: 28px; height: 28px; }
+.db-stats { display: flex; gap: 28px; }
+.db-stats > div { display: flex; flex-direction: column; gap: 4px; }
+.db-stats .tabular { font-size: 16px; font-weight: 600; white-space: nowrap; }
+.gauge-card { padding: 16px 12px 14px; display: grid; place-items: center; }
+.kv-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 0; border-bottom: 1px solid rgba(20,48,56,.5); font-size: 12.5px; }
+.kv-row > span { white-space: nowrap; }
+.kv-row:last-child { border-bottom: none; }
+
+/* ============================================================
+   SETTINGS
+   ============================================================ */
+.set-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; border-bottom: 1px solid rgba(20,48,56,.5); }
+.set-row:last-child { border-bottom: none; }
+.set-label { font-size: 13.5px; font-weight: 500; }
+.set-sub { font-size: 11px; color: var(--dim); margin-top: 3px; }
+.set-control { flex: none; }
+
+/* ============================================================
+   MOBILE
+   ============================================================ */
+@media (max-width: 900px) {
+  .live-grid, .insights-grid, .training-grid { grid-template-columns: 1fr; }
+  .ask-card { min-height: 440px; }
+  .db-stats { gap: 18px; flex-wrap: wrap; }
+  .pt-head { display: none; }
+  .pt-row { grid-template-columns: 1fr 1fr; gap: 6px 10px; padding: 12px 10px; border: 1px solid var(--border); border-radius: 8px; margin-bottom: 8px; }
+  .pt-row > span:nth-child(6) { grid-column: 1 / -1; }
+  .mobile-bar {
+    display: flex; position: fixed; bottom: 0; left: 0; right: 0; height: 60px; z-index: 50;
+    background: rgba(7,13,18,.94); backdrop-filter: blur(12px); border-top: 1px solid var(--border);
+    align-items: center; justify-content: space-around; padding: 0 8px;
   }
-  /* Sidebar slides in from the left as an overlay drawer; #nav-toggle
-     button (only visible on mobile) flips a body.nav-open class. */
-  #sidebar{
-    position:fixed;top:0;left:0;bottom:0;z-index:60;
-    width:240px;max-width:85vw;
-    transform:translateX(-100%);transition:transform 0.22s ease-out;
-    box-shadow:6px 0 18px rgba(0,0,0,0.55);
-  }
-  body.nav-open #sidebar{ transform:translateX(0) }
-  body.nav-open::after{
-    content:"";position:fixed;inset:0;background:rgba(0,0,0,0.55);
-    z-index:55;
-  }
-  #nav-toggle{ display:inline-flex !important }
-  #topbar{
-    padding:0 10px;flex-shrink:0;
-    position:sticky;top:0;z-index:20;
-  }
-  .page-title{ font-size:13px }
-  .live-badge{ padding:2px 7px;font-size:10px }
-  #snap-btn{ padding:5px 10px;font-size:11px }
-  #uptime{ display:none }
-  #main{
-    display:flex !important;flex-direction:column !important;
-    grid-template-columns:unset !important;
-    width:100%;padding:0;gap:0;flex-shrink:0;
-  }
-  /* Same mobile collapse for #label-panel — its desktop body.train-tab
-     `display:grid !important` rule would otherwise force a 2-column layout
-     on phones. Body.train-tab on mobile re-applies flex column. */
-  body.train-tab #label-panel{
-    display:flex !important;flex-direction:column !important;
-    grid-template-columns:unset !important;
-    width:100%;padding:0;gap:0;flex-shrink:0;overflow:auto;
-  }
-  #label-canvas-area{padding:0}
-  /* Sidebar cards STACK vertically on narrow screens. The previous
-     row+wrap-with-50%-cards layout looked OK in theory but the
-     calc(50% - 8px) gap-math made the right column slide past the
-     viewport (Train-model button got clipped), and tall buttons like
-     "Save & next" wrapped their text awkwardly. Single column kills both
-     bugs and gives every card the full width to breathe. */
-  #label-sidebar{
-    display:flex;flex-direction:column;
-    gap:8px;padding:10px;width:100%;overflow:visible;
-  }
-  #label-sidebar .card{flex:0 0 auto;width:100%;max-width:100%}
-  #feed-wrap{
-    width:100%;height:56vw;min-height:180px;
-    border-radius:0;border-left:none;border-right:none;border-top:none;flex-shrink:0;
-  }
-  #stats-panel{
-    display:flex;flex-direction:column;
-    gap:8px;padding:10px;width:100%;overflow:visible;flex-shrink:0;
-  }
-  #stats-panel .card{flex:0 0 auto;width:100%;max-width:100%}
-  #stats-panel #fish-list{max-height:160px}
-  #filmstrip{
-    width:100%;height:auto;min-height:100px;flex-shrink:0;
-  }
-  #snap-popover{ right:auto;left:0;width:calc(100vw - 20px);max-width:320px }
+  .mb-item { background: none; border: none; color: var(--dim); cursor: pointer; padding: 10px 16px; border-radius: 9px; }
+  .mb-item .ni-icon { width: 22px; height: 22px; }
+  .mb-item.on { color: var(--teal); background: rgba(0,229,204,.1); }
 }
-
-/* ── Sidebar ── */
-#sidebar{
-  grid-area:sidebar;
-  background:linear-gradient(180deg,#161d27 0%,#0f1820 100%);
-  border-right:1px solid var(--border);
-  display:flex;flex-direction:column;
-  padding:16px 0;
+@media (max-width: 560px) {
+  .tm-stat-row { grid-template-columns: repeat(2, 1fr); }
+  .db-stats { width: 100%; justify-content: space-between; }
 }
-.logo{
-  display:flex;align-items:center;gap:10px;
-  padding:0 18px 20px;
-  font-size:16px;font-weight:700;letter-spacing:1px;
-  background:linear-gradient(90deg,#f5c518,#00d4aa);
-  -webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;
-}
-.logo-icon{font-size:22px}
-.nav-section{
-  font-size:10px;letter-spacing:2px;color:var(--dim);
-  padding:14px 18px 6px;text-transform:uppercase;
-}
-.nav-item{
-  display:flex;align-items:center;gap:10px;
-  padding:9px 18px;cursor:pointer;border-radius:0;
-  color:var(--dim);transition:all 0.15s;font-size:13px;
-  border-left:3px solid transparent;
-}
-.nav-item:hover{background:rgba(255,255,255,0.04);color:var(--text)}
-.nav-item.active{color:var(--accent);border-left-color:var(--accent);background:linear-gradient(90deg,rgba(245,197,24,0.13) 0%,rgba(245,197,24,0.02) 100%)}
-.nav-icon{font-size:15px;width:18px;text-align:center}
-.nav-spacer{flex:1}
-.status-dot{
-  display:inline-block;width:7px;height:7px;border-radius:50%;
-  background:var(--teal);margin-right:6px;
-  animation:pulse 1.8s infinite;
-}
-@keyframes pulse{0%,100%{opacity:1;transform:scale(1)}50%{opacity:0.5;transform:scale(0.85)}}
-
-/* ── Topbar ── */
-#topbar{
-  grid-area:topbar;
-  background:linear-gradient(90deg,#161d27 0%,#131a23 100%);border-bottom:1px solid var(--border);
-  display:flex;align-items:center;justify-content:space-between;
-  padding:0 20px;
-}
-.topbar-left{display:flex;align-items:center;gap:14px}
-.page-title{font-size:15px;font-weight:600;color:var(--text)}
-#nav-toggle{
-  display:none;align-items:center;justify-content:center;
-  background:transparent;color:var(--text);border:1px solid var(--border);
-  width:32px;height:32px;border-radius:6px;font-size:16px;cursor:pointer;
-}
-#nav-toggle:hover{background:rgba(255,255,255,0.04)}
-.live-badge{
-  background:linear-gradient(90deg,rgba(0,212,170,0.18) 0%,rgba(0,212,170,0.06) 100%);color:var(--teal);
-  border:1px solid rgba(0,212,170,0.3);
-  padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;
-}
-.topbar-right{display:flex;align-items:center;gap:12px}
-#clock{color:var(--blue);font-family:var(--mono);font-size:13px}
-#uptime{color:var(--dim);font-size:11px}
-#snap-btn{
-  background:linear-gradient(135deg,#f5c518 0%,#d4a017 100%);color:#111;border:none;
-  padding:6px 14px;border-radius:6px;font-size:12px;font-weight:700;
-  cursor:pointer;transition:opacity 0.15s;letter-spacing:0.5px;
-}
-#snap-btn:hover{opacity:0.85}
-#snap-btn:active{opacity:0.7}
-#snap-wrap{position:relative}
-#snap-popover{
-  display:none;
-  position:absolute;top:calc(100% + 8px);right:0;
-  width:340px;
-  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);border-radius:8px;
-  padding:10px;z-index:50;
-  box-shadow:0 8px 32px rgba(0,0,0,0.7);
-}
-#snap-wrap:focus-within #snap-popover,
-#snap-wrap.open #snap-popover{display:block}
-#snap-pop-row{
-  display:flex;gap:6px;overflow-x:auto;
-  scrollbar-width:thin;scrollbar-color:var(--border) transparent;
-  padding-bottom:4px;
-}
-#snap-pop-empty{color:var(--dim);font-size:11px;text-align:center;padding:10px 0}
-.pop-thumb{
-  flex-shrink:0;width:100px;height:56px;border-radius:5px;overflow:hidden;
-  border:1px solid var(--border);cursor:pointer;position:relative;transition:border-color 0.15s;
-}
-.pop-thumb:hover{border-color:var(--accent)}
-.pop-thumb img{width:100%;height:100%;object-fit:cover}
-/* Always show the action buttons — :hover-only doesn't work on touch and
-   the user couldn't reach delete/download from a phone. */
-.pop-thumb .del{
-  position:absolute;top:2px;right:2px;
-  background:rgba(0,0,0,0.72);color:#fc5c65;border:none;
-  border-radius:3px;font-size:11px;line-height:1;padding:2px 5px;cursor:pointer;
-}
-.pop-thumb .dl{
-  position:absolute;top:2px;left:2px;
-  background:rgba(0,0,0,0.72);color:var(--teal);text-decoration:none;
-  border:1px solid rgba(0,212,170,0.4);
-  border-radius:3px;font-size:11px;line-height:1;padding:2px 5px;cursor:pointer;
-}
-.pop-thumb .dl:hover{background:rgba(0,212,170,0.25)}
-.pop-thumb .del:hover{background:rgba(252,92,101,0.25)}
-
-/* ── Main ── */
-#main{
-  grid-area:main;
-  display:grid;
-  grid-template-columns:1fr 200px;
-  gap:10px;padding:10px;
-  overflow:hidden;
-  /* Same explicit dark bg as #label-panel — guarantees the live page
-     reads as the page background everywhere, including under transparent
-     stats cards. */
-  background:#0e1117;
-  color-scheme:dark;
-}
-
-/* ── Label panel (Training tab) ── */
-/* The label page mirrors #main's layout exactly: 1fr canvas + 200px right
-   sidebar, same gap + padding. Switching tabs swaps which panel claims the
-   grid-area; the page never resizes and the chrome stays consistent.
-
-   Explicit `background:#0e1117` (the page gradient's middle tone) — the
-   body sets its own gradient, but without setting an explicit bg here
-   some browsers / forced-color modes were painting the panel white once
-   the inner card backgrounds were removed. Pinning a dark colour
-   guarantees the panel reads as page background under every browser. */
-#label-panel{
-  grid-area:main;
-  display:none;
-  grid-template-columns:1fr 200px;
-  gap:10px;padding:10px;
-  overflow:hidden;
-  background:#0e1117;
-  color-scheme:dark;
-}
-/* When the training tab is active, hide the live-feed grid and reveal the
-   labeling panel. Using a body class beats the mobile @media `!important`
-   on #main, which a plain inline `display:none` couldn't. */
-body.train-tab #main{display:none !important}
-body.train-tab #label-panel{display:grid !important}
-body.snaps-tab #main{display:none !important}
-body.snaps-tab #snaps-panel{display:flex !important}
-body.settings-tab #main{display:none !important}
-body.settings-tab #settings-panel{display:flex !important}
-body.analytics-tab #main{display:none !important}
-body.analytics-tab #analytics-panel{display:flex !important}
-
-/* ── Analytics tab ── */
-#analytics-panel{
-  grid-area:main;
-  display:none;flex-direction:column;gap:10px;
-  padding:14px 18px;overflow:auto;
-  background:#0e1117;color-scheme:dark;
-}
-#analytics-panel-inner{
-  width:100%;max-width:1100px;align-self:center;
-  display:flex;flex-direction:column;gap:12px;
-}
-#analytics-header{
-  display:flex;align-items:center;justify-content:space-between;gap:14px;
-  flex-wrap:wrap;
-}
-#analytics-title{font-size:15px;font-weight:700;color:var(--accent)}
-#analytics-version-row{
-  display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim);
-}
-#analytics-version-select{
-  background:#1a2130;color:var(--text);border:1px solid var(--border);
-  padding:5px 24px 5px 10px;border-radius:5px;font-size:12px;cursor:pointer;
-  appearance:none;-webkit-appearance:none;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a5568'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;background-position:right 8px center;
-  min-width:140px;
-}
-.analytics-section{
-  display:flex;flex-direction:column;gap:10px;
-  background:#0d141d;
-  border:1px solid var(--border);border-radius:10px;
-  padding:14px 16px;
-}
-.analytics-section-head{
-  font-size:13px;font-weight:700;color:var(--accent);
-}
-.analytics-section-sub{
-  display:flex;flex-direction:column;gap:6px;
-}
-.analytics-summary{
-  display:grid;grid-template-columns:repeat(auto-fit, minmax(140px, 1fr));
-  gap:10px;
-  border:1px solid var(--border);border-radius:8px;
-  padding:10px 14px;
-}
-.analytics-summary .stat-cell{display:flex;flex-direction:column;gap:2px}
-.analytics-summary .stat-cell .stat-lbl{
-  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);
-}
-.analytics-summary .stat-cell .stat-val{
-  font-family:var(--mono);font-size:14px;color:var(--text);
-}
-.analytics-empty{
-  color:var(--dim);font-size:13px;text-align:center;padding:24px 16px;
-  border:1px dashed var(--border);border-radius:8px;
-}
-.analytics-empty b{color:var(--text)}
-.analytics-empty code{
-  background:#0d141d;border:1px solid var(--border);
-  padding:1px 5px;border-radius:3px;font-family:var(--mono);font-size:11px;
-}
-#analytics-charts, #inference-charts{
-  display:grid;
-  grid-template-columns:repeat(auto-fill, minmax(260px, 1fr));
-  gap:12px;
-}
-#analytics-version-row{
-  display:flex;align-items:center;gap:8px;font-size:12px;color:var(--dim);
-  flex-wrap:wrap;
-}
-#inference-top-table{
-  width:100%;border-collapse:collapse;font-size:12px;font-family:var(--mono);
-}
-#inference-top-table th, #inference-top-table td{
-  text-align:right;padding:6px 10px;border-bottom:1px solid rgba(30,45,61,0.55);
-}
-#inference-top-table th{
-  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);
-  font-family:var(--font);font-weight:600;
-}
-#inference-top-table th:first-child, #inference-top-table td:first-child{text-align:left}
-#inference-top-table tbody tr:last-child td{border-bottom:none}
-
-/* ── Settings tab ── */
-/* Settings page: capped width so it doesn't stretch across a 4K monitor,
-   tight row heights, side-by-side Inference + Training sections on wide
-   screens so all controls fit in one viewport. */
-#settings-panel{
-  grid-area:main;
-  display:none;flex-direction:column;gap:10px;
-  padding:14px 18px;overflow:auto;
-  background:#0e1117;
-  color-scheme:dark;
-}
-#settings-panel-inner{
-  width:100%;max-width:1100px;align-self:center;
-  display:grid;grid-template-columns:repeat(2, minmax(0, 1fr));
-  gap:14px;
-}
-#settings-header{
-  grid-column:1 / -1;
-  display:flex;align-items:center;justify-content:space-between;
-}
-#settings-title{font-size:15px;font-weight:700;color:var(--accent)}
-.settings-section{
-  background:#0d141d;
-  border:1px solid var(--border);border-radius:10px;
-  padding:4px 14px;
-}
-.settings-section-title{
-  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;
-  color:var(--accent);font-weight:700;
-  padding:10px 0 6px;border-bottom:1px solid var(--border);margin-bottom:4px;
-}
-.settings-row{
-  display:flex;align-items:center;justify-content:space-between;gap:10px;
-  padding:7px 0;border-bottom:1px solid rgba(30,45,61,0.45);
-}
-.settings-row:last-child{border-bottom:none}
-.settings-lbl{color:var(--text);font-size:12px}
-.settings-control{
-  display:flex;align-items:center;gap:6px;justify-content:flex-end;
-  min-width:0;
-}
-.settings-row select{
-  background:#1a2130;color:var(--text);border:1px solid var(--border);
-  padding:4px 24px 4px 8px;border-radius:5px;font-size:12px;cursor:pointer;
-  appearance:none;-webkit-appearance:none;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a5568'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;background-position:right 8px center;
-  min-width:140px;max-width:200px;
-}
-.settings-row .toggle-btn{
-  background:#1a2130;color:var(--text);border:1px solid var(--border);
-  padding:4px 14px;border-radius:5px;font-size:11px;cursor:pointer;font-weight:600;
-  font-family:var(--font);min-width:60px;
-}
-.settings-row .toggle-btn.on{
-  background:linear-gradient(135deg,rgba(0,212,170,0.30) 0%,rgba(0,212,170,0.12) 100%);
-  border-color:var(--teal);color:var(--teal);
-}
-.settings-row .toggle-btn:hover{opacity:0.88}
-#settings-conf-slider{
-  -webkit-appearance:none;appearance:none;
-  height:4px;border-radius:2px;outline:none;cursor:pointer;
-  width:140px;
-  background:linear-gradient(to right,var(--accent) 0%,var(--accent) 35%,#1e2d3d 35%,#1e2d3d 100%);
-}
-#settings-conf-slider::-webkit-slider-thumb{
-  -webkit-appearance:none;width:13px;height:13px;border-radius:50%;
-  background:var(--accent);cursor:pointer;border:2px solid #0e1117;
-}
-#settings-conf-val{
-  font-family:var(--mono);font-size:11px;color:var(--accent);
-  width:34px;text-align:right;flex-shrink:0;
-}
-.settings-readonly{
-  font-family:var(--mono);color:var(--dim);font-size:11px;
-}
-#settings-min-labels{
-  background:#1a2130;color:var(--text);border:1px solid var(--border);
-  border-radius:5px;padding:3px 6px;font-size:11px;font-family:var(--mono);
-  width:60px;text-align:center;
-  -moz-appearance:textfield;
-}
-#settings-min-labels::-webkit-outer-spin-button,
-#settings-min-labels::-webkit-inner-spin-button{margin:0}
-#settings-label-count{color:var(--text)}
-
-@media (max-width: 900px){
-  #settings-panel-inner{grid-template-columns:1fr}
-}
-
-/* ── Snapshots tab ── */
-#snaps-panel{
-  grid-area:main;
-  display:none;flex-direction:column;gap:10px;padding:14px;
-  overflow:auto;
-}
-#snaps-header{
-  display:flex;align-items:center;justify-content:space-between;gap:12px;
-  padding:10px 14px;
-}
-#snaps-title{font-size:14px;font-weight:700;color:var(--accent)}
-#snaps-count-info{font-size:11px;color:var(--dim);font-family:var(--mono)}
-#snaps-grid-wrap{flex:1;min-height:0;padding:14px}
-#snaps-grid{
-  display:grid;
-  grid-template-columns:repeat(auto-fill, minmax(220px, 1fr));
-  gap:12px;
-}
-.snap-card{
-  background:#0d141d;border:1px solid var(--border);border-radius:8px;
-  overflow:hidden;display:flex;flex-direction:column;
-  transition:border-color 0.15s;
-}
-.snap-card:hover{border-color:var(--accent)}
-.snap-card img{
-  width:100%;aspect-ratio:16/9;object-fit:cover;cursor:pointer;
-  background:#000;
-}
-.snap-card-meta{
-  display:flex;align-items:center;justify-content:space-between;gap:8px;
-  padding:8px 10px;font-size:11px;color:var(--dim);
-}
-.snap-card-actions{display:flex;gap:6px;align-items:center}
-.snap-card-actions a, .snap-card-actions button{
-  background:#1a2130;border:1px solid var(--border);
-  border-radius:5px;padding:4px 9px;font-size:11px;cursor:pointer;
-  text-decoration:none;display:inline-flex;align-items:center;gap:4px;
-  font-family:var(--font);line-height:1;
-}
-.snap-card-actions a{color:var(--teal);border-color:rgba(0,212,170,0.4)}
-.snap-card-actions a:hover{background:rgba(0,212,170,0.15)}
-.snap-card-actions .del{color:var(--danger);border-color:rgba(252,92,101,0.4)}
-.snap-card-actions .del:hover{background:rgba(252,92,101,0.15)}
-#snaps-empty{color:var(--dim);font-size:13px;text-align:center;padding:30px}
-/* Dead rules from the old single-card label layout (#label-controls,
-   .label-model-wrap, #label-actions, #train-controls inline button) have
-   been removed — the new label page uses #label-sidebar + .card with
-   shared #label-sidebar select / #train-btn / .manual-btn-row rules. */
-
-/* ── Label page layout (mirrors Live Feed: feed-wrap + sidebar) ── */
-#label-canvas-area{
-  display:flex;flex-direction:column;gap:8px;
-  min-width:0;min-height:0;overflow:hidden;
-}
-#label-sidebar{
-  display:flex;flex-direction:column;gap:8px;overflow:hidden;
-}
-/* Cards on the Label-Fish sidebar use the page background, not the lighter
-   stats-panel gradient. The lighter gradient (#1a2130 → #141c26) sits
-   above the page bg (#0e1117) by ~5% lightness — enough that on a dark
-   monitor it reads as "white-ish blocks". Transparent fill + the existing
-   border-color keeps the card outline but lets the page colour through. */
-#label-sidebar .card{
-  background:#0d141d;
-  border:1px solid var(--border);border-radius:8px;padding:10px 12px;
-}
-#label-sidebar .card-title{
-  font-size:10px;letter-spacing:2px;text-transform:uppercase;
-  color:var(--dim);margin-bottom:8px;
-}
-#label-sidebar select,
-#label-sidebar #train-btn,
-#label-sidebar .manual-btn-row button{
-  width:100%;
-  background:#1a2130;color:var(--text);border:1px solid var(--border);
-  padding:7px 10px;border-radius:6px;font-size:12px;cursor:pointer;
-  font-family:var(--font);
-}
-#label-sidebar select{
-  appearance:none;-webkit-appearance:none;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a5568'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;background-position:right 10px center;
-  padding-right:24px;
-}
-#label-sidebar select:disabled,
-#label-sidebar #train-btn:disabled{opacity:0.55;cursor:not-allowed}
-.manual-btn-row{display:flex;gap:6px;margin-bottom:6px}
-.manual-btn-row:last-child{margin-bottom:0}
-.manual-btn-row #manual-save{
-  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);
-  color:#0e1117;border:none;font-weight:700;
-}
-.manual-btn-row #manual-add{
-  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);
-  color:#fff;border:none;font-weight:700;
-}
-#label-sidebar #train-btn{
-  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);
-  color:#fff;border:none;font-weight:700;
-}
-#label-sidebar #train-btn:disabled{
-  background:linear-gradient(135deg,#3a3a4a 0%,#2a2a35 100%);
-  color:#666;font-weight:600;
-}
-#label-saved-big{
-  display:flex;align-items:baseline;gap:8px;
-  font-family:var(--mono);
-}
-#label-saved-big #label-saved{
-  font-size:22px;font-weight:700;color:var(--text);
-}
-#label-saved-big #manual-streak{
-  color:var(--dim);font-size:11px;font-family:var(--font);
-}
-#train-eta-hint{
-  color:var(--dim);font-size:11px;margin:4px 0 8px;
-}
-/* Helper text under the disabled Train button. Shown only while the
-   threshold hasn't been reached; refreshTrainLabels toggles its display. */
-#train-enable-note{
-  margin-top:8px;
-  font-size:11px;line-height:1.45;color:var(--dim);
-}
-#train-enable-note a{color:var(--accent);text-decoration:none}
-#train-enable-note a:hover{text-decoration:underline}
-#manual-streak{color:var(--dim);font-weight:500;font-size:11px}
-/* Step-by-step instructions panel under the canvas. Collapsible — by
-   default only the title bar is visible (so it doesn't eat canvas space);
-   click the chevron to expand the four numbered steps, ✕ to dismiss
-   entirely for the session. Expanded-state persists across reloads. */
-#manual-hint{
-  background:#0d141d;border:1px solid var(--border);
-  border-radius:8px;
-  font-size:11.5px;color:var(--text);
-  flex-shrink:0;overflow:hidden;
-}
-#manual-hint.dismissed{display:none}
-#manual-hint .hint-title-bar{
-  display:flex;align-items:center;justify-content:space-between;gap:8px;
-  padding:6px 10px;
-}
-#manual-hint .hint-toggle{
-  display:inline-flex;align-items:center;gap:8px;
-  background:transparent;border:none;padding:0;cursor:pointer;
-  color:var(--dim);font-family:var(--font);
-  font-size:10px;letter-spacing:1.5px;text-transform:uppercase;font-weight:700;
-}
-#manual-hint .hint-toggle:hover{color:var(--text)}
-/* Default glyph is ▾ (chevron-down) so the affordance "click to expand
-   downward" is obvious at rest. On expand we rotate 180° → chevron-up
-   to mean "click to collapse". */
-#manual-hint .hint-chevron{
-  display:inline-block;color:var(--accent);
-  transition:transform 0.15s ease-out;
-  font-size:11px;line-height:1;
-}
-#manual-hint.expanded .hint-chevron{transform:rotate(180deg)}
-#manual-hint .hint-close{
-  background:transparent;border:none;cursor:pointer;
-  color:var(--dim);font-size:14px;line-height:1;padding:2px 6px;
-  border-radius:4px;
-}
-#manual-hint .hint-close:hover{
-  color:var(--danger);background:rgba(252,92,101,0.08);
-}
-#manual-hint .hint-steps{
-  display:none;
-  flex-direction:column;gap:6px;
-  padding:4px 12px 10px;
-  border-top:1px solid var(--border);
-  margin-top:2px;
-}
-#manual-hint.expanded .hint-steps{display:flex}
-#manual-hint .step{
-  display:flex;align-items:flex-start;gap:8px;line-height:1.45;
-}
-#manual-hint .step-num{
-  display:inline-flex;align-items:center;justify-content:center;
-  flex-shrink:0;
-  width:18px;height:18px;border-radius:50%;
-  background:rgba(245,197,24,0.18);color:var(--accent);
-  border:1px solid rgba(245,197,24,0.4);
-  font-family:var(--mono);font-size:10px;font-weight:700;
-  margin-top:1px;
-}
-#manual-hint .step b{color:var(--accent);font-weight:600}
-#manual-hint .step .kbd{
-  display:inline-block;
-  font-family:var(--mono);font-size:10.5px;color:var(--text);
-  background:#1a2130;border:1px solid var(--border);
-  border-radius:3px;padding:0 5px;line-height:1.4;
-  margin:0 2px;
-}
-@media (min-width: 1100px){
-  /* On wide layouts, lay the four steps in two columns so the expanded
-     panel doesn't dominate the canvas card. */
-  #manual-hint.expanded .hint-steps{
-    display:grid;
-    grid-template-columns:1fr 1fr;gap:6px 18px;
-  }
-}
-
-/* Canvas wrap is intentionally invisible: no border, no background, no
-   radius. The canvas IS the only visible content; any empty space (from
-   aspect-fit) shows the page gradient underneath, so there's nothing to
-   read as a frame or outline.
-
-   max-width caps the canvas at a readable size on ultrawide monitors —
-   same treatment as #feed-wrap so both pages have matching visual scale. */
-#manual-canvas-wrap{
-  position:relative;
-  flex:1;min-height:0;
-  background:transparent;border:0;border-radius:0;
-  overflow:hidden;
-  display:flex;align-items:center;justify-content:center;
-  max-width:1600px;width:100%;margin-inline:auto;
-}
-#manual-canvas{
-  max-width:100%;max-height:100%;
-  display:block;
-  touch-action:none;        /* let pointer events drive the drawing */
-  cursor:crosshair;
-}
-#manual-empty{
-  color:var(--dim);font-size:12px;text-align:center;padding:24px;
-}
-
-/* ── Training modal ── */
-/* ── Training-confirm modal ── */
-#train-confirm-overlay{
-  display:none;position:fixed;inset:0;background:rgba(0,0,0,0.78);
-  align-items:center;justify-content:center;z-index:300;padding:16px;
-}
-#train-confirm-overlay.open{display:flex}
-#train-confirm-card{
-  background:var(--card);border:1px solid var(--border);border-radius:12px;
-  padding:18px 20px;width:min(460px, 95vw);
-  display:flex;flex-direction:column;gap:12px;
-}
-#train-confirm-title{font-size:15px;font-weight:700;color:var(--accent)}
-#train-confirm-body{font-size:13px;color:var(--text);line-height:1.55}
-#train-confirm-body ul{margin:0;padding-left:20px}
-#train-confirm-body li{margin-bottom:4px}
-#train-confirm-body code{
-  background:#0d141d;border:1px solid var(--border);border-radius:4px;
-  padding:1px 5px;font-size:12px;color:var(--teal);
-}
-#train-confirm-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:4px}
-#train-confirm-actions button{
-  padding:8px 16px;border-radius:6px;font-size:13px;font-weight:600;cursor:pointer;
-}
-#tc-cancel{background:#1a2130;color:var(--fg);border:1px solid var(--border)}
-#tc-cancel:hover{background:rgba(255,255,255,0.04)}
-#tc-go{
-  background:linear-gradient(135deg,#7c4dff 0%,#5e35b1 100%);color:#fff;border:none;
-}
-#tc-go:hover{opacity:0.9}
-
-#train-overlay{
-  display:none;position:fixed;inset:0;background:rgba(0,0,0,0.85);
-  z-index:400;align-items:center;justify-content:center;backdrop-filter:blur(2px);
-}
-#train-overlay.open{display:flex}
-#train-card{
-  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);
-  border-radius:12px;padding:20px 22px;min-width:360px;
-  width:min(820px,94vw);max-width:820px;
-  box-shadow:0 16px 48px rgba(0,0,0,0.7);
-  display:flex;flex-direction:column;gap:10px;max-height:92vh;
-}
-#train-title{font-size:16px;font-weight:700;color:var(--accent)}
-#train-state-line{color:var(--text);font-size:13px}
-
-/* Two-stage progress block at the top of the modal. Stage 1 is the epoch
-   loop; stage 2 is the post-training TensorRT export (skipped on CPU/MPS
-   where there's nothing to export). */
-#train-stages{
-  display:flex;flex-direction:column;gap:8px;
-  background:rgba(255,255,255,0.02);
-  border:1px solid var(--border);border-radius:8px;padding:10px 12px;
-}
-.train-stage{display:flex;flex-direction:column;gap:5px}
-.train-stage-head{
-  display:flex;justify-content:space-between;align-items:center;
-  font-size:11px;color:var(--dim);letter-spacing:0.5px;
-}
-.train-stage-head .stage-name{color:var(--text);font-weight:600}
-.train-stage-head .stage-name .stage-tag{
-  display:inline-block;font-size:9px;padding:1px 5px;border-radius:8px;
-  margin-right:6px;background:#0d141d;border:1px solid var(--border);
-  color:var(--dim);font-weight:700;letter-spacing:1px;
-}
-.train-stage.active .stage-tag{
-  background:rgba(245,197,24,0.15);border-color:var(--accent);color:var(--accent);
-}
-.train-stage.done .stage-tag{
-  background:rgba(0,212,170,0.15);border-color:var(--teal);color:var(--teal);
-}
-.train-stage.skipped .stage-tag{
-  background:rgba(74,85,104,0.15);color:var(--dim);
-}
-.train-stage-bar-wrap{
-  background:#0d141d;border:1px solid var(--border);
-  border-radius:4px;height:8px;overflow:hidden;position:relative;
-}
-.train-stage-bar{
-  height:100%;width:0%;
-  background:linear-gradient(90deg,#7c4dff,#00d4aa);
-  transition:width 0.4s;
-}
-/* Indeterminate animation for the export stage (no % available). */
-.train-stage-bar-wrap.indeterminate .train-stage-bar{
-  width:100% !important;
-  background:linear-gradient(90deg,
-    rgba(124,77,255,0.15) 0%, rgba(124,77,255,0.85) 25%,
-    rgba(0,212,170,0.85) 50%, rgba(124,77,255,0.85) 75%,
-    rgba(124,77,255,0.15) 100%);
-  background-size:200% 100%;
-  animation:train-stripes 1.4s linear infinite;
-}
-.train-stage.done .train-stage-bar{width:100%;background:var(--teal)}
-.train-stage.skipped .train-stage-bar{background:#2a3a4a;width:100%}
-@keyframes train-stripes{0%{background-position:200% 0}100%{background-position:-200% 0}}
-
-#train-info{display:grid;grid-template-columns:repeat(4,1fr);gap:6px 14px;font-size:11px}
-#train-info .stat-lbl{font-size:10px}
-#train-info .stat-val{font-family:var(--mono);font-size:12px}
-
-/* Tab strip below the progress / stats block. */
-#train-tabs{
-  display:flex;gap:4px;border-bottom:1px solid var(--border);
-  margin-top:2px;
-}
-.train-tab{
-  background:transparent;color:var(--dim);
-  border:none;
-  border-radius:6px 6px 0 0;
-  font-size:12px;cursor:pointer;
-  font-family:var(--font);position:relative;top:1px;
-}
-.train-tab:hover{color:var(--text)}
-.train-tab.active{
-  color:var(--accent);
-  background:#0d141d;
-}
-.train-tab-pane{display:none;flex-direction:column;gap:10px;flex:1;min-height:0}
-.train-tab-pane.active{display:flex}
-
-/* Charts pane: responsive grid of small cards with real breathing room.
-   `auto-fill, minmax(...)` means the layout grows with chart count — the
-   pane stays usable whether there are 4 charts or 8. Vertical overflow
-   scrolls so adding charts never overflows the modal. */
-#train-pane-charts.active{display:grid}
-#train-pane-charts{
-  grid-template-columns:repeat(auto-fill, minmax(260px, 1fr));
-  gap:12px;
-  overflow-y:auto;
-  align-content:start;
-  flex:1;min-height:0;
-  padding-right:4px;  /* room for the scrollbar without overlapping cards */
-}
-@media (max-width: 700px){
-  #train-pane-charts{grid-template-columns:1fr}
-}
-
-/* Chart cards inside the Charts pane. */
-.train-chart-card{
-  background:#0a0f15;border:1px solid var(--border);border-radius:6px;
-  padding:8px 10px;display:flex;flex-direction:column;gap:4px;
-}
-.train-chart-head{
-  display:flex;align-items:center;justify-content:space-between;
-  font-size:10px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);
-}
-.train-chart-head .chart-now{
-  font-family:var(--mono);color:var(--text);text-transform:none;letter-spacing:0;
-  font-size:11px;
-}
-.train-chart-card canvas{width:100%;display:block}
-.train-chart-empty{color:var(--dim);font-style:italic;font-size:11px;padding:8px 0}
-.train-chart-legend{
-  display:flex;gap:12px;flex-wrap:wrap;font-size:10px;color:var(--dim);
-}
-.train-chart-legend .swatch{
-  display:inline-block;width:9px;height:9px;border-radius:2px;
-  margin-right:4px;vertical-align:middle;
-}
-
-#train-log-wrap{
-  background:#0a0f15;border:1px solid var(--border);border-radius:6px;
-  padding:8px 10px;
-  font-family:var(--mono);font-size:11px;line-height:1.45;color:#9fb3c8;
-  height:260px;overflow:auto;white-space:pre-wrap;word-break:break-word;
-  flex:1;min-height:0;
-}
-#train-log-wrap.empty{color:var(--dim);font-style:italic}
-
-#train-msg{color:var(--dim);font-size:11px}
-#train-actions{display:flex;gap:10px;justify-content:flex-end}
-#train-actions button{
-  border:1px solid var(--border);background:#1a2130;color:var(--text);
-  padding:7px 14px;border-radius:6px;font-size:12px;cursor:pointer;font-family:var(--font);
-}
-#train-cancel{color:var(--danger);border-color:rgba(252,92,101,0.4)}
-#train-actions button:hover{opacity:0.85}
-
-@media (max-width: 700px){
-  #train-info{grid-template-columns:repeat(2,1fr)}
-  #train-card{padding:16px 14px}
-  #train-log-wrap{height:200px}
-}
-
-/* ── Inference-disabled overlay on the live feed ── */
-#start-inference-btn{
-  position:absolute;top:14px;right:14px;z-index:14;
-  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;
-  border:none;border-radius:6px;padding:10px 16px;
-  font-size:13px;font-weight:700;cursor:pointer;
-  box-shadow:0 4px 14px rgba(0,212,170,0.35);
-}
-#start-inference-btn:hover{opacity:0.92}
-#start-inference-btn:disabled{opacity:0.55;cursor:not-allowed}
-
-#feed-disabled{
-  position:absolute;inset:0;background:rgba(0,0,0,0.78);
-  z-index:5;display:flex;align-items:center;justify-content:center;
-}
-.feed-disabled-card{
-  text-align:center;padding:20px 26px;max-width:300px;
-  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);
-  border:1px solid var(--border);border-radius:10px;
-}
-.feed-disabled-title{font-size:15px;font-weight:700;color:var(--accent);margin-bottom:6px}
-.feed-disabled-msg{color:var(--dim);font-size:11px;line-height:1.5}
-
-/* ── Feed ── */
-#feed-wrap{
-  position:relative;
-  /* Match Label-Fish's canvas wrap exactly: invisible (no bg/border/
-     radius). The MJPEG image IS the visible content; any aspect-fit
-     gutter shows the page bg underneath, so there's no visible frame. */
-  background:transparent;border:0;border-radius:0;
-  overflow:hidden;
-  display:flex;align-items:center;justify-content:center;
-  /* Cap horizontal stretch on ultrawide monitors so the camera image
-     stays readable instead of swimming in a 3000px letterbox band. */
-  max-width:1600px;width:100%;margin-inline:auto;
-}
-#feed{max-width:100%;max-height:100%;object-fit:contain;display:block}
-.corner{position:absolute;width:20px;height:20px;border-color:var(--teal);border-style:solid;opacity:0.6}
-.tl{top:8px;left:8px;border-width:2px 0 0 2px;border-radius:2px 0 0 2px}
-.tr{top:8px;right:8px;border-width:2px 2px 0 0;border-radius:0 2px 0 0}
-.bl{bottom:8px;left:8px;border-width:0 0 2px 2px;border-radius:0 0 0 2px}
-.br{bottom:8px;right:8px;border-width:0 2px 2px 0;border-radius:0 0 2px 0}
-.scanlines{
-  position:absolute;inset:0;pointer-events:none;
-  background:repeating-linear-gradient(to bottom,transparent 0 3px,rgba(0,0,0,0.07) 3px 4px);
-}
-#stream-expired{
-  display:none;position:absolute;inset:0;z-index:6;
-  background:rgba(0,0,0,0.82);backdrop-filter:blur(2px);
-  align-items:center;justify-content:center;
-}
-#stream-expired.show{display:flex}
-.expired-card{
-  text-align:center;padding:22px 28px;max-width:280px;
-  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);
-  border:1px solid var(--border);border-radius:10px;
-  box-shadow:0 8px 32px rgba(0,0,0,0.6);
-}
-.expired-title{font-size:16px;font-weight:700;color:var(--accent);margin-bottom:6px}
-.expired-msg{color:var(--dim);font-size:11px;margin-bottom:14px;line-height:1.5}
-.expired-card button{
-  background:linear-gradient(135deg,var(--teal) 0%,#00a88a 100%);color:#0e1117;
-  border:none;padding:8px 18px;border-radius:6px;
-  font-size:12px;font-weight:700;cursor:pointer;font-family:var(--font);
-}
-.expired-card button:hover{opacity:0.85}
-
-/* ── Stats panel ── */
-#stats-panel{
-  display:flex;flex-direction:column;gap:8px;overflow:hidden;
-}
-/* Same override as #label-sidebar .card — drop the lighter gradient so
-   the stats cards on Live Feed match Label-Fish's transparent-fill look
-   (just an outline against the page bg). */
-#stats-panel .card{background:#0d141d}
-.card{
-  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);
-  border-radius:8px;padding:12px;
-}
-.card-title{
-  font-size:10px;letter-spacing:2px;text-transform:uppercase;
-  color:var(--dim);margin-bottom:10px;
-}
-.big-stat{
-  display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;
-}
-.big-val{font-size:22px;font-weight:700;font-family:var(--mono)}
-.big-label{font-size:10px;color:var(--dim)}
-.fps-val{color:var(--teal)}
-.active-val{color:var(--blue)}
-.fps-bar-wrap{background:#111;border-radius:3px;height:4px;margin-bottom:10px}
-.fps-bar{height:4px;border-radius:3px;transition:width 0.5s,background 0.5s}
-.stat-row{display:flex;justify-content:space-between;margin-bottom:5px;font-size:12px}
-.stat-lbl{color:var(--dim)}
-.stat-val{color:var(--text);font-family:var(--mono)}
-.tag{
-  display:inline-block;padding:1px 7px;border-radius:10px;font-size:10px;
-}
-.tag-on{background:linear-gradient(90deg,rgba(0,212,170,0.22) 0%,rgba(0,212,170,0.08) 100%);color:var(--teal);border:1px solid rgba(0,212,170,0.3)}
-.tag-off{background:linear-gradient(90deg,rgba(74,85,104,0.25) 0%,rgba(74,85,104,0.08) 100%);color:var(--dim);border:1px solid var(--border)}
-#enhance-btn{
-  width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
-  background:linear-gradient(135deg,rgba(0,212,170,0.10) 0%,rgba(0,212,170,0.03) 100%);color:var(--teal);
-  font-size:12px;cursor:pointer;transition:all 0.15s;font-family:var(--font);
-  margin-bottom:6px;
-}
-#enhance-btn:hover{background:linear-gradient(135deg,rgba(0,212,170,0.22) 0%,rgba(0,212,170,0.08) 100%)}
-#enhance-btn.on{background:linear-gradient(135deg,rgba(0,212,170,0.30) 0%,rgba(0,212,170,0.12) 100%);border-color:var(--teal)}
-/* Confidence slider card */
-#conf-card{margin-bottom:0}
-.conf-title-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:10px}
-.conf-title-row .card-title{margin-bottom:0}
-#conf-val{font-family:var(--mono);font-size:12px;color:var(--accent)}
-.conf-row{display:flex;align-items:center;gap:6px}
-/* Resolution + Model dropdowns */
-#res-select, #model-select, #label-model-select{
-  width:100%;padding:7px 10px;border-radius:6px;border:1px solid var(--border);
-  background:linear-gradient(135deg,#1a2130 0%,#141c26 100%);color:var(--text);
-  font-size:12px;font-family:var(--font);cursor:pointer;outline:none;
-  appearance:none;-webkit-appearance:none;
-  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%234a5568'/%3E%3C/svg%3E");
-  background-repeat:no-repeat;background-position:right 10px center;
-  padding-right:28px;
-}
-#conf-slider{
-  flex:1;-webkit-appearance:none;appearance:none;
-  height:4px;border-radius:2px;outline:none;cursor:pointer;
-  background:linear-gradient(to right,var(--accent) 0%,var(--accent) 35%,#1e2d3d 35%,#1e2d3d 100%);
-}
-#conf-slider::-webkit-slider-thumb{
-  -webkit-appearance:none;width:14px;height:14px;border-radius:50%;
-  background:var(--accent);cursor:pointer;border:2px solid #0e1117;
-  box-shadow:0 0 4px rgba(245,197,24,0.5);
-}
-#conf-slider::-moz-range-thumb{
-  width:14px;height:14px;border-radius:50%;border:2px solid #0e1117;
-  background:var(--accent);cursor:pointer;
-}
-#conf-val{font-family:var(--mono);font-size:12px;color:var(--accent);width:30px;text-align:right;flex-shrink:0}
-#reset-btn{
-  width:100%;padding:7px;border-radius:6px;border:1px solid var(--border);
-  background:linear-gradient(135deg,rgba(252,92,101,0.12) 0%,rgba(252,92,101,0.04) 100%);color:var(--danger);
-  font-size:12px;cursor:pointer;transition:background 0.15s;font-family:var(--font);
-}
-#reset-btn:hover{background:linear-gradient(135deg,rgba(252,92,101,0.24) 0%,rgba(252,92,101,0.08) 100%)}
-
-/* Fish list */
-#fish-list{flex:1;overflow-y:auto;display:flex;flex-direction:column;gap:4px;scrollbar-width:thin;scrollbar-color:var(--border) transparent}
-.fish-card{
-  background:linear-gradient(145deg,#1a2130 0%,#141c26 100%);border:1px solid var(--border);border-radius:6px;
-  padding:7px 9px;transition:border-color 0.2s;
-}
-.fish-card.alive{border-left:3px solid var(--teal);background:linear-gradient(90deg,rgba(0,212,170,0.08) 0%,#141c26 60%)}
-.fish-card.dead{border-left:3px solid var(--border);opacity:0.55}
-.fish-id{font-size:12px;font-weight:600;color:var(--text);font-family:var(--mono)}
-.fish-meta{font-size:10px;color:var(--dim);margin-top:2px}
-
-/* ── Filmstrip ── */
-#filmstrip{
-  grid-area:filmstrip;
-  background:linear-gradient(180deg,#0f1820 0%,#161d27 100%);border-top:1px solid var(--border);
-  padding:10px 14px;display:flex;flex-direction:column;gap:8px;overflow:hidden;
-}
-.film-header{
-  display:flex;align-items:center;justify-content:space-between;
-}
-.film-title{font-size:11px;letter-spacing:2px;text-transform:uppercase;color:var(--dim)}
-.film-count{font-size:11px;color:var(--accent);font-family:var(--mono)}
-#snap-row{
-  display:flex;gap:8px;overflow-x:auto;flex:1;
-  scrollbar-width:thin;scrollbar-color:var(--border) transparent;
-  padding-bottom:4px;
-}
-.snap-thumb{
-  flex-shrink:0;width:140px;height:79px;
-  border-radius:6px;overflow:hidden;border:1px solid var(--border);
-  position:relative;cursor:pointer;transition:border-color 0.2s;
-}
-.snap-thumb:hover{border-color:var(--accent)}
-.snap-thumb img{width:100%;height:100%;object-fit:cover}
-.snap-label{
-  position:absolute;bottom:0;left:0;right:0;
-  background:linear-gradient(to top,rgba(0,0,0,0.85) 0%,transparent 100%);color:var(--text);
-  font-size:9px;padding:6px 5px 3px;font-family:var(--mono);
-}
-.snap-empty{color:var(--dim);font-size:12px;padding-top:20px}
-
-/* Modal */
-#modal{
-  display:none;position:fixed;inset:0;
-  background:rgba(0,0,0,0.85);z-index:100;
-  align-items:center;justify-content:center;
-}
-#modal.open{display:flex}
-#modal img{max-width:90vw;max-height:85vh;border-radius:8px;border:1px solid var(--border)}
-#modal-close{
-  position:absolute;top:20px;right:24px;
-  background:none;border:none;color:var(--text);font-size:24px;cursor:pointer;
-}
-
-/* Fullscreen video overlay */
-#fs-overlay{
-  display:none;position:fixed;inset:0;
-  background:#000;z-index:300;
-  align-items:center;justify-content:center;
-}
-#fs-overlay.open{display:flex}
-#fs-overlay img{
-  width:100%;height:100%;object-fit:contain;
-}
-#fs-close{
-  position:absolute;top:14px;right:14px;
-  background:rgba(0,0,0,0.65);color:#fff;
-  border:1px solid rgba(255,255,255,0.25);border-radius:50%;
-  width:38px;height:38px;font-size:18px;
-  cursor:pointer;display:flex;align-items:center;justify-content:center;
-  z-index:301;transition:background 0.15s;
-}
-#fs-close:hover{background:rgba(255,255,255,0.15)}
-#feed-wrap{cursor:pointer}
 </style>
-</head><body>
-
-<!-- Sidebar -->
-<nav id="sidebar">
-  <div class="logo"><span class="logo-icon">🐟</span>AquaScope</div>
-
-  <div class="nav-section">Monitor</div>
-  <div class="nav-item active" id="nav-live" onclick="switchTab('live')"><span class="nav-icon">📹</span>Live Feed</div>
-  <div class="nav-item" id="nav-analytics" onclick="switchTab('analytics')"><span class="nav-icon">📊</span>Analytics</div>
-  <div class="nav-item" id="nav-snaps" onclick="switchTab('snaps')"><span class="nav-icon">🖼️</span>Snapshots</div>
-
-  <div class="nav-section">Training</div>
-  <div class="nav-item" id="nav-train" onclick="switchTab('train')"><span class="nav-icon">🏷️</span>Label Fish</div>
-
-  <div class="nav-section">System</div>
-  <div class="nav-item" id="nav-settings" onclick="switchTab('settings')"><span class="nav-icon">⚙️</span>Settings</div>
-
-  <div class="nav-spacer"></div>
-  <div class="nav-item" style="margin-bottom:6px">
-    <span class="status-dot"></span>
-    <span id="conn-status">Connected</span>
-  </div>
-</nav>
-
-<!-- Topbar -->
-<header id="topbar">
-  <div class="topbar-left">
-    <button id="nav-toggle" onclick="toggleNav()" aria-label="Open navigation">☰</button>
-    <div class="page-title">Live Feed</div>
-    <div class="live-badge">● LIVE</div>
-  </div>
-  <div class="topbar-right">
-    <span id="uptime" style="color:var(--dim);font-size:11px"></span>
-    <span id="clock"></span>
-    <div id="snap-wrap" style="position:relative">
-      <button id="snap-btn" onclick="takeSnap()">📷 Snapshot</button>
-      <div id="snap-popover">
-        <div id="snap-pop-row"></div>
-        <div id="snap-pop-empty">No snapshots yet</div>
-      </div>
-    </div>
-  </div>
-</header>
-
-<!-- Main -->
-<main id="main">
-  <!-- Feed -->
-  <div id="feed-wrap">
-    <img id="feed" src="/stream" alt="live">
-    <div class="corner tl"></div>
-    <div class="corner tr"></div>
-    <div class="corner bl"></div>
-    <div class="corner br"></div>
-    <div class="scanlines"></div>
-    <div id="feed-disabled" style="display:none">
-      <div class="feed-disabled-card">
-        <div class="feed-disabled-title">⏸ Inference paused</div>
-        <div class="feed-disabled-msg">Training is using the GPU. The live feed will resume automatically when training completes.</div>
-      </div>
-    </div>
-    <div id="stream-expired">
-      <div class="expired-card">
-        <div class="expired-title">⏸ Stream paused</div>
-        <div class="expired-msg">3-minute session limit reached.<br>Refresh the page to keep streaming.</div>
-        <button onclick="location.reload()">↻ Refresh</button>
-      </div>
-    </div>
-    <!-- Shown after the user toggles labeling off — one tap to kill any
-         lingering training process and snap inference back to the user-tuned
-         confidence threshold. -->
-    <button id="start-inference-btn" onclick="startInferencing(event)" style="display:none">
-      ▶ Start inferencing
-    </button>
-  </div>
-
-  <!-- Stats -->
-  <div id="stats-panel">
-    <!-- FPS + Active -->
-    <div class="card">
-      <div class="card-title">Detection</div>
-      <div class="big-stat">
-        <div>
-          <div class="big-val fps-val" id="s-fps">--</div>
-          <div class="big-label">FPS</div>
-        </div>
-        <div style="text-align:right">
-          <div class="big-val active-val" id="s-active">--</div>
-          <div class="big-label">Active</div>
-        </div>
-      </div>
-      <div class="fps-bar-wrap"><div class="fps-bar" id="fps-bar"></div></div>
-      <div class="stat-row"><span class="stat-lbl">Total IDs</span><span class="stat-val" id="s-total">--</span></div>
-      <div class="stat-row"><span class="stat-lbl">Frame</span><span class="stat-val" id="s-frame">--</span></div>
-    </div>
-
-
-    <!-- Fish list -->
-    <div class="card" style="flex:1;overflow:hidden;display:flex;flex-direction:column">
-      <div class="card-title">Fish Activity</div>
-      <div id="fish-list"></div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Resolution</div>
-      <select id="res-select" onchange="setResolution(this.value)">
-        <option value="480p">480p &nbsp;(854×480)</option>
-        <option value="720p">720p &nbsp;(1280×720)</option>
-        <option value="1080p" selected>1080p (1920×1080)</option>
-      </select>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Model</div>
-      <select id="model-select" onchange="setModel(this.value)">
-        <option>loading…</option>
-      </select>
-    </div>
-
-    <div class="card" id="conf-card">
-      <div class="conf-title-row">
-        <div class="card-title">Confidence</div>
-        <span id="conf-val">35%</span>
-      </div>
-      <div class="conf-row">
-        <input id="conf-slider" type="range" min="5" max="95" step="5" value="35" oninput="onConfSlider(this.value)">
-      </div>
-    </div>
-    <button id="enhance-btn" onclick="toggleEnhance()">✨ Enhance: OFF</button>
-    <button id="reset-btn" onclick="doReset()">↺ Reset Trails</button>
-  </div>
-</main>
-
-<!-- Label panel (Label Fish tab) — same grid as #main: 1fr canvas + 200px
-     right sidebar of cards. The canvas wrap and the sidebar mirror Live
-     Feed exactly so flipping tabs doesn't change page chrome. -->
-<main id="label-panel">
-  <div id="label-canvas-area">
-    <div id="manual-canvas-wrap">
-      <canvas id="manual-canvas" style="display:none"></canvas>
-      <div id="manual-empty">Waiting for a live frame… start the live feed if it's stopped, then come back.</div>
-    </div>
-    <div id="manual-hint">
-      <div class="hint-title-bar">
-        <button class="hint-toggle" onclick="toggleManualHint()" aria-expanded="false">
-          <span class="hint-chevron">▾</span>
-          How to label this frame
-        </button>
-        <button class="hint-close" onclick="dismissManualHint()"
-                title="Hide these instructions" aria-label="Hide instructions">✕</button>
-      </div>
-      <div class="hint-steps">
-        <div class="step">
-          <span class="step-num">1</span>
-          <span>Tap the red <b>✕</b> on any predicted box that isn't a fish.</span>
-        </div>
-        <div class="step">
-          <span class="step-num">2</span>
-          <span><b>Click + drag</b> on a fish the model missed to draw a new box. (On touch: tap once to drop a box, then drag the corners.)</span>
-        </div>
-        <div class="step">
-          <span class="step-num">3</span>
-          <span>Refine: drag corners to <b>resize</b>, the <b>✋</b> in the middle to <b>move</b>. Use <span class="kbd">+ Add another</span> when you need multiple boxes per frame.</span>
-        </div>
-        <div class="step">
-          <span class="step-num">4</span>
-          <span>Hit <span class="kbd">Save &amp; next</span> to commit the labels and pull a fresh frame. The <b>Saved</b> counter on the right ticks up — when it hits the threshold, <b>Train model</b> unlocks.</span>
-        </div>
-      </div>
-    </div>
-  </div>
-
-  <div id="label-sidebar">
-    <div class="card">
-      <div class="card-title">Detection model</div>
-      <select id="label-model-select" onchange="setModel(this.value)">
-        <option>loading…</option>
-      </select>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Labels saved</div>
-      <div id="label-saved-big">
-        <span id="label-saved">0/5</span>
-        <span id="manual-streak"></span>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Label this frame</div>
-      <select id="manual-class" title="Class for the box you're currently drawing" style="margin-bottom:8px">
-        <option value="0">fish</option>
-        <option value="1">shrimp</option>
-      </select>
-      <div class="manual-btn-row">
-        <button id="manual-add" onclick="manualAddBox()">+ Add</button>
-        <button id="manual-clear" onclick="clearManualBox()">Clear</button>
-      </div>
-      <div class="manual-btn-row">
-        <button id="manual-skip" onclick="manualNextFrame()">Skip</button>
-        <button id="manual-save" onclick="saveManualLabel()">Save &amp; next</button>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">Train model</div>
-      <select id="train-epochs" onchange="onEpochsChange()" title="Number of training epochs" style="margin-bottom:6px">
-        <option value="5" selected>5 epochs</option>
-        <option value="10">10 epochs</option>
-        <option value="15">15 epochs</option>
-        <option value="20">20 epochs</option>
-        <option value="30">30 epochs</option>
-        <option value="50">50 epochs</option>
-      </select>
-      <div id="train-eta-hint">—</div>
-      <button id="train-btn" disabled onclick="confirmTraining()">🧠 Train model</button>
-      <div id="train-enable-note">
-        Training unlocks once you've saved the labels currently set in
-        <a href="javascript:switchTab('settings')">Settings</a>.
-      </div>
-    </div>
-  </div>
-</main>
-
-<!-- Analytics panel -->
-<main id="analytics-panel">
-  <div id="analytics-panel-inner">
-    <div id="analytics-header">
-      <div id="analytics-title">📊 Analytics</div>
-    </div>
-
-    <!-- Inference activity (from fish_logs/*.json) -->
-    <div class="analytics-section">
-      <div class="analytics-section-head">🐟 Live inference activity</div>
-      <div id="inference-summary" class="analytics-summary">
-        <div class="stat-cell"><span class="stat-lbl">Snapshot</span><span class="stat-val" id="in-ts">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Total frames</span><span class="stat-val" id="in-frames">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Unique IDs</span><span class="stat-val" id="in-unique">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Active right now</span><span class="stat-val" id="in-active">—</span></div>
-      </div>
-      <div id="inference-empty" class="analytics-empty" style="display:none">
-        No inference logs yet — the tracker writes
-        <code>fish_logs/fish_stats_*.json</code> every ~60 s while running.
-      </div>
-      <div id="inference-charts"></div>
-      <div id="inference-top" class="analytics-section-sub" style="display:none">
-        <div class="analytics-section-head" style="font-size:11px">Top fish by frame count (most recent snapshot)</div>
-        <table id="inference-top-table">
-          <thead>
-            <tr><th>Track #</th><th>Frames</th><th>Distance (px)</th><th>Seen for</th></tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </div>
-    </div>
-
-    <!-- Training history (per saved model version) -->
-    <div class="analytics-section">
-      <div class="analytics-section-head">🧠 Training runs</div>
-      <div id="analytics-version-row">
-        <label for="analytics-version-select">Model version</label>
-        <select id="analytics-version-select" onchange="loadAnalyticsModel(this.value)">
-          <option>loading…</option>
-        </select>
-      </div>
-      <div id="analytics-empty" class="analytics-empty">
-        No training history yet. Train a model from the
-        <a href="javascript:switchTab('train')" style="color:var(--accent)">Label Fish</a>
-        tab and a per-version summary will appear here.
-      </div>
-      <div id="analytics-summary" class="analytics-summary" style="display:none">
-        <div class="stat-cell"><span class="stat-lbl">Version</span><span class="stat-val" id="an-version">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Final state</span><span class="stat-val" id="an-state">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Epochs</span><span class="stat-val" id="an-epochs">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Final loss</span><span class="stat-val" id="an-loss">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Final mAP@50</span><span class="stat-val" id="an-map50">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Precision</span><span class="stat-val" id="an-precision">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Recall</span><span class="stat-val" id="an-recall">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Elapsed</span><span class="stat-val" id="an-elapsed">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Dataset</span><span class="stat-val" id="an-dataset">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Device</span><span class="stat-val" id="an-device">—</span></div>
-        <div class="stat-cell"><span class="stat-lbl">Image size</span><span class="stat-val" id="an-imgsz">—</span></div>
-      </div>
-      <div id="analytics-charts"></div>
-    </div>
-  </div>
-</main>
-
-<!-- Snapshots panel -->
-<main id="snaps-panel">
-  <div class="card" id="snaps-header">
-    <div id="snaps-title">🖼️ Snapshots</div>
-    <div id="snaps-count-info">0 saved</div>
-  </div>
-  <div class="card" id="snaps-grid-wrap">
-    <div id="snaps-grid"></div>
-    <div id="snaps-empty">No snapshots yet — tap 📷 in the topbar to capture one.</div>
-  </div>
-</main>
-
-<!-- Settings panel: capped at 1100px wide so it doesn't sprawl across
-     ultrawide displays. Inference + Training render side-by-side as
-     two .settings-section columns on screens ≥ 900px; they stack on
-     phones via the @media collapse. -->
-<main id="settings-panel">
-  <div id="settings-panel-inner">
-    <div id="settings-header">
-      <div id="settings-title">⚙️ Settings</div>
-    </div>
-
-    <div class="settings-section">
-      <div class="settings-section-title">📹 Inference</div>
-      <div class="settings-row">
-        <label class="settings-lbl">Detection model</label>
-        <div class="settings-control">
-          <select id="settings-model-select" onchange="setModel(this.value)">
-            <option>loading…</option>
-          </select>
-        </div>
-      </div>
-      <div class="settings-row">
-        <label class="settings-lbl">Resolution</label>
-        <div class="settings-control">
-          <select id="settings-res-select" onchange="setResolution(this.value)">
-            <option value="480p">480p (854×480)</option>
-            <option value="720p">720p (1280×720)</option>
-            <option value="1080p" selected>1080p (1920×1080)</option>
-          </select>
-        </div>
-      </div>
-      <div class="settings-row">
-        <label class="settings-lbl">Confidence</label>
-        <div class="settings-control">
-          <input id="settings-conf-slider" type="range" min="5" max="95" step="5" value="35" oninput="onSettingsConfSlider(this.value)">
-          <span id="settings-conf-val">35%</span>
-        </div>
-      </div>
-      <div class="settings-row">
-        <label class="settings-lbl">Trails</label>
-        <button class="toggle-btn" id="settings-trails-btn" onclick="toggleTrails()">OFF</button>
-      </div>
-      <div class="settings-row">
-        <label class="settings-lbl">Underwater enhance</label>
-        <button class="toggle-btn" id="settings-enhance-btn" onclick="toggleEnhance()">OFF</button>
-      </div>
-    </div>
-
-    <div class="settings-section">
-      <div class="settings-section-title">🧠 Training</div>
-      <div class="settings-row">
-        <label class="settings-lbl">Model (for labeling)</label>
-        <div class="settings-control">
-          <select id="settings-label-model-select" onchange="setModel(this.value)">
-            <option>loading…</option>
-          </select>
-        </div>
-      </div>
-      <div class="settings-row">
-        <label class="settings-lbl">Epochs</label>
-        <div class="settings-control">
-          <select id="settings-train-epochs" onchange="onSettingsEpochsChange(this.value)">
-            <option value="5" selected>5 epochs</option>
-            <option value="10">10 epochs</option>
-            <option value="15">15 epochs</option>
-            <option value="20">20 epochs</option>
-            <option value="30">30 epochs</option>
-            <option value="50">50 epochs</option>
-          </select>
-        </div>
-      </div>
-      <div class="settings-row">
-        <label class="settings-lbl">Saved labels</label>
-        <div class="settings-control">
-          <span class="settings-readonly" id="settings-label-count">0</span>
-          <span class="settings-readonly" style="color:var(--dim)">/</span>
-          <input id="settings-min-labels" type="number" min="1" max="1000" step="1"
-                 value="5" onchange="onMinLabelsChange(this.value)"
-                 title="Minimum labels required before training is enabled">
-        </div>
-      </div>
-    </div>
-  </div>
-</main>
-
-<!-- Filmstrip -->
-<footer id="filmstrip">
-  <div class="film-header">
-    <div class="film-title">Snapshots</div>
-    <div class="film-count" id="snap-count">0</div>
-  </div>
-  <div id="snap-row"><div class="snap-empty" id="snap-empty">No snapshots yet — press 📷 to capture</div></div>
-</footer>
-
-<!-- Modal lightbox -->
-<div id="modal">
-  <button id="modal-close" onclick="closeModal()">✕</button>
-  <img id="modal-img" src="" alt="snapshot">
-</div>
-
-<!-- Fullscreen video overlay -->
-<div id="fs-overlay">
-  <button id="fs-close" onclick="closeFeed()">✕</button>
-  <img id="fs-feed" src="" alt="fullscreen feed">
-</div>
-
-<!-- Training-confirm modal: replaces the native window.confirm() so the
-     details (label count, ETA band, epochs, output path) get a real card
-     instead of an OS-styled alert that's hard to read on mobile. -->
-<div id="train-confirm-overlay">
-  <div id="train-confirm-card">
-    <div id="train-confirm-title">🧠 Train a new model?</div>
-    <div id="train-confirm-body">
-      <ul>
-        <li>Labels saved: <b id="tc-labels">—</b></li>
-        <li>Epochs: <b id="tc-epochs">—</b></li>
-        <li>Estimated time: <b id="tc-eta">—</b></li>
-        <li>Inference will pause on the GPU while training runs.</li>
-        <li>On success, <code>models/best_v&lt;N&gt;.engine</code> appears
-            in the Model dropdown.</li>
-      </ul>
-    </div>
-    <div id="train-confirm-actions">
-      <button id="tc-cancel" onclick="closeTrainConfirm()">Cancel</button>
-      <button id="tc-go" onclick="startTrainingConfirmed()">Start training</button>
-    </div>
-  </div>
-</div>
-
-<!-- Training progress modal -->
-<div id="train-overlay">
-  <div id="train-card">
-    <div id="train-title">🧠 Training model</div>
-    <div id="train-state-line">starting…</div>
-
-    <!-- Top: two-stage progress -->
-    <div id="train-stages">
-      <div class="train-stage" id="train-stage1">
-        <div class="train-stage-head">
-          <span class="stage-name"><span class="stage-tag">STAGE 1</span>Epochs</span>
-          <span id="train-stage1-text">—</span>
-        </div>
-        <div class="train-stage-bar-wrap"><div class="train-stage-bar" id="train-stage1-bar"></div></div>
-      </div>
-      <div class="train-stage" id="train-stage2">
-        <div class="train-stage-head">
-          <span class="stage-name"><span class="stage-tag">STAGE 2</span>TensorRT engine export</span>
-          <span id="train-stage2-text">pending</span>
-        </div>
-        <div class="train-stage-bar-wrap"><div class="train-stage-bar" id="train-stage2-bar"></div></div>
-      </div>
-    </div>
-
-    <!-- Compact stats row -->
-    <div id="train-info">
-      <div><span class="stat-lbl">Epoch</span> <span class="stat-val" id="train-epoch">—</span> / <span id="train-total">—</span></div>
-      <div><span class="stat-lbl">Elapsed</span> <span class="stat-val" id="train-elapsed">—</span></div>
-      <div><span class="stat-lbl">ETA</span> <span class="stat-val" id="train-eta">—</span></div>
-      <div><span class="stat-lbl">Version</span> <span class="stat-val" id="train-version">—</span></div>
-    </div>
-
-    <!-- Tab strip -->
-    <div id="train-tabs">
-      <button class="train-tab active" data-tab="charts" onclick="setTrainTab('charts')">📊 Charts</button>
-      <button class="train-tab"        data-tab="logs"   onclick="setTrainTab('logs')">📜 Logs</button>
-    </div>
-
-    <!-- Charts pane: cards are rendered dynamically from TRAIN_CHARTS so
-         the total number of charts is variable — add to the config and a
-         new card appears in the grid (which scrolls when it overflows). -->
-    <div id="train-pane-charts" class="train-tab-pane active"></div>
-
-    <!-- Logs pane -->
-    <div id="train-pane-logs" class="train-tab-pane">
-      <div id="train-log-wrap" class="empty">waiting for training subprocess output…</div>
-    </div>
-
-    <div id="train-msg">Inference is paused while training runs.</div>
-    <div id="train-actions">
-      <button id="train-cancel" onclick="cancelTraining()">Cancel</button>
-      <button id="train-close" onclick="closeTrainModal()" style="display:none">Close</button>
-    </div>
-  </div>
-</div>
-
-
+</head>
+<body>
+<div id="app-bg"></div>
+<div id="root"></div>
 <script>
-let startTime = Date.now();
+/* ============================================================
+   AquaScope — Neural Tank Monitor (vanilla, self-contained)
+   Cyber/lab dashboard. Wired to the real stream.py endpoints
+   where they exist; Analytics + AI Insights are simulated.
+   ============================================================ */
+(function () {
+'use strict';
 
-function doReset() {
-  fetch('/reset').then(() => {
-    document.getElementById('fish-list').innerHTML = '';
-  });
-}
+/* ── tiny hyperscript (HTML + SVG) ── */
+var SVG_NS = 'http://www.w3.org/2000/svg';
+var SVG_TAGS = new Set(['svg','path','circle','rect','line','text','g','defs',
+  'linearGradient','radialGradient','stop','ellipse','polyline','polygon','animate']);
 
-// Mirror a boolean state into the matching Settings toggle button so the
-// Settings tab always reflects the live value.
-function _syncSettingsToggle(key, on) {
-  const btn = document.getElementById('settings-' + key + '-btn');
-  if (!btn) return;
-  btn.classList.toggle('on', !!on);
-  btn.textContent = on ? 'ON' : 'OFF';
-}
-
-function toggleTrails() {
-  // Trails lives only in Settings now — there's no Live-Feed-sidebar
-  // button to update; just sync the Settings toggle.
-  fetch('/trails').then(r => r.json()).then(d => {
-    _syncSettingsToggle('trails', d.trails);
-  });
-}
-
-// ── Resolution dropdown ──────────────────────────────────
-function setResolution(val) {
-  fetch('/resolution?v=' + encodeURIComponent(val));
-}
-
-// ── Model dropdown ───────────────────────────────────────
-function setModel(val) {
-  fetch('/model?v=' + encodeURIComponent(val))
-    .finally(() => loadModels());   // re-sync both dropdowns to the same value
-}
-
-function loadModels() {
-  fetch('/models').then(r => r.json()).then(d => {
-    // Populate every model dropdown on the page (live feed + labeling tab)
-    // from the same /models response so they stay in sync.
-    const selects = document.querySelectorAll(
-      '#model-select, #label-model-select, #settings-model-select, #settings-label-model-select');
-    if (!selects.length) return;
-    const models = d.models || [];
-    const currentBase = (d.current || '').split('/').pop();
-    selects.forEach(sel => {
-      sel.innerHTML = '';
-      if (!models.length) {
-        const opt = document.createElement('option');
-        opt.textContent = '(no models found)';
-        opt.disabled = true;
-        sel.appendChild(opt);
-        return;
-      }
-      models.forEach(m => {
-        const base = m.split('/').pop();
-        const opt = document.createElement('option');
-        opt.value = base;
-        opt.textContent = m;
-        if (base === currentBase) opt.selected = true;
-        sel.appendChild(opt);
-      });
-    });
-  });
-}
-
-// ── Confidence slider ────────────────────────────────────
-let _confDebounce = null;
-
-function _sendConf(pct) {
-  clearTimeout(_confDebounce);
-  _confDebounce = setTimeout(() => {
-    fetch('/conf?v=' + (pct / 100).toFixed(2));
-  }, 120);
-}
-
-function _updateConfUI(pct) {
-  const slider = document.getElementById('conf-slider');
-  const fill = Math.round((pct - 5) / 90 * 100); // map [5,95] → [0,100]%
-  slider.value = pct;
-  slider.style.background =
-    'linear-gradient(to right,var(--accent) 0%,var(--accent) ' + fill + '%,#1e2d3d ' + fill + '%,#1e2d3d 100%)';
-  document.getElementById('conf-val').textContent = pct + '%';
-  // Mirror to Settings.
-  const sSlider = document.getElementById('settings-conf-slider');
-  if (sSlider) {
-    sSlider.value = pct;
-    sSlider.style.background = slider.style.background;
-  }
-  const sVal = document.getElementById('settings-conf-val');
-  if (sVal) sVal.textContent = pct + '%';
-}
-
-function onConfSlider(val) {
-  const pct = parseInt(val, 10);
-  _updateConfUI(pct);
-  _sendConf(pct);
-}
-
-// Settings slider drives the same handler — single source of truth.
-function onSettingsConfSlider(val) {
-  onConfSlider(val);
-}
-
-function toggleEnhance() {
-  fetch('/enhance').then(r => r.json()).then(d => {
-    const btn = document.getElementById('enhance-btn');
-    btn.textContent = '✨ Enhance: ' + (d.enhance ? 'ON' : 'OFF');
-    btn.classList.toggle('on', d.enhance);
-    _syncSettingsToggle('enhance', d.enhance);
-  });
-}
-
-// ── Snapshot state ──────────────────────────────────────
-let snapList = [];
-
-function addThumb(s) {
-  const url = '/screenshots/' + s.filename;
-  // Popover thumb
-  const popRow = document.getElementById('snap-pop-row');
-  const popEmpty = document.getElementById('snap-pop-empty');
-  popEmpty.style.display = 'none';
-  const pt = document.createElement('div');
-  pt.className = 'pop-thumb';
-  pt.dataset.file = s.filename;
-  pt.innerHTML =
-    '<img src="' + url + '">' +
-    '<a class="dl" href="' + url + '" download="' + s.filename + '" title="Download">⬇</a>' +
-    '<button class="del" onclick="deleteSnap(event,\'' + s.filename + '\')">✕</button>';
-  pt.querySelector('img').onclick = () => openModal(url);
-  // Download click shouldn't bubble up to the popover-toggle / image-open
-  // handlers — let the browser handle the <a download> directly.
-  pt.querySelector('.dl').addEventListener('click', e => e.stopPropagation());
-  popRow.prepend(pt);
-
-  // Filmstrip thumb
-  const row = document.getElementById('snap-row');
-  const empty = document.getElementById('snap-empty');
-  empty.style.display = 'none';
-  const ft = document.createElement('div');
-  ft.className = 'snap-thumb';
-  ft.dataset.file = s.filename;
-  ft.innerHTML = '<img src="' + url + '" loading="lazy"><div class="snap-label">' + s.label + '</div>';
-  ft.onclick = () => openModal(url);
-  row.prepend(ft);
-
-  document.getElementById('snap-count').textContent = snapList.length;
-  // Keep the Snapshots tab in sync without forcing a full poll.
-  if (document.body.classList.contains('snaps-tab')) renderSnapsGrid();
-}
-
-function takeSnap() {
-  const btn = document.getElementById('snap-btn');
-  const wrap = document.getElementById('snap-wrap');
-  // Open the popover immediately. Previously we only added .open after the
-  // /screenshot response returned, so a slow capture or any failure left the
-  // popover closed and the user couldn't see existing snapshots at all.
-  wrap.classList.add('open');
-  btn.disabled = true;
-  btn.textContent = '⏳';
-  fetch('/screenshot').then(r => r.json()).then(d => {
-    btn.textContent = '✓';
-    if (d && d.filename) {
-      const s = {filename: d.filename, ts: d.filename.replace('snap_','').replace('.jpg',''), label: 'Snap ' + d.filename.slice(9,15)};
-      snapList.unshift(s);
-      addThumb(s);
-    }
-    setTimeout(() => { btn.textContent = '📷 Snapshot'; btn.disabled = false; }, 1200);
-  }).catch(() => { btn.textContent = '📷 Snapshot'; btn.disabled = false; });
-}
-
-// Click outside the wrap closes the popover. Clicks inside (thumbs,
-// download/delete buttons, the button itself) are handled by their own
-// handlers and don't toggle the popover here.
-document.addEventListener('click', e => {
-  if (!document.getElementById('snap-wrap').contains(e.target))
-    document.getElementById('snap-wrap').classList.remove('open');
-});
-
-function deleteSnap(e, filename) {
-  e.stopPropagation();
-  snapList = snapList.filter(s => s.filename !== filename);
-  document.querySelectorAll('[data-file="' + filename + '"]').forEach(el => el.remove());
-  document.getElementById('snap-count').textContent = snapList.length;
-  if (!snapList.length) {
-    document.getElementById('snap-empty').style.display = '';
-    document.getElementById('snap-pop-empty').style.display = '';
-    const sg = document.getElementById('snaps-empty');
-    if (sg) sg.style.display = '';
-  }
-  const info = document.getElementById('snaps-count-info');
-  if (info) info.textContent = snapList.length + ' saved';
-}
-
-function openModal(url) {
-  document.getElementById('modal-img').src = url;
-  document.getElementById('modal').classList.add('open');
-}
-function closeModal() {
-  document.getElementById('modal').classList.remove('open');
-}
-document.getElementById('modal').addEventListener('click', e => {
-  if (e.target === document.getElementById('modal')) closeModal();
-});
-
-function loadSnapshots() {
-  fetch('/screenshots').then(r => r.json()).then(list => {
-    if (list.length === snapList.length) return; // no change
-    // sync any new entries added by other clients
-    const existing = new Set(snapList.map(s => s.filename));
-    list.forEach(s => {
-      if (!existing.has(s.filename)) {
-        snapList.unshift(s);
-        addThumb(s);
-      }
-    });
-  });
-}
-
-function fpsColor(fps) {
-  if (fps >= 20) return '#00d4aa';
-  if (fps >= 12) return '#f5c518';
-  return '#fc5c65';
-}
-
-function updateStats(d) {
-  const fps = d.fps ?? 0;
-  document.getElementById('s-fps').textContent    = fps.toFixed(1);
-  document.getElementById('s-active').textContent = d.active ?? '--';
-  document.getElementById('s-total').textContent  = d.total_ids ?? '--';
-  document.getElementById('s-frame').textContent  = (d.frame ?? 0).toLocaleString();
-  if (d.resolution) {
-    const sel = document.getElementById('res-select');
-    if (sel.value !== d.resolution) sel.value = d.resolution;
-    const sSel = document.getElementById('settings-res-select');
-    if (sSel && sSel.value !== d.resolution) sSel.value = d.resolution;
-  }
-
-  const bar = document.getElementById('fps-bar');
-  bar.style.width = Math.min(fps / 30 * 100, 100) + '%';
-  bar.style.background = fpsColor(fps);
-
-  // Fish list
-  const fish = d.fish ?? {};
-  const now  = Date.now() / 1000;
-  const list = document.getElementById('fish-list');
-  list.innerHTML = '';
-  Object.entries(fish)
-    .sort((a, b) => (b[1].last_seen_ts ?? 0) - (a[1].last_seen_ts ?? 0))
-    .slice(0, 10)
-    .forEach(([id, f]) => {
-      const alive = now - (f.last_seen_ts ?? 0) < 2;
-      const dist  = Math.round(f.total_distance_px ?? 0);
-      const div = document.createElement('div');
-      div.className = 'fish-card ' + (alive ? 'alive' : 'dead');
-      div.innerHTML =
-        '<div class="fish-id">Fish #' + id + (alive ? ' <span style="color:var(--teal);font-size:9px">●</span>' : '') + '</div>' +
-        '<div class="fish-meta">' + dist + 'px &nbsp;|&nbsp; ' + f.frame_count + ' frames</div>';
-      list.appendChild(div);
-    });
-}
-
-function tick() {
-  const now = new Date();
-  document.getElementById('clock').textContent = now.toLocaleTimeString();
-  const ms = Date.now() - startTime;
-  const s = Math.floor(ms/1000), m = Math.floor(s/60), h = Math.floor(m/60);
-  document.getElementById('uptime').textContent =
-    'UP ' + (h ? h+'h ' : '') + (m%60 ? (m%60)+'m ' : '') + (s%60) + 's';
-
-  fetch('/stats').then(r => r.json()).then(updateStats).catch(() => {
-    document.getElementById('conn-status').textContent = 'Reconnecting…';
-  });
-}
-
-setInterval(tick, 1000);
-setInterval(loadSnapshots, 2000);
-tick();
-loadSnapshots();
-loadModels();
-
-// ── Training / Label tab ─────────────────────────────────
-let labelTabActive = false;
-
-function switchTab(tab) {
-  labelTabActive = (tab === 'train');
-  // Toggle body classes instead of inline display, because the mobile
-  // @media rule on #main uses !important (needed to override the
-  // later-in-source desktop grid rule), which inline styles can't beat.
-  const body = document.body;
-  body.classList.toggle('train-tab',     tab === 'train');
-  body.classList.toggle('snaps-tab',     tab === 'snaps');
-  body.classList.toggle('settings-tab',  tab === 'settings');
-  body.classList.toggle('analytics-tab', tab === 'analytics');
-  document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
-  const navMap = {
-    live: 'nav-live', train: 'nav-train', snaps: 'nav-snaps',
-    settings: 'nav-settings', analytics: 'nav-analytics',
-  };
-  const navId = navMap[tab];
-  if (navId) {
-    const el = document.getElementById(navId);
-    if (el) el.classList.add('active');
-  }
-  // Close the mobile nav drawer once a tab is picked.
-  body.classList.remove('nav-open');
-  if (tab === 'train')     manualActivate();
-  if (tab === 'snaps')     renderSnapsGrid();
-  if (tab === 'settings')  syncSettingsFromInline();
-  if (tab === 'analytics') {
-    loadAnalyticsVersions();
-    loadInferenceHistory();
-    // Refresh the live-inference section every 30 s while the tab stays
-    // open; the training-history section is static once loaded.
-    if (_inferenceRefreshTimer) clearInterval(_inferenceRefreshTimer);
-    _inferenceRefreshTimer = setInterval(() => {
-      if (document.body.classList.contains('analytics-tab')) {
-        loadInferenceHistory();
-      } else if (_inferenceRefreshTimer) {
-        clearInterval(_inferenceRefreshTimer);
-        _inferenceRefreshTimer = 0;
-      }
-    }, 30000);
-  } else if (_inferenceRefreshTimer) {
-    clearInterval(_inferenceRefreshTimer);
-    _inferenceRefreshTimer = 0;
-  }
-}
-
-// Copy live state from the inline (Live Feed / Label) controls into the
-// Settings tab so it always opens reflecting current values. After this
-// initial sync, both sides stay aligned because the Settings controls call
-// the same handlers (setModel, setResolution, onConfSlider, toggle*) that
-// already update the inline UI.
-function syncSettingsFromInline() {
-  const copy = (srcId, dstId) => {
-    const s = document.getElementById(srcId);
-    const d = document.getElementById(dstId);
-    if (s && d && d.value !== s.value) d.value = s.value;
-  };
-  copy('res-select',    'settings-res-select');
-  copy('train-epochs',  'settings-train-epochs');
-  // Confidence: re-run the UI updater so slider value, fill gradient, and
-  // both labels match.
-  const conf = document.getElementById('conf-slider');
-  if (conf) _updateConfUI(parseInt(conf.value, 10));
-  // Toggles
-  ['trails', 'enhance'].forEach(k => {
-    const src = document.getElementById(k + '-btn');
-    if (src) _syncSettingsToggle(k, src.classList.contains('on'));
-  });
-  // Read-only: saved labels + ETA come from refreshTrainLabels(); kick it
-  // so the Settings readouts are fresh on tab open.
-  if (typeof refreshTrainLabels === 'function') refreshTrainLabels();
-}
-
-// Build a grid of all current snapshots in the Snapshots tab. Cheap
-// enough at the cap (50) to fully re-render on every change rather than
-// reconcile a diff. Each card has open / download / delete actions.
-function renderSnapsGrid() {
-  const grid  = document.getElementById('snaps-grid');
-  const empty = document.getElementById('snaps-empty');
-  const info  = document.getElementById('snaps-count-info');
-  if (!grid) return;
-  grid.innerHTML = '';
-  if (info) info.textContent = snapList.length + (snapList.length === 1 ? ' saved' : ' saved');
-  if (!snapList.length) {
-    if (empty) empty.style.display = '';
-    return;
-  }
-  if (empty) empty.style.display = 'none';
-  for (const s of snapList) {
-    const url = '/screenshots/' + s.filename;
-    const card = document.createElement('div');
-    card.className = 'snap-card';
-    card.dataset.file = s.filename;
-    card.innerHTML =
-      '<img src="' + url + '" loading="lazy" alt="' + s.filename + '">' +
-      '<div class="snap-card-meta">' +
-        '<span>' + s.label + '</span>' +
-        '<span class="snap-card-actions">' +
-          '<a href="' + url + '" download="' + s.filename + '" title="Download">⬇</a>' +
-          '<button class="del" type="button" title="Delete">✕</button>' +
-        '</span>' +
-      '</div>';
-    card.querySelector('img').onclick = () => openModal(url);
-    card.querySelector('.del').onclick = (e) => deleteSnap(e, s.filename);
-    grid.appendChild(card);
-  }
-}
-
-function toggleNav() {
-  document.body.classList.toggle('nav-open');
-}
-// Tap outside the drawer to dismiss it.
-document.addEventListener('click', (e) => {
-  if (!document.body.classList.contains('nav-open')) return;
-  const sb = document.getElementById('sidebar');
-  const tg = document.getElementById('nav-toggle');
-  if (sb && !sb.contains(e.target) && tg && !tg.contains(e.target)) {
-    document.body.classList.remove('nav-open');
-  }
-});
-
-function startInferencing(e) {
-  if (e && e.stopPropagation) e.stopPropagation();   // don't open fullscreen feed
-  const btn = document.getElementById('start-inference-btn');
-  if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
-  // Cancel any leftover trainer subprocess (no-op if none), then ack the
-  // post-training pause so the tracker re-acquires camera + model.
-  fetch('/train/cancel').catch(() => {}).finally(() => {
-    fetch('/train/acknowledge').catch(() => {}).finally(() => {
-      setFeedDisabled(false);
-      const feed = document.getElementById('feed');
-      if (feed && !streamExpired) feed.src = '/stream?t=' + Date.now();
-      if (btn) {
-        btn.style.display = 'none';
-        btn.disabled = false;
-        btn.textContent = '▶ Start inferencing';
-      }
-    });
-  });
-}
-
-// ── Manual label modal ────────────────────────────────────
-//
-// One box per modal session. Pointer model handles both mouse and touch via
-// the unified Pointer Events API:
-//   - Empty canvas, mouse:  pointerdown/move/up = drag-to-draw a new box
-//   - Empty canvas, touch:  pointerdown drops a default-sized box
-//   - Existing box:         pointerdown on a corner handle = resize that corner
-//                           pointerdown on the center hand = move
-//   - Saving issues GET /label/manual?class=…&cx,cy,w,h=… and the backend
-//     captures the *current* _frame as the image, so the saved label always
-//     matches what the user sees.
-let manualImg    = null;   // Image() of the snapped frame
-let manualBoxes  = [];     // frozen boxes for the CURRENT frame: [{x,y,w,h,cls}, ...]
-let manualBox    = null;   // ACTIVE editable box {x,y,w,h} or null (no class yet —
-                           // class is taken from the dropdown when it's frozen)
-let manualMode   = 'idle'; // 'drawing' | 'moving' | 'tl' | 'tr' | 'bl' | 'br' | 'idle'
-let manualLast   = null;   // last pointer pos (img-coords) used by 'moving'
-let manualSavedCount = 0;  // images saved during this manual session — reset on close
-const MANUAL_CLASS_NAMES = ['fish', 'shrimp'];
-const MANUAL_HANDLE_PX = 18;  // hit radius around corner handles in canvas-coords
-const MANUAL_HAND_PX   = 28;  // hit radius around the center ✋ handle
-const MANUAL_CLOSE_PX  = 32;  // size of the ✕ close button drawn over each frozen box
-
-// Compute the canvas-space rect of the ✕ button drawn on a frozen box `b`.
-// Kept in one place so draw + hit-test agree. The ✕ sits *inside* the
-// top-right of the box rather than half-outside, because anchoring it
-// outside meant a box flush with the canvas top clamped its ✕ to y=0,
-// which visually merged with the toolbar above the canvas ("close button
-// on top of menu items"). Inside-anchored means the button always lives
-// over the box itself — no clamping, no toolbar collision.
-function manualCloseRect(b) {
-  const cv = document.getElementById('manual-canvas');
-  const sz = Math.max(MANUAL_CLOSE_PX, Math.round((cv ? cv.width : 1000) / 50));
-  const cvW = cv ? cv.width : 0, cvH = cv ? cv.height : 0;
-  // Normalize negative-size boxes so we always operate on the visible rect.
-  let bx = b.x, by = b.y, bw = b.w, bh = b.h;
-  if (bw < 0) { bx += bw; bw = -bw; }
-  if (bh < 0) { by += bh; bh = -bh; }
-  const inset = Math.max(2, Math.round(sz / 6));
-  let cx = bx + bw - sz - inset;
-  let cy = by + inset;
-  // For boxes smaller than the button itself, fall back to top-right
-  // outside-corner so the ✕ is still visible and tappable.
-  if (bw < sz + inset * 2 || bh < sz + inset * 2) {
-    cx = bx + bw - sz / 2;
-    cy = by - sz / 2;
-  }
-  cx = Math.max(0, Math.min(cvW - sz, cx));
-  cy = Math.max(0, Math.min(cvH - sz, cy));
-  return { x: cx, y: cy, w: sz, h: sz };
-}
-
-// Snap the latest live frame onto the manual-label canvas. Used both to open
-// the modal and to advance to the next frame after each save (the modal stays
-// open until the user clicks ✕ — that's the "manual labeling stays default
-// for consecutive frames" behavior).
-function manualLoadFrame(opts) {
-  opts = opts || {};
-  // Load the JPEG and the latest model boxes in parallel — the boxes are
-  // pre-filled into manualBoxes so the user only has to ✕ wrong ones and add
-  // missed ones, instead of redrawing every fish from scratch.
-  const framePromise = fetch('/label/snap?t=' + Date.now()).then(r => {
-    if (!r.ok) throw new Error('no frame');
-    return r.blob();
-  });
-  const predsPromise = fetch('/label/predictions?t=' + Date.now())
-    .then(r => r.ok ? r.json() : { boxes: [], img_w: 0, img_h: 0 })
-    .catch(() => ({ boxes: [], img_w: 0, img_h: 0 }));
-
-  return Promise.all([framePromise, predsPromise]).then(([blob, preds]) => {
-    return new Promise((resolve, reject) => {
-      const url = URL.createObjectURL(blob);
-      const img = new Image();
-      img.onload = () => {
-        manualImg = img;
-        manualBox = null;
-        manualMode = 'idle';
-        const cv = document.getElementById('manual-canvas');
-        const empty = document.getElementById('manual-empty');
-        cv.width  = img.naturalWidth;
-        cv.height = img.naturalHeight;
-        cv.style.display = '';
-        if (empty) empty.style.display = 'none';
-        // Pre-fill predicted boxes. Scale them if the prediction frame dims
-        // don't match the snapped frame dims (e.g. resolution just changed,
-        // or the JPEG encoder padded). Strict equality used to drop boxes
-        // entirely on the slightest dim drift, which made the predicted
-        // close buttons never appear for the user.
-        manualBoxes = [];
-        if (preds && Array.isArray(preds.boxes) && preds.boxes.length
-            && preds.img_w > 0 && preds.img_h > 0) {
-          const sx = img.naturalWidth  / preds.img_w;
-          const sy = img.naturalHeight / preds.img_h;
-          for (const p of preds.boxes) {
-            const x = Math.max(0, p.x1 * sx);
-            const y = Math.max(0, p.y1 * sy);
-            const w = Math.max(1, (p.x2 - p.x1) * sx);
-            const h = Math.max(1, (p.y2 - p.y1) * sy);
-            manualBoxes.push({ x, y, w, h, cls: p.cls | 0, predicted: true });
-          }
-        }
-        drawManualCanvas();
-        URL.revokeObjectURL(url);
-        resolve();
-      };
-      img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('decode failed')); };
-      img.src = url;
-    });
-  });
-}
-
-function manualUpdateStreak() {
-  const el = document.getElementById('manual-streak');
-  if (!el) return;
-  el.textContent = manualSavedCount > 0 ? `(${manualSavedCount} saved this session)` : '';
-}
-
-// Activate the inline labeling card (called from switchTab when the user
-// ── "How to label this frame" disclosure ─────────────────
-//
-// The hint card defaults to collapsed (title bar only) so it doesn't eat
-// canvas space. The user can:
-//   - Click the title bar to expand/collapse — choice persists across
-//     reloads via localStorage ('manualHintExpanded').
-//   - Click the ✕ to dismiss for this session — it'll come back on the
-//     next page load, so users who haven't yet seen the instructions
-//     don't miss them on a future visit.
-function _hintEl() { return document.getElementById('manual-hint'); }
-
-function toggleManualHint() {
-  const el = _hintEl();
-  if (!el) return;
-  const expanded = !el.classList.contains('expanded');
-  el.classList.toggle('expanded', expanded);
-  const btn = el.querySelector('.hint-toggle');
-  if (btn) btn.setAttribute('aria-expanded', String(expanded));
-  try { localStorage.setItem('manualHintExpanded', expanded ? '1' : '0'); }
-  catch (_) {}
-}
-
-function dismissManualHint() {
-  const el = _hintEl();
-  if (el) el.classList.add('dismissed');
-}
-
-// Restore expand-state once, at module load.
-(function _initManualHint(){
-  try {
-    const v = localStorage.getItem('manualHintExpanded');
-    if (v === '1') {
-      const el = _hintEl();
-      if (el) {
-        el.classList.add('expanded');
-        const btn = el.querySelector('.hint-toggle');
-        if (btn) btn.setAttribute('aria-expanded', 'true');
-      }
-    }
-  } catch (_) {}
-})();
-
-// opens the Label tab). Loads the latest frame + predictions; if no frame
-// is available yet, leaves the placeholder visible so the user knows why.
-function manualActivate() {
-  manualSavedCount = 0;
-  manualUpdateStreak();
-  return manualLoadFrame().catch(() => {
-    // No frame yet — keep the placeholder visible.
-    const cv = document.getElementById('manual-canvas');
-    const empty = document.getElementById('manual-empty');
-    if (cv) cv.style.display = 'none';
-    if (empty) empty.style.display = '';
-  });
-}
-
-function manualNextFrame() {
-  // Skip the current frame without saving — useful when the snapped frame
-  // has nothing worth labeling.
-  manualLoadFrame().catch(() => {});
-}
-
-// "Clear" pops what the user drew most recently:
-//   - active box first (the one with handles), or
-//   - if there's no active box, the last frozen box from manualBoxes.
-// This lets the user undo step-by-step without nuking everything.
-function clearManualBox() {
-  if (manualBox) {
-    manualBox = null;
-  } else if (manualBoxes.length > 0) {
-    manualBoxes.pop();
-  }
-  manualMode = 'idle';
-  drawManualCanvas();
-}
-
-// Validate the active box and freeze it into manualBoxes with the currently
-// selected class, then reset the active box so the user can draw the next one.
-function manualAddBox() {
-  if (!manualBox) {
-    alert('Draw a box first, then tap "+ Add another".');
-    return;
-  }
-  let {x, y, w, h} = manualBox;
-  if (w < 0) { x += w; w = -w; }
-  if (h < 0) { y += h; h = -h; }
-  if (w < 6 || h < 6) {
-    alert('Box too small — draw a bigger one before adding.');
-    return;
-  }
-  const cls = parseInt(document.getElementById('manual-class').value, 10) || 0;
-  manualBoxes.push({ x, y, w, h, cls });
-  manualBox = null;
-  manualMode = 'idle';
-  drawManualCanvas();
-}
-
-function drawManualCanvas() {
-  const cv = document.getElementById('manual-canvas');
-  if (!cv || !manualImg) return;
-  const ctx = cv.getContext('2d');
-  ctx.drawImage(manualImg, 0, 0);
-  const lineW = Math.max(2, Math.round(cv.width / 480));
-  // 1) Frozen boxes — drawn dimmer, no handles, with a ✕ close button at
-  //    the top-right. Predicted boxes (teal) are intentionally minimal:
-  //    a thin outline + the ✕ only. The underlying JPEG already has the
-  //    tracker's "Fish #X (NN%)" tag baked in, so adding our own class
-  //    label here just duplicates the tag and crowds the canvas.
-  //    User-drawn boxes (purple) keep their class label since there's
-  //    nothing else on the frame telling the user what class they picked.
-  for (const b of manualBoxes) {
-    const isPred = !!b.predicted;
-    const stroke = isPred ? '#00d4aa' : '#7c4dff';
-    const fillTr = isPred ? 'rgba(0, 212, 170, 0.08)' : 'rgba(124, 77, 255, 0.10)';
-    ctx.lineWidth = isPred ? Math.max(1, Math.round(lineW * 0.6)) : lineW;
-    ctx.strokeStyle = stroke;
-    ctx.fillStyle = fillTr;
-    ctx.fillRect(b.x, b.y, b.w, b.h);
-    ctx.strokeRect(b.x, b.y, b.w, b.h);
-    if (!isPred) {
-      // Class label tag in the top-left corner — user-drawn only.
-      const name = MANUAL_CLASS_NAMES[b.cls] || ('class_' + b.cls);
-      const fontPx = Math.max(14, Math.round(cv.width / 80));
-      ctx.font = `bold ${fontPx}px sans-serif`;
-      ctx.textBaseline = 'top';
-      ctx.textAlign = 'left';
-      const padX = 6, padY = 4;
-      const textW = ctx.measureText(name).width;
-      ctx.fillStyle = stroke;
-      ctx.fillRect(b.x, b.y, textW + padX * 2, fontPx + padY * 2);
-      ctx.fillStyle = '#fff';
-      ctx.fillText(name, b.x + padX, b.y + padY);
-    }
-    // ✕ close button at top-right of the box.
-    const cr = manualCloseRect(b);
-    ctx.fillStyle = '#fc5c65';
-    ctx.fillRect(cr.x, cr.y, cr.w, cr.h);
-    ctx.lineWidth = Math.max(2, Math.round(cr.w / 12));
-    ctx.strokeStyle = '#fff';
-    const inset = Math.round(cr.w * 0.28);
-    ctx.beginPath();
-    ctx.moveTo(cr.x + inset, cr.y + inset);
-    ctx.lineTo(cr.x + cr.w - inset, cr.y + cr.h - inset);
-    ctx.moveTo(cr.x + cr.w - inset, cr.y + inset);
-    ctx.lineTo(cr.x + inset, cr.y + cr.h - inset);
-    ctx.stroke();
-  }
-  // 2) Active box (the one with handles) on top.
-  if (!manualBox) return;
-  let {x, y, w, h} = manualBox;
-  ctx.lineWidth = lineW;
-  ctx.strokeStyle = '#00d4aa';
-  ctx.fillStyle = 'rgba(0, 212, 170, 0.10)';
-  ctx.fillRect(x, y, w, h);
-  ctx.strokeRect(x, y, w, h);
-  if (manualMode !== 'drawing') {
-    const hs = MANUAL_HANDLE_PX;
-    ctx.fillStyle = '#00d4aa';
-    [[x, y], [x + w, y], [x, y + h], [x + w, y + h]].forEach(([cx, cy]) => {
-      ctx.fillRect(cx - hs / 2, cy - hs / 2, hs, hs);
-    });
-    const cx = x + w / 2, cy = y + h / 2;
-    const fontPx = Math.max(28, Math.round(cv.width / 28));
-    ctx.font = `${fontPx}px serif`;
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
-    ctx.fillText('✋', cx + 1, cy + 1);
-    ctx.fillStyle = '#fff';
-    ctx.fillText('✋', cx, cy);
-  }
-}
-
-function manualEventToImage(e) {
-  const cv = document.getElementById('manual-canvas');
-  const rect = cv.getBoundingClientRect();
-  const sx = cv.width / rect.width;
-  const sy = cv.height / rect.height;
-  return {
-    x: (e.clientX - rect.left) * sx,
-    y: (e.clientY - rect.top) * sy,
-  };
-}
-
-function manualHitTest(x, y) {
-  if (!manualBox) return null;
-  let {x: bx, y: by, w, h} = manualBox;
-  // Normalize to positive size for hit-testing
-  if (w < 0) { bx += w; w = -w; }
-  if (h < 0) { by += h; h = -h; }
-  const hs = MANUAL_HANDLE_PX;
-  if (Math.abs(x - bx)       < hs && Math.abs(y - by)       < hs) return 'tl';
-  if (Math.abs(x - (bx + w)) < hs && Math.abs(y - by)       < hs) return 'tr';
-  if (Math.abs(x - bx)       < hs && Math.abs(y - (by + h)) < hs) return 'bl';
-  if (Math.abs(x - (bx + w)) < hs && Math.abs(y - (by + h)) < hs) return 'br';
-  const cx = bx + w / 2, cy = by + h / 2;
-  if (Math.abs(x - cx) < MANUAL_HAND_PX && Math.abs(y - cy) < MANUAL_HAND_PX) return 'moving';
-  return null;
-}
-
-(function bindManualCanvas() {
-  const cv = document.getElementById('manual-canvas');
-  if (!cv) return;
-
-  cv.addEventListener('pointerdown', (e) => {
-    if (!manualImg) return;
-    e.preventDefault();
-    cv.setPointerCapture(e.pointerId);
-    const p = manualEventToImage(e);
-
-    // 1) Hit-test the ✕ close button on each frozen box first — tapping
-    //    it removes that box and ends the gesture. Iterate top-most first
-    //    (last drawn = front) so the topmost ✕ wins on overlap.
-    for (let i = manualBoxes.length - 1; i >= 0; i--) {
-      const cr = manualCloseRect(manualBoxes[i]);
-      if (p.x >= cr.x && p.x <= cr.x + cr.w
-          && p.y >= cr.y && p.y <= cr.y + cr.h) {
-        manualBoxes.splice(i, 1);
-        manualMode = 'idle';
-        drawManualCanvas();
-        try { cv.releasePointerCapture(e.pointerId); } catch (_) {}
-        return;
-      }
-    }
-
-    if (manualBox) {
-      const hit = manualHitTest(p.x, p.y);
-      if (hit) {
-        manualMode = hit;
-        manualLast = p;
-        return;
-      }
-    }
-    // Empty canvas (or pointer outside box): touch drops a default box,
-    // mouse starts a click-drag draw.
-    if (e.pointerType === 'touch' || e.pointerType === 'pen') {
-      const sz = Math.min(cv.width, cv.height) * 0.20;
-      manualBox = { x: p.x - sz / 2, y: p.y - sz / 2, w: sz, h: sz };
-      manualMode = 'idle';
-      drawManualCanvas();
-    } else {
-      manualBox = { x: p.x, y: p.y, w: 0, h: 0 };
-      manualMode = 'drawing';
-      manualLast = p;
-    }
-  });
-
-  cv.addEventListener('pointermove', (e) => {
-    if (manualMode === 'idle' || !manualBox) return;
-    e.preventDefault();
-    const p = manualEventToImage(e);
-    if (manualMode === 'drawing') {
-      manualBox.w = p.x - manualBox.x;
-      manualBox.h = p.y - manualBox.y;
-    } else if (manualMode === 'moving') {
-      manualBox.x += p.x - manualLast.x;
-      manualBox.y += p.y - manualLast.y;
-      manualLast = p;
-    } else {
-      // Resize: anchor the opposite corner and let this corner follow the pointer.
-      let {x: bx, y: by, w, h} = manualBox;
-      let right = bx + w, bottom = by + h;
-      if (manualMode === 'tl') { bx = p.x; by = p.y; }
-      if (manualMode === 'tr') { right = p.x; by = p.y; }
-      if (manualMode === 'bl') { bx = p.x; bottom = p.y; }
-      if (manualMode === 'br') { right = p.x; bottom = p.y; }
-      manualBox = { x: bx, y: by, w: right - bx, h: bottom - by };
-    }
-    drawManualCanvas();
-  });
-
-  cv.addEventListener('pointerup', (e) => {
-    if (manualMode === 'drawing' && manualBox) {
-      // Normalize negative drags to positive box.
-      let {x, y, w, h} = manualBox;
-      if (w < 0) { x += w; w = -w; }
-      if (h < 0) { y += h; h = -h; }
-      manualBox = { x, y, w, h };
-    }
-    manualMode = 'idle';
-    drawManualCanvas();
-    try { cv.releasePointerCapture(e.pointerId); } catch (_) {}
-  });
-  cv.addEventListener('pointercancel', () => { manualMode = 'idle'; });
-})();
-
-function saveManualLabel() {
-  if (!manualImg) return;
-  const W = manualImg.naturalWidth, H = manualImg.naturalHeight;
-  // Snapshot all boxes the user has staged for this frame, including the
-  // active one if it's drawn and big enough — saves them a tap when the user
-  // forgets to hit "+ Add another" before "Save & next".
-  const all = manualBoxes.slice();
-  if (manualBox) {
-    let {x, y, w, h} = manualBox;
-    if (w < 0) { x += w; w = -w; }
-    if (h < 0) { y += h; h = -h; }
-    if (w >= 6 && h >= 6) {
-      const cls = parseInt(document.getElementById('manual-class').value, 10) || 0;
-      all.push({ x, y, w, h, cls });
-    }
-  }
-  if (all.length === 0) {
-    alert('Draw at least one box before saving.');
-    return;
-  }
-  // Build a multi-box query string. Each box=cls,cx,cy,w,h with normalized
-  // [0, 1] coords clamped to the image bounds.
-  const params = ['t=' + Date.now()];
-  for (const b of all) {
-    let {x, y, w, h, cls} = b;
-    x = Math.max(0, Math.min(W, x));
-    y = Math.max(0, Math.min(H, y));
-    w = Math.min(W - x, w);
-    h = Math.min(H - y, h);
-    if (w < 1 || h < 1) continue;
-    const cx = (x + w / 2) / W;
-    const cy = (y + h / 2) / H;
-    const wn = w / W, hn = h / H;
-    params.push(`box=${cls},${cx.toFixed(6)},${cy.toFixed(6)},${wn.toFixed(6)},${hn.toFixed(6)}`);
-  }
-  if (params.length === 1) {  // only the cachebuster
-    alert('No valid boxes to save.');
-    return;
-  }
-  const url = '/label/manual?' + params.join('&');
-  const saveBtn = document.getElementById('manual-save');
-  if (saveBtn) saveBtn.disabled = true;
-  fetch(url).then(r => r.json()).then(d => {
-    if (d.error) { alert('Could not save: ' + d.error); return; }
-    manualSavedCount += 1;
-    manualUpdateStreak();
-    refreshTrainLabels();
-    // Stay in manual mode for consecutive frames — the user clicks ✕ to exit.
-    return manualLoadFrame();
-  }).catch(() => alert('Save failed.'))
-   .finally(() => { if (saveBtn) saveBtn.disabled = false; });
-}
-
-// ── Training: label count + Train button ─────────────────
-let trainEstimate = null;
-function selectedEpochs() {
-  const sel = document.getElementById('train-epochs');
-  return sel ? parseInt(sel.value, 10) : 5;
-}
-function refreshTrainLabels() {
-  const ep = selectedEpochs();
-  fetch('/train/labels?epochs=' + ep).then(r => r.json()).then(d => {
-    const savedTxt = d.count + '/' + d.min_required;
-    document.getElementById('label-saved').textContent = savedTxt;
-    const btn = document.getElementById('train-btn');
-    btn.disabled = !d.ready || trainModalOpen;
-    trainEstimate = d.estimate;
-    const hint = document.getElementById('train-eta-hint');
-    const etaTxt = d.estimate ? `~${d.estimate.low_min}–${d.estimate.high_min} min` : '—';
-    if (hint && d.estimate) hint.textContent = etaTxt;
-    // Helper text under the Train button: visible only while still below
-    // the threshold. Rewrites the message to show current count + target.
-    const note = document.getElementById('train-enable-note');
-    if (note) {
-      if (d.ready) {
-        note.style.display = 'none';
+function h(tag, props) {
+  var kids = Array.prototype.slice.call(arguments, 2);
+  var isSvg = SVG_TAGS.has(tag);
+  var el = isSvg ? document.createElementNS(SVG_NS, tag) : document.createElement(tag);
+  if (props) {
+    for (var k in props) {
+      var v = props[k];
+      if (v == null || v === false) continue;
+      if (k === 'class') el.setAttribute('class', v);
+      else if (k === 'html') el.innerHTML = v;
+      else if (k === 'style') {
+        if (typeof v === 'object') Object.assign(el.style, v);
+        else el.setAttribute('style', v);
+      } else if (k.slice(0, 2) === 'on' && typeof v === 'function') {
+        el.addEventListener(k.slice(2).toLowerCase(), v);
+      } else if (!isSvg && k in el) {
+        try { el[k] = v; } catch (e) { el.setAttribute(k, v); }
       } else {
-        note.style.display = '';
-        const need = Math.max(0, (d.min_required || 0) - (d.count || 0));
-        note.innerHTML =
-          'Save ' + need + ' more label' + (need === 1 ? '' : 's') +
-          ' to unlock training. The minimum is currently ' +
-          '<b>' + d.min_required + '</b> ' +
-          '(change it in <a href="javascript:switchTab(\'settings\')">Settings</a>).';
+        el.setAttribute(k, v);
       }
     }
-    // Mirror to Settings: count and threshold are now separate fields.
-    const sCount = document.getElementById('settings-label-count');
-    if (sCount) sCount.textContent = String(d.count);
-    const sMin = document.getElementById('settings-min-labels');
-    // Don't clobber the input mid-edit (when document.activeElement is it).
-    if (sMin && document.activeElement !== sMin && Number(sMin.value) !== d.min_required) {
-      sMin.value = String(d.min_required);
-    }
-  }).catch(() => {});
+  }
+  append(el, kids);
+  return el;
 }
+function append(el, kids) {
+  for (var i = 0; i < kids.length; i++) {
+    var c = kids[i];
+    if (c == null || c === false) continue;
+    if (Array.isArray(c)) append(el, c);
+    else el.appendChild(c.nodeType ? c : document.createTextNode(String(c)));
+  }
+}
+function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
+function $(id) { return document.getElementById(id); }
 
-// Persist a new min-labels threshold to the server, then re-fetch so the
-// Train button + label-saved counter pick up the new value.
-function onMinLabelsChange(val) {
-  const n = parseInt(val, 10);
-  if (!Number.isFinite(n) || n < 1) return;
-  fetch('/train/min-labels?v=' + n).finally(() => refreshTrainLabels());
+/* ── utils ── */
+function rand(a, b) { return a + Math.random() * (b - a); }
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function pad2(n) { return String(n).padStart(2, '0'); }
+function seriesNoise(n, base, amp, seed) {
+  seed = seed || 1; var out = [], v = base;
+  for (var i = 0; i < n; i++) {
+    v += (Math.sin((i + seed) * 0.7) + Math.sin((i + seed) * 0.23)) * amp * 0.18;
+    v += rand(-amp, amp) * 0.5; out.push(v);
+  }
+  return out;
 }
-function onEpochsChange() {
-  refreshTrainLabels();
-  // Sync Settings dropdown to the labeling-tab dropdown so they stay paired.
-  const ep = document.getElementById('train-epochs');
-  const sEp = document.getElementById('settings-train-epochs');
-  if (ep && sEp && sEp.value !== ep.value) sEp.value = ep.value;
+function fmtClock(d) { return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); }
+function fmtDate(d) { return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }); }
+function fmtUptime(s) {
+  var hh = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = Math.floor(s % 60);
+  return hh + 'h ' + pad2(m) + 'm ' + pad2(sec) + 's';
 }
-// Settings epochs change → mirror back to the labeling-tab dropdown,
-// then run the same recompute path.
-function onSettingsEpochsChange(val) {
-  const ep = document.getElementById('train-epochs');
-  if (ep) ep.value = val;
-  refreshTrainLabels();
-}
-setInterval(refreshTrainLabels, 3000);
-refreshTrainLabels();
-
-// ── Training: confirm + start + poll progress ────────────
-let trainPollInterval = null;
-let trainModalOpen = false;
-
 function fmtSec(s) {
   if (s == null || isNaN(s)) return '—';
-  s = Math.max(0, Math.round(s));
-  const m = Math.floor(s / 60), r = s % 60;
-  return m ? `${m}m ${r}s` : `${r}s`;
+  s = Math.max(0, Math.round(s)); var m = Math.floor(s / 60), r = s % 60;
+  return m ? (m + 'm ' + r + 's') : (r + 's');
 }
 
-function confirmTraining() {
-  if (!trainEstimate) return;
-  const e = trainEstimate;
-  const ep = selectedEpochs();
-  // Populate the in-page confirm modal with live numbers from the most recent
-  // /train/labels poll, then show it. Replaces window.confirm() so the dialog
-  // is styled, scrollable on mobile, and shows real label counts.
-  const labelsEl = document.getElementById('label-saved');
-  document.getElementById('tc-labels').textContent = labelsEl ? labelsEl.textContent : '—';
-  document.getElementById('tc-epochs').textContent = ep;
-  document.getElementById('tc-eta').textContent =
-    (e && e.low_min != null) ? `~${e.low_min}–${e.high_min} min` : '—';
-  document.getElementById('train-confirm-overlay').classList.add('open');
-}
+/* ── simulated data (Analytics / AI Insights only) ── */
+var FISH_COLORS = ['#00e5cc', '#2ad4ff', '#57f5b6', '#4aa8ff', '#ffc857', '#ff9ecb', '#b388ff', '#7CFFCB'];
+function idColor(id) { return FISH_COLORS[Math.abs(parseInt(id, 10) || 0) % FISH_COLORS.length]; }
 
-function closeTrainConfirm() {
-  document.getElementById('train-confirm-overlay').classList.remove('open');
-}
-
-function startTrainingConfirmed() {
-  closeTrainConfirm();
-  const ep = selectedEpochs();
-  fetch('/train/start?epochs=' + ep).then(r => r.json()).then(d => {
-    if (d.error) { alert('Could not start training: ' + d.error); return; }
-    openTrainModal();
-    startTrainPolling();
+var FISH = [
+  { id: 7,  name: 'Tank Sinatra', species: 'Angelfish',      color: '#00e5cc', conf: 0.97, active: 4218, status: 'alive' },
+  { id: 3,  name: 'Finn Diesel',  species: 'Betta',          color: '#2ad4ff', conf: 0.94, active: 3902, status: 'alive' },
+  { id: 12, name: 'Bubbles',      species: 'Guppy',          color: '#57f5b6', conf: 0.91, active: 5114, status: 'alive' },
+  { id: 5,  name: 'Sushi',        species: 'Neon Tetra',     color: '#4aa8ff', conf: 0.89, active: 2740, status: 'alive' },
+  { id: 9,  name: 'Gilly',        species: 'Molly',          color: '#ffc857', conf: 0.86, active: 1980, status: 'alive' },
+  { id: 18, name: 'Marigold',     species: 'Cardinal Tetra', color: '#ff9ecb', conf: 0.82, active: 3320, status: 'alive' },
+  { id: 21, name: 'Sir Swims',    species: 'Zebra Danio',    color: '#b388ff', conf: 0.79, active: 1240, status: 'idle' },
+  { id: 2,  name: 'Coral',        species: 'Corydoras',      color: '#7CFFCB', conf: 0.74, active: 640,  status: 'idle' }
+];
+var HOURS = Array.from({ length: 24 }, function (_, i) { return i; });
+function circadian(seed) {
+  seed = seed || 0;
+  return HOURS.map(function (hr) {
+    var day = Math.exp(-Math.pow((hr - 13) / 5, 2)) * 70;
+    var feed = Math.exp(-Math.pow((hr - 8) / 0.8, 2)) * 55 + Math.exp(-Math.pow((hr - 18) / 0.8, 2)) * 60;
+    return clamp(day + feed + 10 + Math.sin(hr + seed) * 6, 4, 100);
   });
 }
+var ANALYTICS = {
+  countOverTime: seriesNoise(48, 7.4, 1.1, 3).map(function (v) { return clamp(Math.round(v), 4, 9); }),
+  activity: seriesNoise(48, 58, 22, 8).map(function (v) { return clamp(v, 8, 100); }),
+  confidence: seriesNoise(48, 0.88, 0.05, 11).map(function (v) { return clamp(v, 0.6, 0.99); }),
+  circadian: circadian(2),
+  heatmap: Array.from({ length: 8 }, function (_, r) {
+    return Array.from({ length: 12 }, function (_, c) {
+      var d = Math.hypot(c - 6, r - 3.5);
+      return clamp(Math.exp(-d * d / 9) * 100 + rand(-12, 18), 0, 100);
+    });
+  })
+};
+var INSIGHTS = [
+  { id: 1, sev: 'alert', icon: 'alert', title: 'Reduced activity — Sir Swims',
+    body: 'Track #21 has moved 61% less than its 7-day baseline over the last 3 hours. Could indicate stress or early illness. Recommend a closer look.',
+    time: '14m ago', conf: 0.88, tag: 'Behavior' },
+  { id: 2, sev: 'warn', icon: 'temp', title: 'GPU thermals trending up',
+    body: 'Jetson GPU has held 71–74°C for 25 min. Still nominal, but consider checking enclosure airflow before the afternoon light cycle.',
+    time: '38m ago', conf: 0.79, tag: 'System' },
+  { id: 3, sev: 'good', icon: 'spark', title: 'Feeding response looks healthy',
+    body: 'All 6 active fish converged to the upper-left feeding zone within 9s of the 08:00 feed window. Strong, synchronized response.',
+    time: '6h ago', conf: 0.95, tag: 'Behavior' },
+  { id: 4, sev: 'info', icon: 'eye', title: 'New individual detected',
+    body: 'Track #2 ("Coral", Corydoras) appeared for the first time at 11:42. Likely a bottom-dweller that surfaced into frame.',
+    time: '2h ago', conf: 0.74, tag: 'Detection' },
+  { id: 5, sev: 'good', icon: 'model', title: 'Model v4 improved recall',
+    body: 'Since switching to best.engine_v4, small-fish recall is up ~12% and ID switches dropped from 8/hr to 3/hr.',
+    time: '1d ago', conf: 0.91, tag: 'Model' }
+];
+var SUGGESTED_Q = [
+  'How active was the tank today?',
+  'Is any fish behaving unusually?',
+  'When were the fish most active?',
+  'Summarize the last 24 hours'
+];
+var ASK_ANSWERS = {
+  'how active was the tank today?': "Today's mean activity index is 64/100 — about 8% above the weekly average. Peak activity hit 94 around the 18:00 feed window. Bubbles (#12) logged the most movement (5,114px), while Coral (#2) stayed mostly in the lower-left substrate zone.",
+  'is any fish behaving unusually?': "One flag: Sir Swims (#21) is 61% below its movement baseline over the last 3 hours and is holding near the surface-right corner. Everyone else is within normal range. I'd keep an eye on #21 through the next feed cycle.",
+  'when were the fish most active?': "Two clear peaks, both feeding-driven: 08:00 (morning feed, index ~88) and 18:00 (evening feed, index ~94). Midday holds a gentle plateau around 60. Activity bottoms out 02:00–05:00 during the dark cycle.",
+  'summarize the last 24 hours': "6–8 fish tracked continuously at 22.4 FPS avg. Two healthy feeding responses, no ID losses for >30min. One behavioral flag (#21 low activity). System nominal: GPU peaked 74°C, model best.engine_v4. Overall tank health score: 92/100 — Thriving."
+};
 
+/* ── global app state ── */
+var App = {
+  page: 'live',
+  timers: [],          // per-view intervals, cleared on nav
+  observers: [],       // per-view ResizeObservers
+  viewLive: null,      // current view's live-update callback
+  conn: true,
+  live: {
+    fps: 0, active: 0, total: 0, frame: 0,
+    cpu: 56, gpu: 70, gpuUtil: 80, ram: 5.4,
+    realTemps: false, model: '—', resolution: '1080p', fish: {}
+  }
+};
+function every(ms, fn) { var id = setInterval(fn, ms); App.timers.push(id); return id; }
+function observe(el, cb) {
+  var ro = new ResizeObserver(function (es) { cb((es[0].contentRect.width) || 600); });
+  ro.observe(el); App.observers.push(ro);
+  requestAnimationFrame(function () { cb(el.clientWidth || 600); });
+  return ro;
+}
+function clearViewState() {
+  App.timers.forEach(clearInterval); App.timers = [];
+  App.observers.forEach(function (o) { o.disconnect(); }); App.observers = [];
+  App.viewLive = null;
+}
+
+/* ============================================================
+   Charts (neon SVG)
+   ============================================================ */
+function linePath(vals, w, hgt, pad, lo, hi) {
+  pad = pad || 0;
+  lo = lo == null ? Math.min.apply(null, vals) : lo;
+  hi = hi == null ? Math.max.apply(null, vals) : hi;
+  var span = (hi - lo) || 1, iW = w - pad * 2, iH = hgt - pad * 2;
+  return vals.map(function (v, i) {
+    var x = pad + (i / (vals.length - 1)) * iW;
+    var y = pad + iH - ((v - lo) / span) * iH;
+    return (i === 0 ? 'M' : 'L') + x.toFixed(1) + ',' + y.toFixed(1);
+  }).join(' ');
+}
+var _gid = 0;
+function gid(p) { return p + (++_gid); }
+
+function Sparkline(opts) {
+  var vals = opts.vals, color = opts.color || 'var(--teal)';
+  var w = opts.w || 120, hgt = opts.h || 34, fill = opts.fill !== false;
+  var lo = Math.min.apply(null, vals), hi = Math.max.apply(null, vals);
+  var p = linePath(vals, w, hgt, 3, lo, hi);
+  var area = p + ' L' + (w - 3) + ',' + (hgt - 3) + ' L3,' + (hgt - 3) + ' Z';
+  var id = gid('sg');
+  return h('svg', { width: w, height: hgt, viewBox: '0 0 ' + w + ' ' + hgt, style: { display: 'block' } },
+    h('defs', null, h('linearGradient', { id: id, x1: '0', y1: '0', x2: '0', y2: '1' },
+      h('stop', { offset: '0', 'stop-color': color, 'stop-opacity': '0.32' }),
+      h('stop', { offset: '1', 'stop-color': color, 'stop-opacity': '0' }))),
+    fill && h('path', { d: area, fill: 'url(#' + id + ')' }),
+    h('path', { d: p, fill: 'none', stroke: color, 'stroke-width': '1.8', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
+}
+
+function AreaChart(opts) {
+  var height = opts.height || 200, color = opts.color || 'var(--teal)';
+  var wrap = h('div', { style: { width: '100%', overflow: 'hidden' } });
+  var cur = opts.vals.slice();
+  function build(w) {
+    var padL = 38, padB = 22, padT = 10, padR = 8, hgt = height;
+    var lo = opts.min == null ? Math.min.apply(null, cur) : opts.min;
+    var hi = opts.max == null ? Math.max.apply(null, cur) : opts.max;
+    var span = (hi - lo) || 1, iW = w - padL - padR, iH = hgt - padT - padB;
+    var pts = cur.map(function (v, i) {
+      return [padL + (i / (cur.length - 1)) * iW, padT + iH - ((v - lo) / span) * iH];
+    });
+    var line = pts.map(function (p, i) { return (i ? 'L' : 'M') + p[0].toFixed(1) + ',' + p[1].toFixed(1); }).join(' ');
+    var area = line + ' L' + (padL + iW) + ',' + (padT + iH) + ' L' + padL + ',' + (padT + iH) + ' Z';
+    var id = gid('ag'), ticks = 4, last = pts[pts.length - 1];
+    var grid = [];
+    for (var i = 0; i <= ticks; i++) {
+      var y = padT + (i / ticks) * iH, val = hi - (i / ticks) * span;
+      grid.push(h('g', null,
+        h('line', { x1: padL, y1: y, x2: w - padR, y2: y, stroke: 'var(--border)', 'stroke-width': '1', 'stroke-dasharray': '2 4', opacity: '0.6' }),
+        h('text', { x: padL - 7, y: y + 3, 'text-anchor': 'end', 'font-size': '9', 'font-family': 'var(--mono)', fill: 'var(--faint)' },
+          opts.fmtY ? opts.fmtY(val) : Math.round(val))));
+    }
+    var svg = h('svg', { width: w, height: hgt, viewBox: '0 0 ' + w + ' ' + hgt, style: { display: 'block' } },
+      h('defs', null, h('linearGradient', { id: id, x1: '0', y1: '0', x2: '0', y2: '1' },
+        h('stop', { offset: '0', 'stop-color': color, 'stop-opacity': '0.30' }),
+        h('stop', { offset: '1', 'stop-color': color, 'stop-opacity': '0' }))),
+      grid,
+      h('path', { d: area, fill: 'url(#' + id + ')' }),
+      h('path', { d: line, fill: 'none', stroke: color, 'stroke-width': '2', 'stroke-linejoin': 'round', 'stroke-linecap': 'round' }),
+      opts.live && h('circle', { cx: last[0], cy: last[1], r: '3.5', fill: color },
+        h('animate', { attributeName: 'opacity', values: '1;.3;1', dur: '1.4s', repeatCount: 'indefinite' })));
+    clear(wrap); wrap.appendChild(svg);
+  }
+  observe(wrap, build);
+  return { node: wrap, update: function (v) { cur = v; build(wrap.clientWidth || 600); } };
+}
+
+function BarChart(opts) {
+  var height = opts.height || 180, color = opts.color || 'var(--cyan)', highlight = opts.highlight || [];
+  var wrap = h('div', { style: { width: '100%', overflow: 'hidden' } });
+  var vals = opts.vals;
+  function build(w) {
+    var padB = 18, padT = 6, padL = 4, padR = 4, hgt = height;
+    var max = Math.max.apply(null, vals) || 1, iW = w - padL - padR, iH = hgt - padT - padB, bw = iW / vals.length;
+    var bars = vals.map(function (v, i) {
+      var bh = (v / max) * iH, x = padL + i * bw, y = padT + iH - bh, hot = highlight.indexOf(i) >= 0;
+      return h('g', null,
+        h('rect', { x: x + bw * 0.18, y: y, width: bw * 0.64, height: bh, rx: '2',
+          fill: hot ? 'var(--teal)' : color, opacity: hot ? 1 : 0.55,
+          style: hot ? { filter: 'drop-shadow(0 0 5px var(--teal))' } : null }),
+        (opts.labels && i % 3 === 0) && h('text', { x: x + bw / 2, y: hgt - 5, 'text-anchor': 'middle',
+          'font-size': '8.5', 'font-family': 'var(--mono)', fill: 'var(--faint)' }, opts.labels[i]));
+    });
+    var svg = h('svg', { width: w, height: hgt, viewBox: '0 0 ' + w + ' ' + hgt, style: { display: 'block' } }, bars);
+    clear(wrap); wrap.appendChild(svg);
+  }
+  observe(wrap, build);
+  return { node: wrap };
+}
+
+function Ring(opts) {
+  var value = opts.value, max = opts.max || 100, size = opts.size || 132, stroke = opts.stroke || 11;
+  var color = opts.color || 'var(--teal)', track = opts.track || '#0e2228';
+  var r = (size - stroke) / 2, c = 2 * Math.PI * r, off = c - (clamp(value, 0, max) / max) * c;
+  var box = h('div', { style: { position: 'relative', width: size + 'px', height: size + 'px' } },
+    h('svg', { width: size, height: size, style: { transform: 'rotate(-90deg)' } },
+      h('circle', { cx: size / 2, cy: size / 2, r: r, fill: 'none', stroke: track, 'stroke-width': stroke }),
+      h('circle', { cx: size / 2, cy: size / 2, r: r, fill: 'none', stroke: color, 'stroke-width': stroke,
+        'stroke-dasharray': c, 'stroke-dashoffset': off, 'stroke-linecap': 'round',
+        style: { transition: 'stroke-dashoffset .8s cubic-bezier(.4,0,.2,1)', filter: 'drop-shadow(0 0 6px ' + color + ')' } })),
+    h('div', { style: { position: 'absolute', inset: 0, display: 'grid', placeItems: 'center', textAlign: 'center' } }, opts.children));
+  return box;
+}
+
+function Gauge(opts) {
+  var value = opts.value, max = opts.max || 100, color = opts.color || 'var(--teal)', size = opts.size || 150;
+  var w = size, hgt = size * 0.62, sw = 10, r = (w - sw) / 2, cx = w / 2, cy = hgt - 4;
+  var startA = Math.PI, endA = 0, pct = clamp(value / max, 0, 1), ang = startA + (endA - startA) * pct;
+  function arc(a0, a1) {
+    var x0 = cx + r * Math.cos(a0), y0 = cy + r * Math.sin(a0);
+    var x1 = cx + r * Math.cos(a1), y1 = cy + r * Math.sin(a1);
+    var large = Math.abs(a1 - a0) > Math.PI ? 1 : 0;
+    return 'M' + x0 + ',' + y0 + ' A' + r + ',' + r + ' 0 ' + large + ' 1 ' + x1 + ',' + y1;
+  }
+  var nx = cx + r * Math.cos(ang), ny = cy + r * Math.sin(ang);
+  return h('div', { style: { textAlign: 'center' } },
+    h('svg', { width: w, height: hgt + 6, viewBox: '0 0 ' + w + ' ' + (hgt + 6) },
+      h('path', { d: arc(startA, endA), fill: 'none', stroke: '#0e2228', 'stroke-width': sw, 'stroke-linecap': 'round' }),
+      h('path', { d: arc(startA, ang), fill: 'none', stroke: color, 'stroke-width': sw, 'stroke-linecap': 'round',
+        style: { filter: 'drop-shadow(0 0 5px ' + color + ')', transition: 'all .6s' } }),
+      h('circle', { cx: nx, cy: ny, r: '4.5', fill: '#04141a', stroke: color, 'stroke-width': '2' })),
+    h('div', { style: { marginTop: '-6px' } },
+      h('div', { class: 'tabular', style: { fontSize: '24px', fontWeight: 600, color: 'var(--text)' } },
+        value, h('span', { style: { fontSize: '12px', color: 'var(--dim)' } }, opts.unit || '')),
+      h('div', { class: 'eyebrow', style: { marginTop: '2px' } }, opts.label)));
+}
+
+function Heatmap(opts) {
+  var grid = opts.grid, color = opts.color || '0,229,204';
+  var wrap = h('div', { style: { width: '100%', overflow: 'hidden' } });
+  function build(w) {
+    var rows = grid.length, cols = grid[0].length, cell = w / cols, hgt = cell * rows;
+    var rects = [];
+    grid.forEach(function (row, r) {
+      row.forEach(function (v, c) {
+        rects.push(h('rect', { x: c * cell + 1.5, y: r * cell + 1.5, width: cell - 3, height: cell - 3, rx: '2',
+          fill: 'rgba(' + color + ',' + (v / 100 * 0.85 + 0.04).toFixed(2) + ')' }));
+      });
+    });
+    var svg = h('svg', { width: w, height: hgt, viewBox: '0 0 ' + w + ' ' + hgt, style: { display: 'block', borderRadius: '8px' } }, rects);
+    clear(wrap); wrap.appendChild(svg);
+  }
+  observe(wrap, build);
+  return wrap;
+}
+
+/* ── shared bits ── */
+function eyebrow(text, style) { return h('div', { class: 'eyebrow', style: style }, text); }
+function confBar(pct, color, width) {
+  return h('div', { class: 'conf-bar', style: width ? { width: width + 'px' } : null },
+    h('i', { style: { width: pct + '%', background: color } }));
+}
+function chip(text, kind) { return h('span', { class: 'chip' + (kind ? ' ' + kind : '') }, text); }
+function liveDot(cls) { return h('span', { class: 'dot live' + (cls ? ' ' + cls : '') }); }
+
+/* ============================================================
+   Nav + shell
+   ============================================================ */
+var ICONS = {
+  live: 'M2 7a2 2 0 012-2h9a2 2 0 012 2v10a2 2 0 01-2 2H4a2 2 0 01-2-2z M15 9l5-3v12l-5-3',
+  chart: 'M3 3v18h18 M7 14l3-4 3 3 5-7',
+  ai: 'M12 3a4 4 0 014 4v0a4 4 0 010 8 4 4 0 11-8 0 4 4 0 010-8v0a4 4 0 014-4z M12 7v8 M8.5 11h7',
+  train: 'M4 7h16 M4 12h16 M4 17h10 M18 15l3 2-3 2',
+  device: 'M5 4h14a1 1 0 011 1v11a1 1 0 01-1 1H5a1 1 0 01-1-1V5a1 1 0 011-1z M8 21h8 M12 17v4',
+  gear: 'M12 9a3 3 0 100 6 3 3 0 000-6z M19.4 13a7.9 7.9 0 000-2l2-1.5-2-3.5-2.4 1a8 8 0 00-1.7-1L14 0h-4l-.3 2.5a8 8 0 00-1.7 1l-2.4-1-2 3.5L3.6 11a7.9 7.9 0 000 2l-2 1.5 2 3.5 2.4-1a8 8 0 001.7 1L10 24h4l.3-2.5a8 8 0 001.7-1l2.4 1 2-3.5z'
+};
+function navIcon(name, transform) {
+  return h('svg', { class: 'ni-icon', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor',
+    'stroke-width': '1.7', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' },
+    h('path', { d: ICONS[name], transform: transform }));
+}
+var NAV = [
+  { group: 'Monitor', items: [
+    { id: 'live', label: 'Live Feed', icon: 'live', badge: 'LIVE' },
+    { id: 'analytics', label: 'Analytics', icon: 'chart' },
+    { id: 'insights', label: 'AI Insights', icon: 'ai', badge: '1', alert: true }
+  ] },
+  { group: 'Training', items: [{ id: 'training', label: 'Label & Train', icon: 'train' }] },
+  { group: 'System', items: [
+    { id: 'system', label: 'Device Health', icon: 'device' },
+    { id: 'settings', label: 'Settings', icon: 'gear' }
+  ] }
+];
+var TITLES = {
+  live: ['Live Feed', 'Real-time detection & tracking'],
+  analytics: ['Analytics', 'Behavioral & detection metrics'],
+  insights: ['AI Insights', 'Anomalies, health & natural-language'],
+  training: ['Label & Train', 'Active-learning data loop'],
+  system: ['Device Health', 'Jetson Orin Nano telemetry'],
+  settings: ['Settings', 'Pipeline & camera configuration']
+};
+
+function buildSidebar() {
+  var devVals = {};
+  function bar(v, c) { var i = h('i', { style: { width: clamp(v, 0, 100) + '%', background: c, boxShadow: '0 0 6px ' + c } }); return { node: h('div', { class: 'dev-bar' }, i), i: i }; }
+  var gpuV = h('span', { class: 'val' }), ramV = h('span', { class: 'val' }), fpsV = h('span', { class: 'val', style: { color: 'var(--teal)' } });
+  var gpuBar = bar(0, 'var(--teal)'), ramBar = bar(0, 'var(--cyan)');
+  var connEl = h('span', null, 'Connecting…');
+  App.updateSidebar = function () {
+    var L = App.live;
+    gpuV.textContent = L.gpuUtil + '% · ' + Math.round(L.gpu) + '°C';
+    gpuBar.i.style.width = clamp(L.gpuUtil, 0, 100) + '%';
+    ramV.textContent = L.ram.toFixed(1) + '/8GB';
+    ramBar.i.style.width = clamp(L.ram / 8 * 100, 0, 100) + '%';
+    fpsV.textContent = L.fps.toFixed(1);
+    connEl.textContent = App.conn ? 'Connected · live' : 'Reconnecting…';
+  };
+  var nav = NAV.map(function (g) {
+    return h('div', { class: 'nav-group' },
+      h('div', { class: 'nav-label' }, g.group),
+      g.items.map(function (it) {
+        return h('div', { class: 'nav-item' + (App.page === it.id ? ' active' : ''), 'data-nav': it.id,
+          onclick: function () { go(it.id); closeNav(); } },
+          navIcon(it.icon),
+          h('span', null, it.label),
+          it.badge && h('span', { class: 'nav-badge' + (it.alert ? ' alert' : '') }, it.badge));
+      }));
+  });
+  var aside = h('aside', { class: 'sidebar', id: 'sidebar' },
+    h('div', { class: 'brand' },
+      h('div', { class: 'brand-mark' },
+        h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'var(--teal)', 'stroke-width': '1.7', 'stroke-linejoin': 'round' },
+          h('ellipse', { cx: '13', cy: '12', rx: '7', ry: '4.5', fill: 'rgba(0,229,204,.12)' }),
+          h('path', { d: 'M6 12L2 8.5v7z' }),
+          h('circle', { cx: '16', cy: '11', r: '1', fill: 'var(--teal)', stroke: 'none' }))),
+      h('div', null,
+        h('div', { class: 'brand-name', html: 'Aqua<b>Scope</b>' }),
+        h('div', { class: 'brand-sub' }, 'Neural Monitor'))),
+    nav,
+    h('div', { class: 'nav-spacer' }),
+    h('div', { class: 'dev-card' },
+      h('div', { class: 'dev-row' }, h('span', { class: 'lbl' }, 'GPU'), gpuV), gpuBar.node,
+      h('div', { class: 'dev-row', style: { marginTop: '9px' } }, h('span', { class: 'lbl' }, 'RAM'), ramV), ramBar.node,
+      h('div', { class: 'dev-row', style: { marginTop: '9px' } }, h('span', { class: 'lbl' }, 'FPS'), fpsV)),
+    h('div', { class: 'conn' }, liveDot(), connEl));
+  App.updateSidebar();
+  return aside;
+}
+
+function buildTopbar() {
+  var clock = h('div', { class: 'clock' });
+  var titleEl = h('div', { class: 'tb-title' }), subEl = h('div', { class: 'tb-sub' });
+  var pillSlot = h('span', { class: 'tb-spacer' });
+  App.updateTopbar = function () {
+    var t = TITLES[App.page]; titleEl.textContent = t[0]; subEl.textContent = t[1];
+  };
+  function tickClock() {
+    var now = new Date();
+    clear(clock); clock.appendChild(document.createTextNode(fmtClock(now)));
+    clock.appendChild(h('div', { class: 'date' }, fmtDate(now)));
+  }
+  setInterval(tickClock, 1000); tickClock();
+  App.updateTopbar();
+  return h('header', { class: 'topbar' },
+    h('button', { class: 'btn btn-icon hamburger', onclick: openNav },
+      h('svg', { width: '18', height: '18', viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' },
+        h('path', { d: 'M3 6h18M3 12h18M3 18h18' }))),
+    h('div', null, titleEl, subEl),
+    App.page === 'live' && h('span', { class: 'live-pill' }, liveDot(), 'LIVE · CAM_01'),
+    pillSlot,
+    h('div', { class: 'tb-right' }, clock));
+}
+
+function openNav() { var s = $('sidebar'); if (s) s.classList.add('open'); $('scrim').classList.add('show'); }
+function closeNav() { var s = $('sidebar'); if (s) s.classList.remove('open'); $('scrim').classList.remove('show'); }
+
+var VIEWS;
+function go(page) {
+  if (!VIEWS[page]) return;
+  clearViewState();
+  App.page = page;
+  // refresh sidebar active + topbar
+  document.querySelectorAll('[data-nav]').forEach(function (n) {
+    n.classList.toggle('active', n.getAttribute('data-nav') === page);
+  });
+  document.querySelectorAll('[data-mb]').forEach(function (n) {
+    n.classList.toggle('on', n.getAttribute('data-mb') === page);
+  });
+  // rebuild topbar (live pill depends on page)
+  var main = $('main-col');
+  var oldTop = main.querySelector('.topbar');
+  var newTop = buildTopbar();
+  main.replaceChild(newTop, oldTop);
+  var content = $('content');
+  clear(content);
+  content.appendChild(VIEWS[page]());
+}
+
+/* ============================================================
+   Global live polling (drives sidebar + live view + system)
+   ============================================================ */
+function startLivePolling() {
+  function poll() {
+    fetch('/stats').then(function (r) { return r.json(); }).then(function (d) {
+      App.conn = true;
+      var L = App.live;
+      L.fps = d.fps != null ? d.fps : 0;
+      L.active = d.active != null ? d.active : 0;
+      L.total = d.total_ids != null ? d.total_ids : 0;
+      L.frame = d.frame != null ? d.frame : 0;
+      L.fish = d.fish || {};
+      if (d.resolution) L.resolution = d.resolution;
+      if (d.model) L.model = d.model;
+      var temps = d.temps_c || {};
+      var hasT = false;
+      if (temps.CPU != null) { L.cpu = temps.CPU; hasT = true; }
+      if (temps.GPU != null) { L.gpu = temps.GPU; hasT = true; }
+      L.realTemps = hasT;
+      if (App.updateSidebar) App.updateSidebar();
+      if (App.viewLive) App.viewLive();
+    }).catch(function () {
+      App.conn = false;
+      if (App.updateSidebar) App.updateSidebar();
+    });
+  }
+  // simulate util/ram (no backend) + temp fallback when off-Jetson
+  function walk() {
+    var L = App.live;
+    L.gpuUtil = Math.round(clamp(L.gpuUtil + rand(-4, 4), 62, 96));
+    L.ram = clamp(L.ram + rand(-0.18, 0.18), 4.8, 6.4);
+    if (!L.realTemps) {
+      L.gpu = clamp(L.gpu + rand(-1.6, 1.6), 64, 78);
+      L.cpu = clamp(L.cpu + rand(-1.4, 1.4), 50, 66);
+    }
+    if (App.updateSidebar) App.updateSidebar();
+  }
+  setInterval(poll, 1000); poll();
+  setInterval(walk, 1500);
+}
+
+/* ============================================================
+   LIVE VIEW — wired to real /stream, /stats, snapshots, controls
+   ============================================================ */
+var STREAM_LIMIT_MS = 180000;
+
+function MiniKpi(opts) {
+  var valEl = h('span', null, opts.value);
+  var node = h('div', { class: 'card', style: { padding: '12px 14px' } },
+    h('div', { class: 'kpi-label' }, opts.label),
+    h('div', { style: { display: 'flex', alignItems: 'flex-end', justifyContent: 'space-between', marginTop: '8px' } },
+      h('div', { class: 'tabular', style: { fontSize: '24px', fontWeight: 600, color: opts.color || 'var(--text)' } },
+        valEl, opts.unit && h('span', { style: { fontSize: '12px', color: 'var(--dim)', marginLeft: '3px' } }, opts.unit)),
+      opts.sparkWrap));
+  return { node: node, setValue: function (v) { valEl.textContent = v; } };
+}
+
+function LiveView() {
+  var streamExpired = false;
+  // feed
+  var feed = h('img', { id: 'feed', src: '/stream', alt: 'live', style: { width: '100%', height: '100%', objectFit: 'contain', display: 'block' } });
+  feed.onerror = function () {
+    if (streamExpired) return;
+    setTimeout(function () { if (!streamExpired) feed.src = '/stream?t=' + Date.now(); }, 2000);
+  };
+  var modelTag = h('span', { class: 'feed-tag mono' }, App.live.model || 'model');
+  var expiredOverlay = h('div', { style: { display: 'none', position: 'absolute', inset: 0, zIndex: 6, background: 'rgba(2,6,9,.82)', backdropFilter: 'blur(2px)', alignItems: 'center', justifyContent: 'center' } },
+    h('div', { class: 'card pad', style: { textAlign: 'center', maxWidth: '280px' } },
+      h('div', { style: { fontSize: '15px', fontWeight: 700, color: 'var(--teal)', marginBottom: '6px' } }, '⏸ Stream paused'),
+      h('div', { style: { color: 'var(--dim)', fontSize: '11px', marginBottom: '14px', lineHeight: 1.5 } }, '3-minute session limit reached. Refresh to keep streaming.'),
+      h('button', { class: 'btn btn-primary', onclick: function () { location.reload(); } }, '↻ Refresh')));
+  var pausedOverlay = h('div', { style: { display: 'none', position: 'absolute', inset: 0, zIndex: 5, background: 'rgba(2,6,9,.78)', alignItems: 'center', justifyContent: 'center' } },
+    h('div', { class: 'card pad', style: { textAlign: 'center', maxWidth: '300px' } },
+      h('div', { style: { fontSize: '15px', fontWeight: 700, color: 'var(--teal)', marginBottom: '6px' } }, '⏸ Inference paused'),
+      h('div', { style: { color: 'var(--dim)', fontSize: '11px', lineHeight: 1.5 } }, 'Training is using the GPU. The live feed resumes automatically when training completes.')));
+  App.setFeedPaused = function (p) { pausedOverlay.style.display = p ? 'flex' : 'none'; };
+
+  var feedWrap = h('div', { class: 'feed-wrap', style: { cursor: 'pointer' } },
+    feed,
+    h('span', { class: 'bracket tl' }), h('span', { class: 'bracket tr' }), h('span', { class: 'bracket bl' }), h('span', { class: 'bracket br' }),
+    h('div', { class: 'scanlines' }),
+    h('div', { class: 'feed-top' }, h('span', { class: 'rec' }, h('i', null), 'REC'), modelTag),
+    pausedOverlay, expiredOverlay);
+  feedWrap.addEventListener('click', function () { if (!streamExpired) openFullscreen(); });
+  setTimeout(function () {
+    streamExpired = true; feed.src = ''; expiredOverlay.style.display = 'flex';
+  }, STREAM_LIMIT_MS);
+
+  // snapshot button on the feed
+  var snapBtn = h('button', { class: 'snap-btn', onclick: function (e) { e.stopPropagation(); takeSnap(snapBtn); } },
+    h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' },
+      h('circle', { cx: '12', cy: '13', r: '4' }), h('path', { d: 'M5 7h2l1-2h8l1 2h2a1 1 0 011 1v9a1 1 0 01-1 1H5a1 1 0 01-1-1V8a1 1 0 011-1z' })),
+    'Snapshot');
+  feedWrap.appendChild(snapBtn);
+
+  // filmstrip
+  var filmRow = h('div', { class: 'filmstrip' });
+  var filmCount = h('span', { class: 'mono', style: { marginLeft: 'auto', color: 'var(--teal)', fontSize: '11px' } }, '0');
+  var filmEmpty = h('div', { class: 'film-cap mono', style: { padding: '18px 4px', color: 'var(--dim)' } }, 'No snapshots yet — press 📷');
+  filmRow.appendChild(filmEmpty);
+  var snapState = { list: [] };
+  App.snapState = snapState; App.filmRow = filmRow; App.filmCount = filmCount; App.filmEmpty = filmEmpty;
+
+  // right-rail KPIs with rolling sparklines
+  var fpsRoll = Array.from({ length: 40 }, function () { return App.live.fps || 22; });
+  var actRoll = Array.from({ length: 40 }, function () { return App.live.active || 6; });
+  var fpsSpark = h('span', null), actSpark = h('span', null);
+  function redrawSparks() {
+    clear(fpsSpark); fpsSpark.appendChild(Sparkline({ vals: fpsRoll, color: 'var(--teal)', w: 72, h: 30 }));
+    clear(actSpark); actSpark.appendChild(Sparkline({ vals: actRoll, color: 'var(--cyan)', w: 72, h: 30 }));
+  }
+  redrawSparks();
+  var kFps = MiniKpi({ label: 'FPS', value: '0.0', color: 'var(--teal)', sparkWrap: fpsSpark });
+  var kAct = MiniKpi({ label: 'Active', value: '0', color: 'var(--cyan)', sparkWrap: actSpark });
+  var kTot = MiniKpi({ label: 'Tracked IDs', value: '0', color: 'var(--aqua)' });
+  var kGpu = MiniKpi({ label: 'GPU', value: '0', unit: '°C', color: 'var(--warn)' });
+
+  var fishList = h('div', { class: 'fish-list' });
+  var liveChip = chip('', 'on'); liveChip.appendChild(liveDot());
+  var liveChipText = document.createTextNode('0 live'); liveChip.appendChild(liveChipText);
+
+  function renderFish() {
+    var fish = App.live.fish || {};
+    var entries = Object.keys(fish).map(function (id) { return [id, fish[id]]; });
+    entries.sort(function (a, b) { return (b[1].last_seen_ts || 0) - (a[1].last_seen_ts || 0); });
+    var now = Date.now() / 1000;
+    clear(fishList);
+    if (!entries.length) {
+      fishList.appendChild(h('div', { class: 'fish-meta mono', style: { padding: '14px 6px' } }, 'No fish detected yet.'));
+      return;
+    }
+    entries.slice(0, 12).forEach(function (pair) {
+      var id = pair[0], f = pair[1], col = idColor(id);
+      var alive = (now - (f.last_seen_ts || 0)) < 2;
+      fishList.appendChild(h('div', { class: 'fish-row' },
+        h('span', { class: 'fish-swatch', style: { background: col, boxShadow: '0 0 8px ' + col, opacity: alive ? 1 : 0.4 } }),
+        h('div', { style: { minWidth: 0 } },
+          h('div', { class: 'fish-name' }, 'Fish ', h('span', { class: 'mono', style: { color: 'var(--dim)', fontSize: '11px' } }, '#' + id)),
+          h('div', { class: 'fish-meta mono' }, Math.round(f.total_distance_px || 0).toLocaleString() + 'px · ' + (f.frame_count || 0) + ' frames')),
+        h('span', { class: 'fish-conf mono' }, alive ? 'live' : 'idle')));
+    });
+  }
+
+  App.viewLive = function () {
+    var L = App.live;
+    kFps.setValue(L.fps.toFixed(1)); kAct.setValue(L.active); kTot.setValue(L.total); kGpu.setValue(Math.round(L.gpu));
+    modelTag.textContent = L.model || 'model';
+    fpsRoll = fpsRoll.slice(1).concat(L.fps || 0);
+    actRoll = actRoll.slice(1).concat(L.active || 0);
+    redrawSparks();
+    var live = L.active;
+    liveChipText.textContent = live + ' live';
+    renderFish();
+  };
+
+  var rail = h('div', { style: { display: 'flex', flexDirection: 'column', gap: '14px' } },
+    h('div', { class: 'grid cols-2', style: { gap: '12px' } }, kFps.node, kAct.node, kTot.node, kGpu.node),
+    h('div', { class: 'card', style: { flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 } },
+      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Fish Activity'), h('span', { class: 'ch-spacer' }), liveChip),
+      fishList),
+    FeedControls());
+
+  // initial paint
+  App.viewLive();
+  loadSnapshots();
+  every(2000, loadSnapshots);
+
+  return h('div', { class: 'view live-grid' },
+    h('div', null,
+      feedWrap,
+      h('div', { class: 'card', style: { marginTop: '14px', padding: '12px' } },
+        h('div', { style: { display: 'flex', alignItems: 'center', marginBottom: '9px' } }, eyebrow('Snapshots'), filmCount),
+        filmRow)),
+    rail);
+}
+
+function FeedControls() {
+  // real toggle states (server defaults: trails OFF, enhance ON, hats OFF)
+  var state = { trails: false, enhance: true, hats: false };
+  function toggleRow(key, label, endpoint, respKey) {
+    var tog = h('div', { class: 'toggle' + (state[key] ? ' on' : '') }, h('i', null));
+    var lbl = h('span', { style: { color: state[key] ? 'var(--text)' : 'var(--dim)' } }, label);
+    var row = h('div', { class: 'ctl-row', onclick: function () {
+      fetch(endpoint).then(function (r) { return r.json(); }).then(function (d) {
+        state[key] = !!d[respKey];
+        tog.classList.toggle('on', state[key]);
+        lbl.style.color = state[key] ? 'var(--text)' : 'var(--dim)';
+      });
+    } }, lbl, tog);
+    return row;
+  }
+  var confVal = h('span', { class: 'tabular', style: { color: 'var(--teal)', fontSize: '12px', width: '32px' } }, '35%');
+  var confDebounce = null;
+  var confSlider = h('input', { class: 'rng', type: 'range', min: '5', max: '95', step: '5', value: '35',
+    oninput: function (e) {
+      var pct = parseInt(e.target.value, 10); confVal.textContent = pct + '%';
+      clearTimeout(confDebounce);
+      confDebounce = setTimeout(function () { fetch('/conf?v=' + (pct / 100).toFixed(2)); }, 120);
+    } });
+  var modelSel = h('select', { class: 'sel', onchange: function (e) { fetch('/model?v=' + encodeURIComponent(e.target.value)); } },
+    h('option', null, 'loading…'));
+  loadModelOptions(modelSel);
+  var resSel = h('select', { class: 'sel', value: App.live.resolution, onchange: function (e) { fetch('/resolution?v=' + encodeURIComponent(e.target.value)); } },
+    ['480p', '720p', '1080p'].map(function (r) { return h('option', { value: r, selected: r === App.live.resolution }, r); }));
+
+  return h('div', { class: 'card', style: { padding: '14px' } },
+    eyebrow('Detection Controls', { marginBottom: '12px' }),
+    h('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px' } },
+      toggleRow('trails', 'Motion trails', '/trails', 'trails'),
+      toggleRow('enhance', 'Image enhance', '/enhance', 'enhance'),
+      toggleRow('hats', 'Party hats 🎉', '/hat', 'hat')),
+    h('div', { style: { height: '1px', background: 'var(--border)', margin: '13px 0' } }),
+    eyebrow('Confidence', { marginBottom: '8px' }),
+    h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } }, confSlider, confVal),
+    eyebrow('Model', { margin: '13px 0 6px' }), modelSel,
+    eyebrow('Resolution', { margin: '13px 0 6px' }), resSel,
+    h('button', { class: 'btn btn-ghost', style: { width: '100%', marginTop: '13px', justifyContent: 'center', color: 'var(--alert)', borderColor: 'rgba(255,111,111,.3)' },
+      onclick: function () { fetch('/reset'); } }, '↺ Reset Trails'));
+}
+
+function loadModelOptions(sel) {
+  fetch('/models').then(function (r) { return r.json(); }).then(function (d) {
+    clear(sel);
+    var models = d.models || [];
+    if (!models.length) { sel.appendChild(h('option', { disabled: true }, '(no models found)')); return; }
+    var curBase = (d.current || '').split('/').pop();
+    models.forEach(function (m) {
+      var base = m.split('/').pop();
+      sel.appendChild(h('option', { value: base, selected: base === curBase }, base));
+    });
+  }).catch(function () {});
+}
+
+/* snapshots */
+function takeSnap(btn) {
+  btn.disabled = true;
+  fetch('/screenshot').then(function (r) { return r.json(); }).then(function (d) {
+    if (d.filename) {
+      var s = { filename: d.filename, label: 'Snap ' + d.filename.slice(9, 15) };
+      App.snapState.list.unshift(s); addThumb(s, true);
+    }
+    setTimeout(function () { btn.disabled = false; }, 800);
+  }).catch(function () { btn.disabled = false; });
+}
+function addThumb(s, prepend) {
+  if (App.filmEmpty && App.filmEmpty.parentNode) App.filmEmpty.parentNode.removeChild(App.filmEmpty);
+  var url = '/screenshots/' + s.filename;
+  var thumb = h('div', { class: 'film-thumb', 'data-file': s.filename, style: { cursor: 'pointer' } },
+    h('div', { class: 'film-img', style: { background: '#04161d' } }, h('img', { src: url, loading: 'lazy', style: { width: '100%', height: '100%', objectFit: 'cover' } })),
+    h('span', { class: 'film-cap mono' }, s.label));
+  thumb.onclick = function () { openModal(url); };
+  if (prepend && App.filmRow.firstChild) App.filmRow.insertBefore(thumb, App.filmRow.firstChild);
+  else App.filmRow.appendChild(thumb);
+  App.filmCount.textContent = App.snapState.list.length;
+}
+function loadSnapshots() {
+  if (!App.snapState) return;
+  fetch('/screenshots').then(function (r) { return r.json(); }).then(function (list) {
+    var existing = new Set(App.snapState.list.map(function (s) { return s.filename; }));
+    list.forEach(function (s) {
+      if (!existing.has(s.filename)) { App.snapState.list.push(s); addThumb(s, false); }
+    });
+  }).catch(function () {});
+}
+
+/* modal lightbox + fullscreen feed */
+function openModal(url) {
+  var img = h('img', { src: url, style: { maxWidth: '90vw', maxHeight: '85vh', borderRadius: '8px', border: '1px solid var(--border)' } });
+  var modal = h('div', { style: { position: 'fixed', inset: 0, background: 'rgba(2,6,9,.85)', zIndex: 100, display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+    h('button', { style: { position: 'absolute', top: '20px', right: '24px', background: 'none', border: 'none', color: 'var(--text)', fontSize: '24px', cursor: 'pointer' }, onclick: function () { document.body.removeChild(modal); } }, '✕'),
+    img);
+  modal.addEventListener('click', function (e) { if (e.target === modal) document.body.removeChild(modal); });
+  document.body.appendChild(modal);
+}
+function openFullscreen() {
+  var img = h('img', { src: '/stream?t=' + Date.now(), style: { width: '100%', height: '100%', objectFit: 'contain' } });
+  var overlay = h('div', { style: { position: 'fixed', inset: 0, background: '#000', zIndex: 300, display: 'flex', alignItems: 'center', justifyContent: 'center' } },
+    h('button', { style: { position: 'absolute', top: '14px', right: '14px', background: 'rgba(0,0,0,.65)', color: '#fff', border: '1px solid rgba(255,255,255,.25)', borderRadius: '50%', width: '38px', height: '38px', fontSize: '18px', cursor: 'pointer', zIndex: 301 },
+      onclick: function () { close(); } }, '✕'),
+    img);
+  function close() {
+    img.src = ''; if (overlay.parentNode) document.body.removeChild(overlay);
+    if (document.fullscreenElement) document.exitFullscreen().catch(function () {});
+  }
+  overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+  document.body.appendChild(overlay);
+  if (overlay.requestFullscreen) overlay.requestFullscreen().catch(function () {});
+}
+
+/* ============================================================
+   ANALYTICS VIEW (simulated)
+   ============================================================ */
+function KpiCard(opts) {
+  return h('div', { class: 'card kpi' },
+    h('div', { class: 'kpi-top' },
+      h('span', { class: 'kpi-label' }, opts.label),
+      opts.vals && Sparkline({ vals: opts.vals, color: opts.color || 'var(--teal)', w: 66, h: 26, fill: false })),
+    h('div', { class: 'kpi-val' }, opts.value, opts.unit && h('span', { class: 'unit' }, opts.unit)),
+    opts.delta && h('div', { class: 'kpi-delta ' + (opts.dir || 'flat') },
+      (opts.dir === 'up' ? '▲' : opts.dir === 'down' ? '▼' : '–') + ' ' + opts.delta,
+      h('span', { style: { color: 'var(--faint)' } }, ' vs 7d avg')));
+}
+function card(title, sub, body, padStyle) {
+  return h('div', { class: 'card' },
+    h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, title), h('span', { class: 'ch-spacer' }),
+      sub === 'live' ? chip('live', 'on') : (sub && h('span', { class: 'ch-sub' }, sub))),
+    h('div', { style: padStyle || { padding: '14px 14px 10px' } }, body));
+}
+function AnalyticsView() {
+  var range = '24h';
+  var countChart = AreaChart({ vals: ANALYTICS.countOverTime, color: 'var(--teal)', height: 210, min: 0, max: 10, live: true });
+  var actChart = AreaChart({ vals: ANALYTICS.activity, color: 'var(--cyan)', height: 210, min: 0, max: 100, fmtY: function (v) { return Math.round(v); }, live: true });
+  // live ticking of the two area charts
+  every(1500, function () {
+    ANALYTICS.countOverTime = ANALYTICS.countOverTime.slice(1).concat(clamp(Math.round(ANALYTICS.countOverTime[ANALYTICS.countOverTime.length - 1] + rand(-1, 1)), 4, 9));
+    ANALYTICS.activity = ANALYTICS.activity.slice(1).concat(clamp(ANALYTICS.activity[ANALYTICS.activity.length - 1] + rand(-8, 8), 8, 100));
+    countChart.update(ANALYTICS.countOverTime); actChart.update(ANALYTICS.activity);
+  });
+  var hourLabels = HOURS.map(pad2);
+  var seg = h('div', { class: 'seg' }, ['6h', '24h', '7d', '30d'].map(function (r) {
+    return h('button', { class: 'seg-btn' + (r === range ? ' on' : ''), onclick: function (e) {
+      range = r; seg.querySelectorAll('.seg-btn').forEach(function (b) { b.classList.remove('on'); }); e.target.classList.add('on');
+    } }, r);
+  }));
+
+  var liveChip = chip('live', 'on'); liveChip.insertBefore(liveDot(), liveChip.firstChild);
+  var countCardEl = h('div', { class: 'card' },
+    h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Fish Count Over Time'), h('span', { class: 'ch-spacer' }), liveChip),
+    h('div', { style: { padding: '14px 14px 10px' } }, countChart.node));
+
+  return h('div', { class: 'view', style: { display: 'flex', flexDirection: 'column', gap: '16px' } },
+    h('div', { class: 'row-between' },
+      h('div', null,
+        h('div', { class: 'section-title' }, 'Tank Analytics'),
+        h('div', { class: 'mono', style: { color: 'var(--dim)', fontSize: '12px', marginTop: '2px' } }, 'Last 24 hours · auto-refreshing · simulated history')),
+      seg),
+    h('div', { class: 'grid cols-4' },
+      KpiCard({ label: 'Avg Fish Count', value: '7.2', delta: '+0.4', dir: 'up', color: 'var(--teal)', vals: ANALYTICS.countOverTime.slice(-16) }),
+      KpiCard({ label: 'Activity Index', value: '64', unit: '/100', delta: '+8%', dir: 'up', color: 'var(--cyan)', vals: ANALYTICS.activity.slice(-16) }),
+      KpiCard({ label: 'Mean Confidence', value: '88', unit: '%', delta: '+2%', dir: 'up', color: 'var(--aqua)', vals: ANALYTICS.confidence.slice(-16).map(function (v) { return v * 100; }) }),
+      KpiCard({ label: 'ID Switches / hr', value: '3.1', delta: '-5', dir: 'down', color: 'var(--good)', vals: seriesNoise(16, 4, 1.5, 4) })),
+    h('div', { class: 'grid cols-2' },
+      countCardEl,
+      card('Activity Level', 'distance swum / interval', actChart.node)),
+    h('div', { class: 'grid cols-2' },
+      card('Circadian Rhythm', 'activity by hour · feeds ▮',
+        BarChart({ vals: ANALYTICS.circadian, labels: hourLabels, color: 'var(--deep)', height: 200, highlight: [8, 18] }).node,
+        { padding: '16px 14px 6px' }),
+      card('Spatial Heatmap', 'where fish dwell',
+        h('div', null, Heatmap({ grid: ANALYTICS.heatmap }),
+          h('div', { class: 'heat-legend' },
+            h('span', { class: 'mono' }, 'low'), h('div', { class: 'heat-bar' }), h('span', { class: 'mono' }, 'high'),
+            h('span', { class: 'mono', style: { marginLeft: 'auto', color: 'var(--dim)' } }, 'upper-center = feeding zone'))),
+        { padding: '16px' })),
+    PerFishTable());
+}
+function PerFishTable() {
+  return h('div', { class: 'card' },
+    h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Per-Fish Breakdown'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, FISH.length + ' individuals tracked')),
+    h('div', { class: 'ptable' },
+      h('div', { class: 'pt-head' },
+        h('span', null, 'Individual'), h('span', null, 'Species'), h('span', null, 'Confidence'),
+        h('span', null, 'Activity (px)'), h('span', null, 'Status'), h('span', null, '7-day trend')),
+      FISH.map(function (f, i) {
+        return h('div', { class: 'pt-row' },
+          h('span', { class: 'pt-name' }, h('span', { class: 'fish-swatch', style: { background: f.color, boxShadow: '0 0 6px ' + f.color } }), f.name + ' ', h('em', { class: 'mono' }, '#' + f.id)),
+          h('span', { class: 'mono dimc' }, f.species),
+          h('span', { class: 'mono' }, confBar(f.conf * 100, f.color), Math.round(f.conf * 100) + '%'),
+          h('span', { class: 'mono' }, f.active.toLocaleString()),
+          h('span', null, chip(f.status === 'alive' ? 'active' : 'idle', f.status === 'alive' ? 'on' : '')),
+          h('span', null, Sparkline({ vals: seriesNoise(20, f.active / 60, f.active / 220, i + 1), color: f.color, w: 110, h: 26 })));
+      })));
+}
+
+/* ============================================================
+   AI INSIGHTS VIEW (simulated)
+   ============================================================ */
+var SEV_COLOR = { alert: 'var(--alert)', warn: 'var(--warn)', good: 'var(--good)', info: 'var(--cyan)' };
+function insightIconPaths(kind) {
+  switch (kind) {
+    case 'alert': return [h('path', { d: 'M12 3l9 16H3z M12 10v4 M12 17.5v.1' })];
+    case 'temp': return [h('path', { d: 'M10 4a2 2 0 014 0v9a4 4 0 11-4 0z' })];
+    case 'eye': return [h('circle', { cx: '12', cy: '12', r: '3' }), h('path', { d: 'M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6z' })];
+    case 'model': return [h('rect', { x: '4', y: '4', width: '16', height: '16', rx: '2' }), h('path', { d: 'M9 9h6v6H9z' })];
+    default: return [h('path', { d: 'M12 3v4 M12 17v4 M3 12h4 M17 12h4 M6 6l2.5 2.5 M15.5 15.5L18 18' })];
+  }
+}
+function insightIcon(kind, color) {
+  return h('svg', { viewBox: '0 0 24 24', width: 16, height: 16, fill: 'none', stroke: color, 'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, insightIconPaths(kind));
+}
+function aiOrb() { return h('span', { class: 'ai-orb' }); }
+
+function TypeOut(text) {
+  var span = h('span', null);
+  var caret = h('span', { class: 'caret' }, '▍');
+  var n = 0;
+  span.appendChild(caret);
+  var id = setInterval(function () {
+    n += 2;
+    if (n >= text.length) { clearInterval(id); span.textContent = text; return; }
+    span.textContent = text.slice(0, n); span.appendChild(caret);
+  }, 14);
+  App.timers.push(id);
+  return span;
+}
+
+function AskTank() {
+  var body = h('div', { class: 'ask-body' });
+  var log = [{ role: 'ai', text: "Hi! I'm watching your tank in real time. Ask me anything — activity, individual fish, feeding, or system health." }];
+  function render() {
+    clear(body);
+    log.forEach(function (m, i) {
+      var bubble = h('div', { class: 'bubble ' + m.role });
+      if (m.role === 'ai' && i === log.length - 1 && i !== 0) bubble.appendChild(TypeOut(m.text));
+      else bubble.textContent = m.text;
+      body.appendChild(bubble);
+    });
+    body.scrollTop = body.scrollHeight;
+  }
+  function ask(text) {
+    var key = text.trim().toLowerCase();
+    var ans = ASK_ANSWERS[key] || "I analyzed the last 24h of tracking data. Activity and detection metrics are within normal range, with 6–8 fish tracked continuously. Try one of the suggested questions for a detailed read-out.";
+    log.push({ role: 'user', text: text }); log.push({ role: 'ai', text: ans });
+    render(); input.value = '';
+  }
+  var input = h('input', { placeholder: 'Ask about your fish…' });
+  render();
+  return h('div', { class: 'card ask-card' },
+    h('div', { class: 'card-h' }, aiOrb(), h('span', { class: 'ch-title' }, 'Ask Your Tank'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, 'grounded in live detections')),
+    body,
+    h('div', { class: 'ask-sugg' }, SUGGESTED_Q.map(function (s) { return h('button', { class: 'sugg', onclick: function () { ask(s); } }, s); })),
+    h('form', { class: 'ask-input', onsubmit: function (e) { e.preventDefault(); if (input.value.trim()) ask(input.value); } },
+      input,
+      h('button', { type: 'submit', class: 'btn btn-primary', style: { padding: '8px 14px' } },
+        h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' }, h('path', { d: 'M22 2L11 13 M22 2l-7 20-4-9-9-4z' })))));
+}
+
+function InsightsView() {
+  var health = 92;
+  var sub = [
+    { k: 'Activity', v: 88, c: 'var(--teal)' }, { k: 'Detection', v: 95, c: 'var(--cyan)' },
+    { k: 'Behavior', v: 84, c: 'var(--aqua)' }, { k: 'System', v: 90, c: 'var(--deep)' }
+  ];
+  var healthCard = h('div', { class: 'card health-card' },
+    h('span', { class: 'bracket tl' }), h('span', { class: 'bracket br' }),
+    eyebrow('Tank Health', { marginBottom: '4px' }),
+    Ring({ value: health, size: 148, stroke: 12, color: 'var(--teal)', children: h('div', null,
+      h('div', { class: 'tabular', style: { fontSize: '40px', fontWeight: 700, lineHeight: 1, color: 'var(--teal)' } }, health),
+      eyebrow('Thriving', { marginTop: '2px' })) }),
+    h('div', { class: 'health-sub' }, sub.map(function (s) {
+      return h('div', { class: 'hs-row' },
+        h('span', { class: 'mono dimc' }, s.k),
+        h('div', { class: 'hs-bar' }, h('i', { style: { width: s.v + '%', background: s.c } })),
+        h('span', { class: 'mono', style: { color: s.c } }, s.v));
+    })));
+  var summaryCard = h('div', { class: 'card summary-card' },
+    h('div', { class: 'card-h' }, aiOrb(), h('span', { class: 'ch-title' }, 'Daily AI Summary'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, 'generated 06:00')),
+    h('div', { class: 'summary-body' },
+      h('p', null, h('b', { style: { color: 'var(--teal)' } }, 'Your tank had a calm, healthy day.'), ' ' + ASK_ANSWERS['summarize the last 24 hours']),
+      h('div', { class: 'summary-tags' },
+        chip('2 feeding responses', 'on'), chip('0 ID losses >30m'), chip('1 behavior flag', 'warn'), chip('92 health', 'on'))));
+  var feedList = h('div', { class: 'feed-list' }, INSIGHTS.map(function (it) {
+    return h('div', { class: 'insight ' + it.sev },
+      h('div', { class: 'ins-icon', style: { borderColor: SEV_COLOR[it.sev] } }, insightIcon(it.icon, SEV_COLOR[it.sev])),
+      h('div', { style: { minWidth: 0, flex: 1 } },
+        h('div', { class: 'ins-top' },
+          h('span', { class: 'ins-title' }, it.title), h('span', { class: 'ins-tag mono' }, it.tag), h('span', { class: 'ins-time mono' }, it.time)),
+        h('div', { class: 'ins-body' }, it.body),
+        h('div', { class: 'ins-conf' },
+          h('span', { class: 'mono dimc' }, 'AI confidence'),
+          confBar(it.conf * 100, SEV_COLOR[it.sev], 80),
+          h('span', { class: 'mono', style: { color: SEV_COLOR[it.sev] } }, Math.round(it.conf * 100) + '%'))));
+  }));
+
+  return h('div', { class: 'view insights-grid' },
+    h('div', { style: { display: 'flex', flexDirection: 'column', gap: '16px', minWidth: 0 } },
+      h('div', { class: 'grid cols-2', style: { gridTemplateColumns: '260px 1fr' } }, healthCard, summaryCard),
+      h('div', { class: 'card', style: { flex: 1 } },
+        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Insight Feed'), h('span', { class: 'ch-spacer' }), chip('1 needs attention', 'alert')),
+        feedList)),
+    AskTank());
+}
+
+/* ============================================================
+   LABEL & TRAIN VIEW — wired to real label/train endpoints
+   ============================================================ */
+function TrainingView() {
+  var current = null;
+  var capturing = false;
+
+  // ---- triage crop area ----
+  var triageBody = h('div', { class: 'triage-body' });
+  function renderTriage() {
+    clear(triageBody);
+    if (!current) {
+      triageBody.appendChild(h('div', { class: 'triage-empty' }, 'Queue empty — enable capture to collect detections from the live feed.'));
+      return;
+    }
+    var c = current, col = idColor(c.track_id);
+    var bb = c.bbox, w = c.img_w || 1, hh = c.img_h || 1;
+    var box = h('div', { class: 'crop-box', style: {
+      left: (bb[0] / w * 100) + '%', top: (bb[1] / hh * 100) + '%',
+      width: ((bb[2] - bb[0]) / w * 100) + '%', height: ((bb[3] - bb[1]) / hh * 100) + '%',
+      borderColor: col, boxShadow: '0 0 10px ' + col + '55' } },
+      h('span', { class: 'crop-label mono', style: { background: col } }, c.class_name + ' #' + c.track_id));
+    var frame = h('div', { class: 'crop-frame' },
+      h('img', { src: c.image_url + '?t=' + Date.now(), style: { position: 'absolute', inset: 0, width: '100%', height: '100%', objectFit: 'cover' } }),
+      box,
+      h('span', { class: 'crop-conf mono' }, c.class_name));
+    triageBody.appendChild(frame);
+    triageBody.appendChild(h('div', { class: 'triage-q' }, 'Is this a fish?'));
+    triageBody.appendChild(h('div', { class: 'triage-actions' },
+      h('button', { class: 'tri-btn reject', onclick: function () { decide(0); } },
+        h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2.5' }, h('path', { d: 'M6 6l12 12M18 6L6 18' })),
+        'No ', h('em', { class: 'mono' }, 'n')),
+      h('button', { class: 'tri-btn accept', onclick: function () { decide(1); } },
+        h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2.5' }, h('path', { d: 'M4 12l5 5L20 6' })),
+        'Yes ', h('em', { class: 'mono' }, 'y'))));
+  }
+  function decide(keep) {
+    if (!current) return;
+    var cid = current.id; current = null;
+    fetch('/label/decision?id=' + encodeURIComponent(cid) + '&keep=' + keep)
+      .then(function (r) { return r.json(); }).then(function () { pollQueue(); refreshLabels(); });
+  }
+  var queueCountEl = h('span', { class: 'tabular' }, '0');
+  function pollQueue() {
+    fetch('/label/queue').then(function (r) { return r.json(); }).then(function (d) {
+      queueCountEl.textContent = d.count || 0;
+      if (!d.count) { current = null; renderTriage(); return; }
+      var next = d.queue[0];
+      if (current && current.id === next.id) return;
+      current = next; renderTriage();
+    }).catch(function () {});
+  }
+
+  var capToggle = h('div', { class: 'toggle', onclick: function () {
+    fetch('/label/toggle').then(function (r) { return r.json(); }).then(function (d) {
+      capturing = !!d.enabled; capToggle.classList.toggle('on', capturing); capLabel.textContent = capturing ? 'capturing' : 'paused';
+      capLabel.style.color = capturing ? 'var(--teal)' : 'var(--dim)';
+    });
+  } }, h('i', null));
+  var capLabel = h('span', { class: 'mono', style: { fontSize: '11px', color: 'var(--dim)' } }, 'paused');
+  // sync capture state on load
+  fetch('/label/state').then(function (r) { return r.json(); }).then(function (d) {
+    capturing = !!d.enabled; capToggle.classList.toggle('on', capturing);
+    capLabel.textContent = capturing ? 'capturing' : 'paused'; capLabel.style.color = capturing ? 'var(--teal)' : 'var(--dim)';
+  }).catch(function () {});
+
+  // ---- dataset progress + train ----
+  var need = 100, saved = 0, estimate = null;
+  var savedEl = h('div', { class: 'tabular', style: { fontSize: '34px', fontWeight: 700 } }, '0', h('span', { style: { fontSize: '15px', color: 'var(--dim)' } }, '/' + need));
+  var progBar = h('i', { style: { width: '0%' } });
+  var estEl = h('span', { class: 'tabular' }, '~16m');
+  var trainBtn = h('button', { class: 'btn btn-primary', disabled: true, style: { width: '100%', marginTop: '14px', justifyContent: 'center', opacity: 0.45 }, onclick: confirmTraining },
+    h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' }, h('path', { d: 'M12 2a4 4 0 014 4v1a4 4 0 010 8 4 4 0 11-8 0 4 4 0 010-8V6a4 4 0 014-4z' })),
+    'Need labels');
+  function refreshLabels() {
+    fetch('/train/labels').then(function (r) { return r.json(); }).then(function (d) {
+      saved = d.count; need = d.min_required; estimate = d.estimate;
+      clear(savedEl); savedEl.appendChild(document.createTextNode(saved));
+      savedEl.appendChild(h('span', { style: { fontSize: '15px', color: 'var(--dim)' } }, '/' + need));
+      savedEl.style.color = d.ready ? 'var(--teal)' : 'var(--text)';
+      progBar.style.width = Math.min(saved / need * 100, 100) + '%';
+      if (d.estimate) estEl.textContent = '~' + Math.round((d.estimate.low_min + d.estimate.high_min) / 2) + 'm';
+      trainBtn.disabled = !d.ready || App.trainModalOpen;
+      trainBtn.style.opacity = (d.ready && !App.trainModalOpen) ? 1 : 0.45;
+      clear(trainBtn); trainBtn.appendChild(h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' }, h('path', { d: 'M12 2a4 4 0 014 4v1a4 4 0 010 8 4 4 0 11-8 0 4 4 0 010-8V6a4 4 0 014-4z' })));
+      trainBtn.appendChild(document.createTextNode(d.ready ? 'Train new model' : ('Need ' + Math.max(0, need - saved) + ' more labels')));
+    }).catch(function () {});
+  }
+  function confirmTraining() {
+    if (!estimate) return;
+    var e = estimate;
+    var ok = window.confirm('Train a new model on your labeled data?\n\n' +
+      '• Estimated time: ~' + e.low_min + '–' + e.high_min + ' minutes (' + e.epochs + ' epochs)\n' +
+      '• Inference will pause while the GPU is in use\n' +
+      '• On success a new models/best.engine_v<N> appears in the model list\n\nContinue?');
+    if (!ok) return;
+    fetch('/train/start').then(function (r) { return r.json(); }).then(function (d) {
+      if (d.error) { alert('Could not start training: ' + d.error); return; }
+      openTrainModal(); startTrainPolling();
+    });
+  }
+
+  // models list (real /models)
+  var modelList = h('div', { class: 'model-list' });
+  var modelCountEl = h('span', { class: 'ch-sub' }, '0');
+  function loadModels() {
+    fetch('/models').then(function (r) { return r.json(); }).then(function (d) {
+      clear(modelList);
+      var models = d.models || [], curBase = (d.current || '').split('/').pop();
+      modelCountEl.textContent = models.length;
+      if (!models.length) { modelList.appendChild(h('div', { class: 'model-meta mono', style: { padding: '10px' } }, 'No model files found.')); return; }
+      models.forEach(function (m) {
+        var base = m.split('/').pop(), active = base === curBase;
+        modelList.appendChild(h('div', { class: 'model-row' + (active ? ' active' : ''), style: { cursor: 'pointer' },
+          onclick: function () { fetch('/model?v=' + encodeURIComponent(base)).then(loadModels); } },
+          h('div', { style: { minWidth: 0 } },
+            h('div', { class: 'model-name mono' }, base, active && chip('active', 'on')),
+            h('div', { class: 'model-meta mono' }, m)),
+          active && h('div', { class: 'model-stats' }, h('div', null, h('span', { class: 'kpi-label' }, 'in use'), h('span', { class: 'tabular', style: { color: 'var(--teal)' } }, '●')))));
+      });
+    }).catch(function () {});
+  }
+
+  // ---- triage polling + shortcuts ----
+  pollQueue(); refreshLabels(); loadModels();
+  every(1000, pollQueue);
+  every(3000, refreshLabels);
+  var keyHandler = function (e) {
+    if (App.page !== 'training' || App.trainModalOpen) return;
+    if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT')) return;
+    if (e.key === 'y' || e.key === 'Y' || e.key === 'ArrowRight') decide(1);
+    if (e.key === 'n' || e.key === 'N' || e.key === 'ArrowLeft') decide(0);
+  };
+  document.addEventListener('keydown', keyHandler);
+  App.observers.push({ disconnect: function () { document.removeEventListener('keydown', keyHandler); } });
+
+  // resume an in-progress run if user reloaded mid-train
+  fetch('/train/status').then(function (r) { return r.json(); }).then(function (s) {
+    if (s.running || s.state === 'training' || s.state === 'starting' || s.state === 'exporting') { openTrainModal(); startTrainPolling(); }
+  }).catch(function () {});
+
+  return h('div', { class: 'view training-grid' },
+    h('div', { style: { display: 'flex', flexDirection: 'column', gap: '16px', minWidth: 0 } },
+      h('div', { class: 'card' },
+        h('div', { class: 'card-h' },
+          h('span', { class: 'ch-title' }, 'Active Learning · Label Triage'), h('span', { class: 'ch-spacer' }), capToggle, capLabel),
+        triageBody)),
+    h('div', { style: { display: 'flex', flexDirection: 'column', gap: '16px' } },
+      h('div', { class: 'card pad' },
+        eyebrow('Dataset Progress', { marginBottom: '12px' }),
+        h('div', { class: 'row-between', style: { alignItems: 'flex-end' } }, savedEl, h('span', { class: 'mono', style: { fontSize: '11px', color: 'var(--dim)' } }, 'labels to retrain')),
+        h('div', { class: 'tm-bar', style: { marginTop: '10px' } }, progBar),
+        h('div', { class: 'grid cols-2', style: { gap: '10px', marginTop: '14px' } },
+          h('div', { class: 'mini-stat' }, h('span', { class: 'kpi-label' }, 'In queue'), queueCountEl),
+          h('div', { class: 'mini-stat' }, h('span', { class: 'kpi-label' }, 'Est. train'), estEl)),
+        trainBtn,
+        h('div', { class: 'mono', style: { fontSize: '10px', color: 'var(--faint)', marginTop: '8px', textAlign: 'center' } }, 'Tip: press y / n to triage fast')),
+      h('div', { class: 'card' },
+        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Model Versions'), h('span', { class: 'ch-spacer' }), modelCountEl),
+        modelList)));
+}
+
+/* ---- real training modal (status/log polling) ---- */
 function openTrainModal() {
-  trainModalOpen = true;
-  document.getElementById('train-overlay').classList.add('open');
-  const cancelBtn = document.getElementById('train-cancel');
-  cancelBtn.style.display = '';
-  cancelBtn.disabled = false;
-  cancelBtn.textContent = 'Cancel';
-  document.getElementById('train-close').style.display = 'none';
-  // Disable both model dropdowns, the epochs dropdown, and the train button
-  document.querySelectorAll(
-    '#model-select, #label-model-select, #settings-model-select, #settings-label-model-select'
-  ).forEach(s => s.disabled = true);
-  const es = document.getElementById('train-epochs');
-  if (es) es.disabled = true;
-  document.getElementById('train-btn').disabled = true;
-}
+  if (App.trainModal) return;
+  App.trainModalOpen = true;
+  var stateLine = h('div', { class: 'mono', style: { color: 'var(--text-2)', fontSize: '13px' } }, 'starting…');
+  var bar = h('i', { style: { width: '0%' } });
+  var epochEl = h('div', { class: 'tabular tm-big' }, '—');
+  var elapsedEl = h('div', { class: 'tabular tm-big' }, '—');
+  var etaEl = h('div', { class: 'tabular tm-big' }, '—');
+  var verEl = h('div', { class: 'tabular tm-big' }, '—');
+  var statusChip = chip('GPU in use · inference paused', 'warn');
+  var logBox = h('div', { class: 'tm-log', style: { height: '180px' } }, 'waiting for training subprocess output…');
+  var titleEl = h('span', { class: 'ch-title' }, 'Training model');
+  var cancelBtn = h('button', { class: 'btn btn-ghost', style: { color: 'var(--alert)', borderColor: 'rgba(255,111,111,.4)' }, onclick: cancelTraining }, 'Cancel');
+  var closeBtn = h('button', { class: 'btn btn-primary', style: { display: 'none' }, onclick: closeTrainModal }, 'Close & resume');
+  var actions = h('div', { style: { display: 'flex', gap: '10px', justifyContent: 'flex-end', marginTop: '14px' } }, cancelBtn, closeBtn);
 
-function closeTrainModal() {
-  // Tell the tracker the user has acknowledged the training-finished modal.
-  // (Server-side this is now a no-op once training has ended — the unacked
-  // flag is cleared automatically when the subprocess exits — but we still
-  // fire it so a Close-clicked-while-active path also resumes inference.)
-  fetch('/train/acknowledge').catch(() => {});
-  trainModalOpen = false;
-  _sawTrainingActive = false;
-  if (_autoDismissTimer) { clearTimeout(_autoDismissTimer); _autoDismissTimer = 0; }
-  document.getElementById('train-overlay').classList.remove('open');
-  if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
-  document.querySelectorAll(
-    '#model-select, #label-model-select, #settings-model-select, #settings-label-model-select'
-  ).forEach(s => s.disabled = false);
-  const es = document.getElementById('train-epochs');
-  if (es) es.disabled = false;
-  refreshTrainLabels();
+  var modal = h('div', { class: 'modal-scrim', onclick: function (e) { if (e.target === modal && closeBtn.style.display !== 'none') closeTrainModal(); } },
+    h('div', { class: 'card train-modal' },
+      h('div', { class: 'card-h' }, aiOrb(), titleEl, h('span', { class: 'ch-spacer' }), statusChip),
+      h('div', { style: { padding: '16px' } },
+        h('div', { style: { marginBottom: '14px' } }, stateLine),
+        h('div', { class: 'tm-stat-row' },
+          h('div', null, h('div', { class: 'kpi-label' }, 'Epoch'), epochEl),
+          h('div', null, h('div', { class: 'kpi-label' }, 'Elapsed'), elapsedEl),
+          h('div', null, h('div', { class: 'kpi-label' }, 'ETA'), etaEl),
+          h('div', null, h('div', { class: 'kpi-label' }, 'Version'), verEl)),
+        h('div', { class: 'tm-bar' }, bar),
+        h('div', { style: { margin: '14px 0' } }, logBox),
+        actions)));
+  document.body.appendChild(modal);
+  App.trainModal = { modal: modal, stateLine: stateLine, bar: bar, epochEl: epochEl, elapsedEl: elapsedEl, etaEl: etaEl, verEl: verEl, statusChip: statusChip, logBox: logBox, titleEl: titleEl, cancelBtn: cancelBtn, closeBtn: closeBtn };
 }
-
+function startTrainPolling() {
+  if (App.trainPoll) clearInterval(App.trainPoll);
+  pollTrainStatus(); pollTrainLog();
+  App.trainPoll = setInterval(function () { pollTrainStatus(); pollTrainLog(); }, 2000);
+}
+function pollTrainStatus() {
+  fetch('/train/status').then(function (r) { return r.json(); }).then(updateTrainModal).catch(function () {});
+}
+function pollTrainLog() {
+  var m = App.trainModal; if (!m) return;
+  fetch('/train/log').then(function (r) { return r.json(); }).then(function (d) {
+    var txt = (d && d.log) || '';
+    if (!txt) { m.logBox.textContent = 'waiting for training subprocess output…'; return; }
+    var pinned = (m.logBox.scrollHeight - m.logBox.clientHeight - m.logBox.scrollTop) < 24;
+    m.logBox.textContent = txt;
+    if (pinned) m.logBox.scrollTop = m.logBox.scrollHeight;
+  }).catch(function () {});
+}
+function updateTrainModal(s) {
+  var m = App.trainModal; if (!m) return;
+  var cur = s.current_epoch || 0, tot = s.total_epochs || 0, pct = tot > 0 ? Math.round(100 * cur / tot) : 0;
+  m.bar.style.width = pct + '%';
+  m.stateLine.textContent = (s.message || s.state || '…') + (tot ? ('   (' + pct + '%)') : '');
+  clear(m.epochEl); m.epochEl.appendChild(document.createTextNode(cur || '—'));
+  if (tot) m.epochEl.appendChild(h('span', { style: { color: 'var(--dim)', fontSize: '14px' } }, '/' + tot));
+  m.elapsedEl.textContent = fmtSec(s.elapsed_sec);
+  m.etaEl.textContent = fmtSec(s.eta_sec);
+  m.verEl.textContent = s.version != null ? ('v' + s.version) : '—';
+  var running = s.running || s.state === 'training' || s.state === 'starting' || s.state === 'exporting';
+  if (App.setFeedPaused) App.setFeedPaused(running);
+  if (s.state === 'done') {
+    m.titleEl.textContent = 'Training complete';
+    clear(m.statusChip); m.statusChip.className = 'chip on'; m.statusChip.textContent = 'done';
+    m.stateLine.innerHTML = '✓ Saved <b>' + ((s.engine_path || '').split('/').pop() || 'engine') + '</b>. Click Close to resume inference with the new model.';
+    m.cancelBtn.style.display = 'none'; m.closeBtn.style.display = '';
+    if (App.trainPoll) { clearInterval(App.trainPoll); App.trainPoll = null; }
+    if (s.latest_engine) { var base = s.latest_engine.split('/').pop(); fetch('/model?v=' + encodeURIComponent(base)); }
+  } else if (s.state === 'failed') {
+    m.titleEl.textContent = 'Training failed';
+    clear(m.statusChip); m.statusChip.className = 'chip alert'; m.statusChip.textContent = 'failed';
+    m.stateLine.textContent = '✗ ' + (s.message || 'unknown error');
+    m.cancelBtn.style.display = 'none'; m.closeBtn.style.display = '';
+    if (App.trainPoll) { clearInterval(App.trainPoll); App.trainPoll = null; }
+  }
+}
 function cancelTraining() {
   if (!confirm('Cancel training? Progress will be lost.')) return;
-  // Lock the button + show that something's happening, so a slow ultralytics
-  // shutdown doesn't make the modal feel frozen between click and the next
-  // 2s status poll.
-  const btn = document.getElementById('train-cancel');
-  if (btn) { btn.disabled = true; btn.textContent = 'Cancelling…'; }
-  document.getElementById('train-state-line').textContent = 'Cancelling — stopping the trainer…';
-  fetch('/train/cancel').catch(() => {});
+  fetch('/train/cancel').then(function (r) { return r.json(); }).catch(function () {});
+}
+function closeTrainModal() {
+  fetch('/train/acknowledge').catch(function () {});
+  if (App.trainPoll) { clearInterval(App.trainPoll); App.trainPoll = null; }
+  if (App.trainModal && App.trainModal.modal.parentNode) document.body.removeChild(App.trainModal.modal);
+  App.trainModal = null; App.trainModalOpen = false;
+  if (App.setFeedPaused) App.setFeedPaused(false);
 }
 
-function startTrainPolling() {
-  if (trainPollInterval) clearInterval(trainPollInterval);
-  pollTrainStatus();
-  pollTrainLog();
-  trainPollInterval = setInterval(() => { pollTrainStatus(); pollTrainLog(); }, 2000);
-}
+/* ============================================================
+   DEVICE HEALTH VIEW
+   ============================================================ */
+function SystemView() {
+  var uptime = 6 * 3600 + 41 * 60;
+  var gpuHist = Array.from({ length: 48 }, function () { return App.live.gpu; });
+  var cpuHist = Array.from({ length: 48 }, function () { return App.live.cpu; });
+  function tempColor(t) { return t >= 75 ? 'var(--alert)' : t >= 68 ? 'var(--warn)' : 'var(--good)'; }
 
-function pollTrainStatus() {
-  fetch('/train/status').then(r => r.json()).then(updateTrainModal).catch(() => {});
-}
+  var gaugeWrap = h('div', { class: 'grid cols-4' });
+  var gpuChart = AreaChart({ vals: gpuHist, color: 'var(--warn)', height: 170, min: 40, max: 90, fmtY: function (v) { return v + '°'; }, live: true });
+  var cpuChart = AreaChart({ vals: cpuHist, color: 'var(--deep)', height: 170, min: 40, max: 90, fmtY: function (v) { return v + '°'; }, live: true });
+  var infBody = h('div', null), memBody = h('div', null);
+  var uptimeEl = h('span', { class: 'tabular', style: { color: 'var(--teal)' } }, fmtUptime(uptime));
+  var engineEl = h('span', { class: 'tabular' }, App.live.model || '—');
+  var tempNote = h('span', { class: 'ch-sub' }, App.live.realTemps ? 'last 48s · throttle @ 87°C' : 'simulated (no telemetry)');
 
-function pollTrainLog() {
-  fetch('/train/log').then(r => r.json()).then(d => {
-    const box = document.getElementById('train-log-wrap');
-    if (!box) return;
-    const txt = (d && d.log) || '';
-    if (!txt) {
-      box.classList.add('empty');
-      box.textContent = 'waiting for training subprocess output…';
-      return;
-    }
-    box.classList.remove('empty');
-    // Pin to bottom only if user is already at the bottom.
-    const pinned = (box.scrollHeight - box.clientHeight - box.scrollTop) < 24;
-    box.textContent = txt;
-    if (pinned) box.scrollTop = box.scrollHeight;
-  }).catch(() => {});
-}
-
-// Active tab inside the training modal ('charts' or 'logs'). Persisted so a
-// poll-driven redraw doesn't yank the user back to the default.
-let trainCurrentTab = 'charts';
-function setTrainTab(name) {
-  trainCurrentTab = name;
-  document.querySelectorAll('.train-tab').forEach(t => {
-    t.classList.toggle('active', t.dataset.tab === name);
-  });
-  document.querySelectorAll('.train-tab-pane').forEach(p => p.classList.remove('active'));
-  const pane = document.getElementById('train-pane-' + name);
-  if (pane) pane.classList.add('active');
-  // Force a chart redraw when switching back to Charts so the canvas
-  // re-fits the (now visible) container size.
-  if (name === 'charts' && _lastTrainStatus) drawTrainCharts(_lastTrainStatus);
-}
-
-const LOSS_COLORS = {
-  total:    '#f5c518',
-  box_loss: '#4fc3f7',
-  cls_loss: '#fc5c65',
-  dfl_loss: '#00d4aa',
-};
-
-function _fmtChartNum(v) {
-  if (v == null || !isFinite(v)) return '';
-  const a = Math.abs(v);
-  if (a >= 1000) return Math.round(v).toString();
-  if (a >= 10)   return v.toFixed(0);
-  if (a >= 1)    return v.toFixed(2);
-  return v.toFixed(3);
-}
-
-// Resize the canvas's pixel buffer to match its CSS box at devicePixelRatio,
-// so lines stay sharp on hi-DPI displays.
-function _fitCanvas(canvas) {
-  const dpr = window.devicePixelRatio || 1;
-  const rect = canvas.getBoundingClientRect();
-  const cssH = rect.height || parseFloat(canvas.getAttribute('height')) || 80;
-  const cssW = rect.width  || 600;
-  const w = Math.max(1, Math.floor(cssW * dpr));
-  const h = Math.max(1, Math.floor(cssH * dpr));
-  if (canvas.width  !== w) canvas.width  = w;
-  if (canvas.height !== h) canvas.height = h;
-  return { dpr, w, h };
-}
-
-// Minimal canvas line chart. `series` = [{name, color, points: [{x, y}, ...]}];
-// `opts` may pin yMin/yMax/xMin/xMax. Series with 0 points are skipped.
-function _drawLineChart(canvasId, series, opts) {
-  const cv = document.getElementById(canvasId);
-  if (!cv) return;
-  const ctx = cv.getContext('2d');
-  const { dpr, w, h } = _fitCanvas(cv);
-  ctx.setTransform(1, 0, 0, 1, 0, 0);
-  ctx.clearRect(0, 0, w, h);
-
-  const pad = { l: 42 * dpr, r: 8 * dpr, t: 6 * dpr, b: 16 * dpr };
-  const plotW = w - pad.l - pad.r;
-  const plotH = h - pad.t - pad.b;
-
-  const nonEmpty = series.filter(s => s.points && s.points.length);
-  if (!nonEmpty.length) {
-    ctx.fillStyle = '#4a5568';
-    ctx.font = (11 * dpr) + 'px monospace';
-    ctx.textBaseline = 'middle';
-    ctx.textAlign = 'left';
-    ctx.fillText('no data yet', pad.l, h / 2);
-    return;
-  }
-  opts = opts || {};
-  let xMin = (opts.xMin != null) ? opts.xMin : Infinity;
-  let xMax = (opts.xMax != null) ? opts.xMax : -Infinity;
-  let yMin = (opts.yMin != null) ? opts.yMin : Infinity;
-  let yMax = (opts.yMax != null) ? opts.yMax : -Infinity;
-  for (const s of nonEmpty) {
-    for (const p of s.points) {
-      if (opts.xMin == null && p.x < xMin) xMin = p.x;
-      if (opts.xMax == null && p.x > xMax) xMax = p.x;
-      if (opts.yMin == null && p.y < yMin) yMin = p.y;
-      if (opts.yMax == null && p.y > yMax) yMax = p.y;
-    }
-  }
-  if (!isFinite(xMin) || !isFinite(xMax) || xMin === xMax) { xMin = 0; xMax = 1; }
-  if (!isFinite(yMin) || !isFinite(yMax) || yMin === yMax) { yMin = 0; yMax = yMax || 1; }
-
-  // Y grid + labels
-  ctx.strokeStyle = '#1e2d3d';
-  ctx.lineWidth = 1 * dpr;
-  ctx.fillStyle = '#4a5568';
-  ctx.font = (10 * dpr) + 'px monospace';
-  ctx.textBaseline = 'middle';
-  ctx.textAlign = 'right';
-  const yTicks = 3;
-  for (let i = 0; i <= yTicks; i++) {
-    const yy = pad.t + plotH * (i / yTicks);
-    ctx.beginPath();
-    ctx.moveTo(pad.l, yy);
-    ctx.lineTo(pad.l + plotW, yy);
-    ctx.stroke();
-    const v = yMax - (yMax - yMin) * (i / yTicks);
-    ctx.fillText(_fmtChartNum(v), pad.l - 4 * dpr, yy);
-  }
-  // X axis label (just min/max)
-  ctx.textAlign = 'left';  ctx.textBaseline = 'top';
-  ctx.fillText(_fmtChartNum(xMin), pad.l, pad.t + plotH + 2 * dpr);
-  ctx.textAlign = 'right';
-  ctx.fillText(_fmtChartNum(xMax), pad.l + plotW, pad.t + plotH + 2 * dpr);
-
-  // Lines
-  for (const s of nonEmpty) {
-    ctx.strokeStyle = s.color || '#00d4aa';
-    ctx.lineWidth = 2 * dpr;
-    ctx.beginPath();
-    s.points.forEach((p, i) => {
-      const px = pad.l + plotW * ((p.x - xMin) / (xMax - xMin || 1));
-      const py = pad.t + plotH * (1 - (p.y - yMin) / (yMax - yMin || 1));
-      if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+  function renderGauges() {
+    clear(gaugeWrap);
+    var L = App.live;
+    [gauge(L.cpu, 'CPU Temp', '°C', tempColor(L.cpu)),
+     gauge(L.gpu, 'GPU Temp', '°C', tempColor(L.gpu)),
+     gauge(L.gpuUtil, 'GPU Util', '%', 'var(--teal)'),
+     gauge(Math.round(L.ram / 8 * 100), 'RAM', '%', 'var(--cyan)')].forEach(function (g) {
+      gaugeWrap.appendChild(h('div', { class: 'card gauge-card' }, g));
     });
-    ctx.stroke();
   }
-}
-
-// Chart registry — adding a new chart is a single appended entry. Each
-// entry produces one card in the Charts grid.
-//
-//   id      — DOM-id prefix; the card uses `${id}-chart`, `${id}-now`, and
-//             optionally `${id}-legend`.
-//   title   — header label shown to the user.
-//   legend  — true if the card should render a swatch legend below the canvas
-//             (drives by `legendFor(s)` returning the series list).
-//   build(s) — returns { series, opts, now } given the latest status `s`.
-//
-// The renderer doesn't know anything about loss vs GPU vs RAM specifically;
-// it just walks this list. To add chart #6, append one more entry.
-const TRAIN_CHARTS = [
-  {
-    id: 'loss-total',
-    title: 'Total loss',
-    build(s) {
-      const samples = s.loss_samples || [];
-      return {
-        series: [{
-          name: 'total', color: LOSS_COLORS.total,
-          points: samples.map(d => ({ x: d.epoch, y: d.total })),
-        }],
-        opts: { yMin: 0 },
-        now: samples.length
-          ? ('epoch ' + samples[samples.length - 1].epoch + ' · '
-              + (samples[samples.length - 1].total != null
-                  ? samples[samples.length - 1].total.toFixed(3) : '—'))
-          : '—',
-      };
-    },
-  },
-  {
-    id: 'loss-components',
-    title: 'Component losses',
-    legend: true,
-    build(s) {
-      const samples = s.loss_samples || [];
-      const names = samples.length
-        ? Object.keys(samples[samples.length - 1])
-            .filter(k => k !== 'epoch' && k !== 'total')
-            .sort()
-        : [];
-      const series = names.map(name => ({
-        name, color: LOSS_COLORS[name] || '#00d4aa',
-        points: samples.map(d => ({ x: d.epoch, y: d[name] })),
-      }));
-      const now = samples.length
-        ? names.map(n => n.replace('_loss', '') + ' '
-            + (samples[samples.length - 1][n] != null
-                ? samples[samples.length - 1][n].toFixed(2) : '—')).join(' · ')
-        : '—';
-      return { series, opts: { yMin: 0 }, now };
-    },
-    legendFor(s) {
-      const samples = s.loss_samples || [];
-      if (!samples.length) return [];
-      return Object.keys(samples[samples.length - 1])
-        .filter(k => k !== 'epoch' && k !== 'total')
-        .sort()
-        .map(name => ({ name, color: LOSS_COLORS[name] || '#00d4aa' }));
-    },
-  },
-  {
-    id: 'gpu-util',
-    title: 'GPU utilization',
-    build(s) {
-      const g = s.gpu_samples || [];
-      const pts = g.filter(d => d.util_pct != null).map(d => ({ x: d.t, y: d.util_pct }));
-      const last = pts.length ? pts[pts.length - 1].y : null;
-      return {
-        series: [{ name: 'util', color: '#4fc3f7', points: pts }],
-        opts: { yMin: 0, yMax: 100 },
-        now: (last != null) ? (last.toFixed(0) + '%') : '—',
-      };
-    },
-  },
-  {
-    id: 'gpu-mem',
-    title: 'GPU memory',
-    build(s) {
-      const g = s.gpu_samples || [];
-      const pts = g.filter(d => d.mem_mb != null).map(d => ({ x: d.t, y: d.mem_mb }));
-      const last = pts.length ? pts[pts.length - 1].y : null;
-      const memTotal = s.gpu_mem_total_mb || 0;
-      return {
-        series: [{ name: 'mem', color: '#f5c518', points: pts }],
-        opts: { yMin: 0, yMax: memTotal || undefined },
-        now: (last != null)
-          ? (last + ' MB' + (memTotal ? ' / ' + memTotal + ' MB' : ''))
-          : '—',
-      };
-    },
-  },
-  {
-    id: 'ram',
-    title: 'RAM',
-    build(s) {
-      const g = s.gpu_samples || [];
-      const pts = g.filter(d => d.ram_mb != null).map(d => ({ x: d.t, y: d.ram_mb }));
-      const last = pts.length ? pts[pts.length - 1].y : null;
-      const ramTotal = s.ram_total_mb || 0;
-      return {
-        series: [{ name: 'ram', color: '#7c4dff', points: pts }],
-        opts: { yMin: 0, yMax: ramTotal || undefined },
-        now: (last != null)
-          ? (last + ' MB' + (ramTotal ? ' / ' + ramTotal + ' MB' : ''))
-          : '—',
-      };
-    },
-  },
-  // ↓ Analytics-only: validation metrics from Ultralytics' results.csv,
-  //   populated by train_jetson.py at the end of each run. Skipped during
-  //   the live training modal (`analyticsOnly: true`) so the user doesn't
-  //   stare at two permanently-empty cards while training is running.
-  {
-    id: 'val-map',
-    title: 'Validation mAP',
-    legend: true,
-    analyticsOnly: true,
-    build(s) {
-      const m = s.metrics || [];
-      const series = [
-        { name: 'mAP@50',     color: '#00d4aa',
-          points: m.filter(d => d.map50    != null).map(d => ({ x: d.epoch, y: d.map50    })) },
-        { name: 'mAP@50-95',  color: '#f5c518',
-          points: m.filter(d => d.map50_95 != null).map(d => ({ x: d.epoch, y: d.map50_95 })) },
-      ];
-      const last = m.length ? m[m.length - 1] : null;
-      return {
-        series, opts: { yMin: 0, yMax: 1 },
-        now: last
-          ? ('mAP@50 ' + (last.map50    != null ? last.map50.toFixed(3)    : '—') +
-             ' · mAP@50-95 ' + (last.map50_95 != null ? last.map50_95.toFixed(3) : '—'))
-          : '—',
-      };
-    },
-    legendFor() {
-      return [
-        { name: 'mAP@50',    color: '#00d4aa' },
-        { name: 'mAP@50-95', color: '#f5c518' },
-      ];
-    },
-  },
-  {
-    id: 'val-pr',
-    title: 'Precision / recall',
-    legend: true,
-    analyticsOnly: true,
-    build(s) {
-      const m = s.metrics || [];
-      const series = [
-        { name: 'precision', color: '#4fc3f7',
-          points: m.filter(d => d.precision != null).map(d => ({ x: d.epoch, y: d.precision })) },
-        { name: 'recall',    color: '#fc5c65',
-          points: m.filter(d => d.recall    != null).map(d => ({ x: d.epoch, y: d.recall    })) },
-      ];
-      const last = m.length ? m[m.length - 1] : null;
-      return {
-        series, opts: { yMin: 0, yMax: 1 },
-        now: last
-          ? ('P ' + (last.precision != null ? last.precision.toFixed(3) : '—') +
-             ' · R ' + (last.recall    != null ? last.recall.toFixed(3)    : '—'))
-          : '—',
-      };
-    },
-    legendFor() {
-      return [
-        { name: 'precision', color: '#4fc3f7' },
-        { name: 'recall',    color: '#fc5c65' },
-      ];
-    },
-  },
-];
-
-// Generic chart-grid builder. `prefix` namespaces the canvas + readout IDs
-// so multiple grids (live training modal vs. Analytics page) can render
-// the same TRAIN_CHARTS config side-by-side without ID collisions.
-// `kind` is 'live' (skip cfg.analyticsOnly entries) or 'analytics' (keep
-// everything).
-function _buildChartGrid(gridId, prefix, kind) {
-  const grid = document.getElementById(gridId);
-  if (!grid || grid.dataset.built === '1') return;
-  for (const cfg of TRAIN_CHARTS) {
-    if (cfg.analyticsOnly && kind !== 'analytics') continue;
-    const card = document.createElement('div');
-    card.className = 'train-chart-card';
-    const legendHtml = cfg.legend
-      ? '<div class="train-chart-legend" id="' + prefix + cfg.id + '-legend"></div>'
-      : '';
-    card.innerHTML =
-      '<div class="train-chart-head">' +
-        '<span>' + cfg.title + '</span>' +
-        '<span class="chart-now" id="' + prefix + cfg.id + '-now">—</span>' +
-      '</div>' +
-      '<canvas id="' + prefix + cfg.id + '-chart" height="90"></canvas>' +
-      legendHtml;
-    grid.appendChild(card);
+  function gauge(v, label, unit, color) { return Gauge({ value: Math.round(v), max: 100, label: label, unit: unit, color: color }); }
+  function kvRows(parent, rows) {
+    clear(parent);
+    rows.forEach(function (r) {
+      parent.appendChild(h('div', { class: 'kv-row' }, h('span', { class: 'mono dimc' }, r[0]), h('span', { class: 'tabular', style: { color: r[2] || 'var(--text)' } }, r[1])));
+    });
   }
-  grid.dataset.built = '1';
-}
-
-function _buildTrainChartCards() {
-  _buildChartGrid('train-pane-charts', '', 'live');
-}
-
-function _renderChartLegend(cfg, items, prefix) {
-  const el = document.getElementById((prefix || '') + cfg.id + '-legend');
-  if (!el) return;
-  el.innerHTML = '';
-  for (const it of items) {
-    const span = document.createElement('span');
-    span.innerHTML = '<span class="swatch" style="background:' + it.color + '"></span>' + it.name;
-    el.appendChild(span);
+  function renderPanels() {
+    var L = App.live;
+    kvRows(infBody, [
+      ['Pipeline FPS', L.fps.toFixed(1), 'var(--teal)'],
+      ['Latency / frame', (L.fps ? (1000 / L.fps).toFixed(1) : '—') + 'ms', null],
+      ['Tracked IDs', String(L.total), null],
+      ['Detections / s', String(Math.round(L.fps * L.active)), null]]);
+    kvRows(memBody, [
+      ['RAM used', L.ram.toFixed(1) + ' / 8 GB', null],
+      ['Swap', '0.2 / 4 GB', null],
+      ['GPU shared', '2.1 GB', null],
+      ['Model VRAM', '0.9 GB', null]]);
+    engineEl.textContent = L.model || '—';
   }
+
+  App.viewLive = function () {
+    renderGauges(); renderPanels();
+    gpuHist = gpuHist.slice(1).concat(App.live.gpu); cpuHist = cpuHist.slice(1).concat(App.live.cpu);
+    gpuChart.update(gpuHist); cpuChart.update(cpuHist);
+  };
+  every(1000, function () { uptime += 1; uptimeEl.textContent = fmtUptime(uptime); });
+  renderGauges(); renderPanels();
+
+  return h('div', { class: 'view', style: { display: 'flex', flexDirection: 'column', gap: '16px' } },
+    h('div', { class: 'card pad device-banner' },
+      h('span', { class: 'bracket tl' }), h('span', { class: 'bracket tr' }), h('span', { class: 'bracket bl' }), h('span', { class: 'bracket br' }),
+      h('div', { class: 'dev-icon' }, h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'var(--teal)', 'stroke-width': '1.6' },
+        h('rect', { x: '4', y: '4', width: '16', height: '16', rx: '2' }), h('rect', { x: '8', y: '8', width: '8', height: '8', rx: '1' }),
+        h('path', { d: 'M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3' }))),
+      h('div', { style: { flex: 1, minWidth: 0 } },
+        h('div', { style: { fontSize: '17px', fontWeight: 600 } }, 'Jetson Orin Nano 8GB'),
+        h('div', { class: 'mono', style: { color: 'var(--dim)', fontSize: '12px', marginTop: '3px' } }, 'JetPack 6.1 · 15W / MAXN · CUDA 12.2 · TensorRT 10.3')),
+      h('div', { class: 'db-stats' },
+        h('div', null, h('span', { class: 'kpi-label' }, 'Uptime'), uptimeEl),
+        h('div', null, h('span', { class: 'kpi-label' }, 'Power mode'), h('span', { class: 'tabular' }, 'MAXN')),
+        h('div', null, h('span', { class: 'kpi-label' }, 'Engine'), engineEl))),
+    gaugeWrap,
+    h('div', { class: 'grid cols-2' },
+      h('div', { class: 'card' },
+        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'GPU Temperature'), h('span', { class: 'ch-spacer' }), tempNote),
+        h('div', { style: { padding: '14px 14px 10px' } }, gpuChart.node)),
+      h('div', { class: 'card' },
+        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'CPU Temperature'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, '6-core Arm Cortex-A78AE')),
+        h('div', { style: { padding: '14px 14px 10px' } }, cpuChart.node))),
+    h('div', { class: 'grid cols-3' },
+      h('div', { class: 'card pad' }, eyebrow('Inference', { marginBottom: '12px' }), infBody),
+      h('div', { class: 'card pad' }, eyebrow('Memory', { marginBottom: '12px' }), memBody),
+      h('div', { class: 'card pad' }, eyebrow('Capture', { marginBottom: '12px' }),
+        (function () { var b = h('div', null); kvRows(b, [['Camera', 'Logitech C920'], ['Driver', 'V4L2 /dev/video0'], ['Resolution', App.live.resolution], ['Exposure', 'auto']]); return b; })())));
 }
 
-// Render every chart in TRAIN_CHARTS into `prefix`-namespaced DOM (used by
-// both the live training modal and the static Analytics page). `kind`
-// matches what _buildChartGrid used: 'live' skips analyticsOnly entries.
-function _drawChartsWithPrefix(s, prefix, kind) {
-  for (const cfg of TRAIN_CHARTS) {
-    if (cfg.analyticsOnly && kind !== 'analytics') continue;
-    const r = cfg.build(s) || { series: [], opts: {}, now: '—' };
-    _drawLineChart(prefix + cfg.id + '-chart', r.series, r.opts);
-    const now = document.getElementById(prefix + cfg.id + '-now');
-    if (now) now.textContent = r.now;
-    if (cfg.legend) {
-      _renderChartLegend(cfg, cfg.legendFor ? cfg.legendFor(s) : [], prefix);
-    }
+/* ============================================================
+   SETTINGS VIEW (toggles wired where a backend exists)
+   ============================================================ */
+function SettingsView() {
+  var s = { enhance: true, trails: false, sahi: false, record: true, public: false, hats: false, quality: 75, exposure: 'auto', interval: 60 };
+  function settingsRow(label, sub, control) {
+    return h('div', { class: 'set-row' },
+      h('div', null, h('div', { class: 'set-label' }, label), sub && h('div', { class: 'set-sub mono' }, sub)),
+      h('div', { class: 'set-control' }, control));
   }
-}
-
-function drawTrainCharts(s) {
-  _buildTrainChartCards();
-  _drawChartsWithPrefix(s, '', 'live');
-}
-
-// ── Analytics page ───────────────────────────────────────
-// Per-version training history is persisted by train_jetson.py at the end
-// of each successful run to `models/best_v<N>.status.json`. The Analytics
-// tab lists those versions in a dropdown and renders the same 5-chart
-// layout used by the live training modal, but pointed at the historic
-// status. Helpers reuse TRAIN_CHARTS + _drawLineChart with an "an-"
-// prefix so DOM IDs don't clash with the live modal.
-function _fmtSec(n) {
-  if (n == null || !isFinite(n)) return '—';
-  n = Math.max(0, Math.round(n));
-  const m = Math.floor(n / 60), s = n % 60;
-  return m + 'm ' + s + 's';
-}
-
-// Two chart configs for the inference-activity section. Independent of
-// TRAIN_CHARTS — different x-axis (snapshot index), different series.
-const INFERENCE_CHARTS = [
-  {
-    id: 'active',
-    title: 'Active fish (right now)',
-    series: (samples) => [{
-      name: 'active', color: '#00d4aa',
-      points: samples.map((s, i) => ({ x: i, y: s.active_fish || 0 })),
-    }],
-    opts: { yMin: 0 },
-    now: (samples) => {
-      const last = samples.length ? samples[samples.length - 1] : null;
-      return last ? (last.active_fish + ' active') : '—';
-    },
-  },
-  {
-    id: 'unique',
-    title: 'Unique IDs (cumulative)',
-    series: (samples) => [{
-      name: 'unique', color: '#f5c518',
-      points: samples.map((s, i) => ({ x: i, y: s.unique_fish || 0 })),
-    }],
-    opts: { yMin: 0 },
-    now: (samples) => {
-      const last = samples.length ? samples[samples.length - 1] : null;
-      return last ? (last.unique_fish + ' total') : '—';
-    },
-  },
-  {
-    id: 'frames',
-    title: 'Total frames processed',
-    series: (samples) => [{
-      name: 'frames', color: '#4fc3f7',
-      points: samples.map((s, i) => ({ x: i, y: s.total_frames || 0 })),
-    }],
-    opts: { yMin: 0 },
-    now: (samples) => {
-      const last = samples.length ? samples[samples.length - 1] : null;
-      return last ? last.total_frames.toLocaleString() : '—';
-    },
-  },
-];
-
-let _inferenceRefreshTimer = 0;
-
-function _buildInferenceChartCards() {
-  const grid = document.getElementById('inference-charts');
-  if (!grid || grid.dataset.built === '1') return;
-  for (const cfg of INFERENCE_CHARTS) {
-    const card = document.createElement('div');
-    card.className = 'train-chart-card';
-    card.innerHTML =
-      '<div class="train-chart-head">' +
-        '<span>' + cfg.title + '</span>' +
-        '<span class="chart-now" id="inf-' + cfg.id + '-now">—</span>' +
-      '</div>' +
-      '<canvas id="inf-' + cfg.id + '-chart" height="90"></canvas>';
-    grid.appendChild(card);
-  }
-  grid.dataset.built = '1';
-}
-
-function _fmtDuration(sec) {
-  if (!isFinite(sec) || sec <= 0) return '—';
-  sec = Math.round(sec);
-  if (sec < 60) return sec + 's';
-  const m = Math.floor(sec / 60), s = sec % 60;
-  if (m < 60) return m + 'm ' + s + 's';
-  const h = Math.floor(m / 60), mr = m % 60;
-  return h + 'h ' + mr + 'm';
-}
-
-function loadInferenceHistory() {
-  fetch('/inference/history').then(r => r.json()).then(d => {
-    const samples = (d && d.samples) || [];
-    const summary = document.getElementById('inference-summary');
-    const empty   = document.getElementById('inference-empty');
-    const top     = document.getElementById('inference-top');
-    if (!samples.length) {
-      if (summary) summary.style.display = 'none';
-      if (empty)   empty.style.display = '';
-      if (top)     top.style.display = 'none';
-      return;
-    }
-    if (summary) summary.style.display = '';
-    if (empty)   empty.style.display = 'none';
-
-    const latest = d.latest || samples[samples.length - 1];
-    const set = (id, v) => {
-      const el = document.getElementById(id);
-      if (el) el.textContent = v;
+  // toggle wired to a real endpoint (endpoint optional → local only)
+  function toggle(key, endpoint, respKey) {
+    var tog = h('div', { class: 'toggle' + (s[key] ? ' on' : '') }, h('i', null));
+    tog.onclick = function () {
+      if (endpoint) {
+        fetch(endpoint).then(function (r) { return r.json(); }).then(function (d) { s[key] = !!d[respKey]; tog.classList.toggle('on', s[key]); });
+      } else { s[key] = !s[key]; tog.classList.toggle('on', s[key]); }
     };
-    // Render snapshot ts as HH:MM:SS for readability.
-    const ts = latest.ts || '';
-    const tsFmt = ts.length === 15
-      ? (ts.slice(9, 11) + ':' + ts.slice(11, 13) + ':' + ts.slice(13, 15))
-      : ts;
-    set('in-ts',     tsFmt);
-    set('in-frames', (latest.total_frames || 0).toLocaleString());
-    set('in-unique', latest.unique_fish || 0);
-    set('in-active', latest.active_fish || 0);
-
-    _buildInferenceChartCards();
-    for (const cfg of INFERENCE_CHARTS) {
-      _drawLineChart('inf-' + cfg.id + '-chart',
-                     cfg.series(samples), cfg.opts);
-      const now = document.getElementById('inf-' + cfg.id + '-now');
-      if (now) now.textContent = cfg.now(samples);
-    }
-
-    // Top-fish table.
-    const tbody = document.querySelector('#inference-top-table tbody');
-    const tops = d.top_fish || [];
-    if (tbody) {
-      tbody.innerHTML = '';
-      for (const f of tops) {
-        const tr = document.createElement('tr');
-        tr.innerHTML =
-          '<td>#' + f.id + '</td>' +
-          '<td>' + (f.frame_count || 0).toLocaleString() + '</td>' +
-          '<td>' + Math.round(f.distance_px || 0).toLocaleString() + '</td>' +
-          '<td>' + _fmtDuration(f.duration_sec) + '</td>';
-        tbody.appendChild(tr);
-      }
-    }
-    if (top) top.style.display = tops.length ? '' : 'none';
-  }).catch(() => {});
-}
-
-function loadAnalyticsVersions() {
-  fetch('/train/history').then(r => r.json()).then(d => {
-    const sel = document.getElementById('analytics-version-select');
-    const empty = document.getElementById('analytics-empty');
-    const summary = document.getElementById('analytics-summary');
-    const charts = document.getElementById('analytics-charts');
-    if (!sel) return;
-    const versions = (d && d.versions) || [];
-    sel.innerHTML = '';
-    if (!versions.length) {
-      if (empty) empty.style.display = '';
-      if (summary) summary.style.display = 'none';
-      if (charts) charts.innerHTML = '';
-      const opt = document.createElement('option');
-      opt.textContent = '(no history)'; opt.disabled = true;
-      sel.appendChild(opt);
-      return;
-    }
-    if (empty) empty.style.display = 'none';
-    for (const v of versions) {
-      const opt = document.createElement('option');
-      opt.value = String(v);
-      opt.textContent = 'best_v' + v;
-      sel.appendChild(opt);
-    }
-    // Default: newest version. Build the chart grid once and load it.
-    sel.value = String(versions[0]);
-    _buildChartGrid('analytics-charts', 'an-', 'analytics');
-    loadAnalyticsModel(versions[0]);
-  }).catch(() => {});
-}
-
-function loadAnalyticsModel(version) {
-  if (version == null || version === '') return;
-  fetch('/train/history?version=' + encodeURIComponent(version))
-    .then(r => r.ok ? r.json() : null)
-    .then(s => {
-      if (!s) return;
-      // Populate the summary cells.
-      const last = (s.loss_samples && s.loss_samples.length)
-        ? s.loss_samples[s.loss_samples.length - 1] : null;
-      const set = (id, v) => {
-        const el = document.getElementById(id);
-        if (el) el.textContent = v;
-      };
-      set('an-version',  'v' + (s.version != null ? s.version : version));
-      set('an-state',    s.state || '—');
-      set('an-epochs',   (s.total_epochs != null ? s.total_epochs : '—'));
-      set('an-loss',     last && last.total != null ? last.total.toFixed(3) : '—');
-      const metrics = s.metrics || [];
-      const finalM = metrics.length ? metrics[metrics.length - 1] : null;
-      set('an-map50',     finalM && finalM.map50     != null ? finalM.map50.toFixed(3)     : '—');
-      set('an-precision', finalM && finalM.precision != null ? finalM.precision.toFixed(3) : '—');
-      set('an-recall',    finalM && finalM.recall    != null ? finalM.recall.toFixed(3)    : '—');
-      set('an-elapsed',  _fmtSec(s.elapsed_sec));
-      const ds = s.dataset_size != null
-        ? (s.dataset_size + ' (' + (s.train_size||0) + '/' + (s.val_size||0) + ')')
-        : '—';
-      set('an-dataset',  ds);
-      set('an-device',   s.device || '—');
-      set('an-imgsz',    s.imgsz != null ? (s.imgsz + ' px') : '—');
-      const summary = document.getElementById('analytics-summary');
-      if (summary) summary.style.display = '';
-      // Render the same chart suite as the training modal.
-      _drawChartsWithPrefix(s, 'an-', 'analytics');
-    }).catch(() => {});
-}
-
-// Re-draw the analytics charts on resize too (canvas needs explicit refit).
-window.addEventListener('resize', () => {
-  if (!document.body.classList.contains('analytics-tab')) return;
-  const sel = document.getElementById('analytics-version-select');
-  if (sel && sel.value) loadAnalyticsModel(sel.value);
-});
-
-function updateTrainStages(s) {
-  const cur = s.current_epoch || 0;
-  const tot = s.total_epochs || 0;
-  const pct = (tot > 0) ? Math.round(100 * cur / tot) : 0;
-  const state = s.state || 'idle';
-  const exporting = (state === 'exporting');
-
-  const s1 = document.getElementById('train-stage1');
-  const s2 = document.getElementById('train-stage2');
-  const s1bar  = document.getElementById('train-stage1-bar');
-  const s2bar  = document.getElementById('train-stage2-bar');
-  const s1text = document.getElementById('train-stage1-text');
-  const s2text = document.getElementById('train-stage2-text');
-  const s2wrap = s2bar.parentElement;
-  if (!s1 || !s2) return;
-
-  // Stage 1 — epoch loop
-  s1.classList.remove('active', 'done', 'skipped');
-  if (state === 'starting' || state === 'training') {
-    s1.classList.add('active');
-    s1bar.style.width = pct + '%';
-    s1text.textContent = tot ? (cur + '/' + tot + ' (' + pct + '%)') : 'starting…';
-  } else if (state === 'exporting' || state === 'done') {
-    s1.classList.add('done');
-    s1bar.style.width = '100%';
-    s1text.textContent = tot ? (tot + '/' + tot + ' ✓') : '✓';
-  } else if (state === 'failed') {
-    s1bar.style.width = pct + '%';
-    s1text.textContent = tot ? (cur + '/' + tot) : 'failed';
-  } else {
-    s1bar.style.width = '0%';
-    s1text.textContent = '—';
+    return tog;
   }
+  var qVal = h('span', { class: 'tabular', style: { color: 'var(--teal)', width: '26px' } }, s.quality);
+  var iVal = h('span', { class: 'tabular', style: { color: 'var(--teal)', width: '36px' } }, s.interval + 's');
 
-  // Stage 2 — TensorRT export. No % signal so we use the indeterminate stripe
-  // animation while running. On done, "skipped" if no engine_path (CPU/MPS).
-  s2.classList.remove('active', 'done', 'skipped');
-  s2wrap.classList.remove('indeterminate');
-  if (exporting) {
-    s2.classList.add('active');
-    s2wrap.classList.add('indeterminate');
-    s2text.textContent = 'exporting…';
-  } else if (state === 'done') {
-    if (s.engine_path) {
-      s2.classList.add('done');
-      s2text.textContent = 'engine saved ✓';
-    } else {
-      s2.classList.add('skipped');
-      s2text.textContent = 'skipped (CPU/MPS)';
-    }
-  } else if (state === 'failed') {
-    s2text.textContent = '—';
-  } else {
-    s2bar.style.width = '0%';
-    s2text.textContent = 'pending';
-  }
+  return h('div', { class: 'view', style: { display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '760px' } },
+    h('div', { class: 'card' },
+      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Pipeline')),
+      h('div', { style: { padding: '4px 16px 8px' } },
+        settingsRow('Image enhancement', 'CLAHE + white-balance on each frame', toggle('enhance', '/enhance', 'enhance')),
+        settingsRow('Motion trails', 'render fish paths on the feed', toggle('trails', '/trails', 'trails')),
+        settingsRow('SAHI sliced inference', 'better small-fish recall · lowers FPS (display only)', toggle('sahi')),
+        settingsRow('Stream quality', 'JPEG quality · lower = less bandwidth (display only)',
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', width: '180px' } },
+            h('input', { class: 'rng', type: 'range', min: '40', max: '95', value: s.quality, oninput: function (e) { s.quality = +e.target.value; qVal.textContent = s.quality; } }), qVal)))),
+    h('div', { class: 'card' },
+      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Camera')),
+      h('div', { style: { padding: '4px 16px 8px' } },
+        settingsRow('Exposure', null,
+          h('select', { class: 'sel', style: { width: '160px' }, onchange: function (e) { s.exposure = e.target.value; } },
+            h('option', { value: 'auto' }, 'Auto'), h('option', { value: '-6' }, 'Manual −6 (dim)'), h('option', { value: '-4' }, 'Manual −4'), h('option', { value: '-2' }, 'Manual −2'))),
+        settingsRow('Record to disk', 'recording_YYYYMMDD.mp4 (display only)', toggle('record')))),
+    h('div', { class: 'card' },
+      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Logging & Sharing')),
+      h('div', { style: { padding: '4px 16px 8px' } },
+        settingsRow('Stats log interval', 'JSON snapshot to fish_logs/ (display only)',
+          h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', width: '180px' } },
+            h('input', { class: 'rng', type: 'range', min: '15', max: '120', step: '15', value: s.interval, oninput: function (e) { s.interval = +e.target.value; iVal.textContent = s.interval + 's'; } }), iVal)),
+        settingsRow('Public Cloudflare tunnel', 'expose dashboard via trycloudflare.com (display only)', toggle('public')),
+        settingsRow('Party hats 🎉', 'purely for science', toggle('hats', '/hat', 'hat')))));
 }
 
-let _lastTrainStatus = null;
-function updateTrainModal(s) {
-  _lastTrainStatus = s;
-  const cur = s.current_epoch || 0;
-  const tot = s.total_epochs || 0;
-  const pct = (tot > 0) ? Math.round(100 * cur / tot) : 0;
-  const exporting = (s.state === 'exporting');
+/* ============================================================
+   Boot
+   ============================================================ */
+VIEWS = { live: LiveView, analytics: AnalyticsView, insights: InsightsView, training: TrainingView, system: SystemView, settings: SettingsView };
 
-  updateTrainStages(s);
-  drawTrainCharts(s);
-
-  const stateLine = exporting
-    ? ((s.message || 'Exporting TensorRT engine') + ' — this can take ~2–3 min on Orin Nano…')
-    : ((s.message || s.state || '…') + (tot ? '   (' + pct + '%)' : ''));
-  document.getElementById('train-state-line').textContent = stateLine;
-  document.getElementById('train-epoch').textContent = cur || '—';
-  document.getElementById('train-total').textContent = tot || '—';
-  document.getElementById('train-elapsed').textContent = fmtSec(s.elapsed_sec);
-  document.getElementById('train-eta').textContent = exporting ? '—' : fmtSec(s.eta_sec);
-  document.getElementById('train-version').textContent = s.version != null ? ('v' + s.version) : '—';
-
-  // Pause / resume the live feed view based on training state.
-  const running = s.running || (s.state === 'training' || s.state === 'starting' || s.state === 'exporting');
-  setFeedDisabled(running);
-
-  if (s.state === 'done') {
-    const engineName = (s.engine_path || s.latest_engine || '').split('/').pop() || 'engine';
-    document.getElementById('train-msg').innerHTML =
-      '✓ Saved <b>' + engineName + '</b>. ' +
-      'Click <b>Close</b> to resume inference with the new model.';
-    document.getElementById('train-cancel').style.display = 'none';
-    document.getElementById('train-close').style.display = '';
-    if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
-  } else if (s.state === 'failed') {
-    document.getElementById('train-msg').textContent =
-      '✗ Training failed: ' + (s.message || 'unknown error');
-    document.getElementById('train-cancel').style.display = 'none';
-    document.getElementById('train-close').style.display = '';
-    if (trainPollInterval) { clearInterval(trainPollInterval); trainPollInterval = null; }
-  }
+function mobileBar() {
+  var items = [['live', 'live'], ['analytics', 'chart'], ['insights', 'ai'], ['training', 'train'], ['system', 'device']];
+  return h('nav', { class: 'mobile-bar' }, items.map(function (it) {
+    return h('button', { class: 'mb-item' + (App.page === it[0] ? ' on' : ''), 'data-mb': it[0], onclick: function () { go(it[0]); } }, navIcon(it[1]));
+  }));
 }
 
-// Redraw charts on window resize so the canvas refits when the modal width
-// changes (e.g. mobile orientation flip). Throttled with rAF.
-let _trainResizeRaf = 0;
-window.addEventListener('resize', () => {
-  if (!trainModalOpen) return;
-  if (_trainResizeRaf) return;
-  _trainResizeRaf = requestAnimationFrame(() => {
-    _trainResizeRaf = 0;
-    if (_lastTrainStatus) drawTrainCharts(_lastTrainStatus);
-  });
-});
-
-function setFeedDisabled(disabled) {
-  const overlay = document.getElementById('feed-disabled');
-  if (overlay) overlay.style.display = disabled ? 'flex' : 'none';
+function boot() {
+  var root = $('root');
+  var scrim = h('div', { class: 'scrim', id: 'scrim', onclick: closeNav });
+  var sidebar = buildSidebar();
+  var mainCol = h('div', { class: 'main', id: 'main-col' }, buildTopbar(), h('div', { class: 'content', id: 'content' }));
+  root.appendChild(h('div', { class: 'shell' }, scrim, sidebar, mainCol));
+  root.appendChild(mobileBar());
+  startLivePolling();
+  // initial view
+  $('content').appendChild(VIEWS[App.page]());
 }
 
-// Broadcast watcher: every connected dashboard polls /train/status on a
-// slow tick and auto-opens the training modal when SOMEONE ELSE starts a
-// run. The modal is a full-page overlay, so once it's open the user sees
-// the live stages/charts regardless of which tab they were on; we also
-// flip them to the Label-Fish tab for visual context. The poll is cheap
-// (~once every 3 s) and stops contributing once the modal's own faster
-// poll (startTrainPolling, 2 s) takes over.
-function _isTrainingActive(s) {
-  return !!(s && (s.running || s.state === 'training'
-                  || s.state === 'starting' || s.state === 'exporting'));
-}
-// Tracks whether this client has SEEN training go active. We use it to
-// decide whether a current "not active" status counts as "training ended"
-// (close the modal) vs "no training has ever been started" (do nothing).
-let _sawTrainingActive = false;
-let _autoDismissTimer = 0;
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+else boot();
 
-function watchTrainBroadcast() {
-  fetch('/train/status').then(r => r.json()).then(s => {
-    const active = _isTrainingActive(s);
-    if (active) {
-      _sawTrainingActive = true;
-      if (!trainModalOpen) {
-        // Someone else started a run — open the modal here too.
-        if (typeof switchTab === 'function') switchTab('train');
-        openTrainModal();
-        startTrainPolling();
-      }
-    } else if (trainModalOpen && _sawTrainingActive) {
-      // Training was active and just ended (done / failed / status file
-      // cleared). Inference is already resuming server-side because
-      // get_train_status auto-clears _train_unacked, so the only job left
-      // is to close this client's modal. We let updateTrainModal repaint
-      // the done/failed message once, then auto-dismiss after a short
-      // grace period so the user can read it. Cancel/Close button is
-      // also wired so impatient users can dismiss immediately.
-      if (s && (s.state === 'done' || s.state === 'failed')) {
-        updateTrainModal(s);          // paint final message + show Close
-      }
-      if (!_autoDismissTimer) {
-        _autoDismissTimer = setTimeout(() => {
-          _autoDismissTimer = 0;
-          if (trainModalOpen) closeTrainModal();
-        }, 4000);
-      }
-    }
-  }).catch(() => {});
-}
-// One immediate check on page load (handles "user reloaded mid-run"),
-// then a slow recurring poll so any user opening the dashboard, OR
-// already on the dashboard, sees a training run someone else started.
-watchTrainBroadcast();
-setInterval(watchTrainBroadcast, 3000);
-
-// ── 3-minute session limit ──────────────────────────────
-const STREAM_LIMIT_MS = 180000;
-let streamExpired = false;
-
-function expireStream() {
-  streamExpired = true;
-  document.getElementById('feed').src = '';
-  const fsFeed = document.getElementById('fs-feed');
-  if (fsFeed) fsFeed.src = '';
-  document.getElementById('fs-overlay').classList.remove('open');
-  document.getElementById('stream-expired').classList.add('show');
-}
-setTimeout(expireStream, STREAM_LIMIT_MS);
-
-document.getElementById('feed').onerror = function() {
-  if (streamExpired) return;
-  setTimeout(() => { if (!streamExpired) this.src = '/stream?t=' + Date.now(); }, 2000);
-};
-
-// ── Fullscreen feed ──────────────────────────────────────
-document.getElementById('feed-wrap').addEventListener('click', function() {
-  if (streamExpired) return;
-  const overlay = document.getElementById('fs-overlay');
-  const fsFeed  = document.getElementById('fs-feed');
-  fsFeed.src = '/stream?t=' + Date.now();
-  overlay.classList.add('open');
-  // Try native fullscreen on supported browsers
-  if (overlay.requestFullscreen) overlay.requestFullscreen().catch(() => {});
-  else if (overlay.webkitRequestFullscreen) overlay.webkitRequestFullscreen();
-});
-
-function closeFeed() {
-  const overlay = document.getElementById('fs-overlay');
-  overlay.classList.remove('open');
-  document.getElementById('fs-feed').src = '';
-  if (document.fullscreenElement || document.webkitFullscreenElement) {
-    (document.exitFullscreen || document.webkitExitFullscreen).call(document);
-  }
-}
-
-// Close fullscreen overlay on backdrop tap (not on close button)
-document.getElementById('fs-overlay').addEventListener('click', function(e) {
-  if (e.target === this) closeFeed();
-});
-
-// Sync if browser exits native fullscreen via Escape
-document.addEventListener('fullscreenchange', () => {
-  if (!document.fullscreenElement)
-    document.getElementById('fs-overlay').classList.remove('open');
-});
+})();
 </script>
-</body></html>"""
+</body>
+</html>
+"""
         body = html.encode()
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
