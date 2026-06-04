@@ -616,6 +616,149 @@ def request_reset() -> bool:
 _STREAM_SESSION_LIMIT_SEC = 180
 
 
+# ── Live device telemetry (best-effort; null/-1 fields when unavailable) ──
+# Read directly from sysfs/procfs so the dashboard's Device Health view shows
+# real numbers on the Jetson and degrades to "N/A" elsewhere (e.g. on a Mac).
+_GPU_LOAD_PATHS = [
+    "/sys/devices/gpu.0/load",
+    "/sys/devices/platform/gpu.0/load",
+    "/sys/devices/platform/17000000.gpu/load",
+    "/sys/devices/platform/17000000.ga10b/load",
+]
+_GPU_FREQ_PATHS = [
+    "/sys/devices/gpu.0/devfreq/17000000.gpu/cur_freq",
+    "/sys/devices/platform/17000000.gpu/devfreq/17000000.gpu/cur_freq",
+    "/sys/devices/platform/17000000.ga10b/devfreq/17000000.ga10b/cur_freq",
+]
+_THERMAL_BASES = ["/sys/class/thermal", "/sys/devices/virtual/thermal"]
+_cpu_prev_idle = 0
+_cpu_prev_total = 0
+
+
+def _read_sysfs(path: str) -> str:
+    try:
+        with open(path, "rb") as f:
+            return f.read().decode("utf-8", errors="replace").strip()
+    except OSError:
+        return ""
+
+
+def _telemetry_cpu_pct() -> float | None:
+    """Overall CPU % since the previous call, from /proc/stat. None if unavailable."""
+    global _cpu_prev_idle, _cpu_prev_total
+    line = _read_sysfs("/proc/stat").split("\n")[0]
+    parts = line.split()
+    if len(parts) < 6 or parts[0] != "cpu":
+        return None
+    try:
+        vals = [int(x) for x in parts[1:]]
+    except ValueError:
+        return None
+    idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+    total = sum(vals)
+    d_idle, d_total = idle - _cpu_prev_idle, total - _cpu_prev_total
+    _cpu_prev_idle, _cpu_prev_total = idle, total
+    if d_total <= 0:
+        return None
+    return round((1.0 - d_idle / d_total) * 100, 1)
+
+
+def _telemetry_gpu() -> dict:
+    load, freq = None, None
+    for p in _GPU_LOAD_PATHS:
+        raw = _read_sysfs(p)
+        if raw:
+            try:
+                load = round(int(raw) / 10.0, 1)  # Jetson reports 0–1000
+            except ValueError:
+                pass
+            break
+    for p in _GPU_FREQ_PATHS:
+        raw = _read_sysfs(p)
+        if raw:
+            try:
+                freq = round(int(raw) / 1_000_000, 0)  # Hz → MHz
+            except ValueError:
+                pass
+            break
+    return {"gpu_util_pct": load, "gpu_freq_mhz": freq}
+
+
+def _telemetry_mem() -> dict:
+    info: dict[str, int] = {}
+    for line in _read_sysfs("/proc/meminfo").split("\n"):
+        parts = line.split()
+        if len(parts) >= 2:
+            try:
+                info[parts[0].rstrip(":")] = int(parts[1])  # kB
+            except ValueError:
+                pass
+    if "MemTotal" not in info:
+        return {"ram_used_mb": None, "ram_total_mb": None, "ram_pct": None,
+                "swap_used_mb": None, "swap_total_mb": None}
+    total = info["MemTotal"]
+    used = total - info.get("MemAvailable", info.get("MemFree", 0))
+    swap_total = info.get("SwapTotal", 0)
+    swap_used = swap_total - info.get("SwapFree", 0)
+    return {
+        "ram_used_mb": round(used / 1024, 1),
+        "ram_total_mb": round(total / 1024, 1),
+        "ram_pct": round(used / total * 100, 1) if total else None,
+        "swap_used_mb": round(swap_used / 1024, 1),
+        "swap_total_mb": round(swap_total / 1024, 1),
+    }
+
+
+def _telemetry_temps() -> dict:
+    temps: dict[str, float] = {}
+    for base in _THERMAL_BASES:
+        if not os.path.isdir(base):
+            continue
+        for name in sorted(os.listdir(base)):
+            if not name.startswith("thermal_zone"):
+                continue
+            label = _read_sysfs(os.path.join(base, name, "type")) or name
+            raw = _read_sysfs(os.path.join(base, name, "temp"))
+            if raw:
+                try:
+                    temps[label] = round(int(raw) / 1000.0, 1)
+                except ValueError:
+                    pass
+        if temps:
+            break
+    # Normalise common CPU/GPU zone aliases so the dashboard can find them.
+    norm = dict(temps)
+    for want, aliases in (("CPU", ("CPU-therm", "cpu-thermal", "cpu_thermal")),
+                          ("GPU", ("GPU-therm", "gpu-thermal", "gpu_thermal"))):
+        if want not in norm:
+            for a in aliases:
+                if a in temps:
+                    norm[want] = temps[a]
+                    break
+    return norm
+
+
+def _telemetry_uptime() -> float | None:
+    raw = _read_sysfs("/proc/uptime").split()
+    if not raw:
+        return None
+    try:
+        return round(float(raw[0]), 0)
+    except ValueError:
+        return None
+
+
+def read_telemetry() -> dict:
+    """Best-effort live device telemetry. Fields are None when the underlying
+    sysfs/procfs source is missing (e.g. running off-Jetson), so the dashboard
+    renders 'N/A' rather than fabricated values."""
+    out = {"cpu_pct": _telemetry_cpu_pct(), "uptime_sec": _telemetry_uptime(),
+           "temps_c": _telemetry_temps()}
+    out.update(_telemetry_gpu())
+    out.update(_telemetry_mem())
+    return out
+
+
 # ── HTTP handler ──────────────────────────────────────────
 class _MJPEGHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # noqa: A002
@@ -667,6 +810,8 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             self._serve_train_history()
         elif p == "/inference/history":
             self._serve_inference_history()
+        elif p == "/telemetry":
+            self._serve_telemetry()
         elif p == "/train/start":
             self._serve_train_start()
         elif p == "/train/status":
@@ -1006,6 +1151,9 @@ class _MJPEGHandler(BaseHTTPRequestHandler):
             "latest":   latest,
         }).encode()
         self._json_response(body)
+
+    def _serve_telemetry(self):
+        self._json_response(json.dumps(read_telemetry()).encode())
 
     def _serve_train_start(self):
         count = count_user_labels()
@@ -1859,17 +2007,8 @@ function clear(el) { while (el.firstChild) el.removeChild(el.firstChild); }
 function $(id) { return document.getElementById(id); }
 
 /* ── utils ── */
-function rand(a, b) { return a + Math.random() * (b - a); }
 function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
 function pad2(n) { return String(n).padStart(2, '0'); }
-function seriesNoise(n, base, amp, seed) {
-  seed = seed || 1; var out = [], v = base;
-  for (var i = 0; i < n; i++) {
-    v += (Math.sin((i + seed) * 0.7) + Math.sin((i + seed) * 0.23)) * amp * 0.18;
-    v += rand(-amp, amp) * 0.5; out.push(v);
-  }
-  return out;
-}
 function fmtClock(d) { return pad2(d.getHours()) + ':' + pad2(d.getMinutes()) + ':' + pad2(d.getSeconds()); }
 function fmtDate(d) { return d.toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }); }
 function fmtUptime(s) {
@@ -1882,70 +2021,29 @@ function fmtSec(s) {
   return m ? (m + 'm ' + r + 's') : (r + 's');
 }
 
-/* ── simulated data (Analytics / AI Insights only) ── */
+/* ── per-track colours (deterministic by track id) ── */
 var FISH_COLORS = ['#00e5cc', '#2ad4ff', '#57f5b6', '#4aa8ff', '#ffc857', '#ff9ecb', '#b388ff', '#7CFFCB'];
 function idColor(id) { return FISH_COLORS[Math.abs(parseInt(id, 10) || 0) % FISH_COLORS.length]; }
 
-var FISH = [
-  { id: 7,  name: 'Tank Sinatra', species: 'Angelfish',      color: '#00e5cc', conf: 0.97, active: 4218, status: 'alive' },
-  { id: 3,  name: 'Finn Diesel',  species: 'Betta',          color: '#2ad4ff', conf: 0.94, active: 3902, status: 'alive' },
-  { id: 12, name: 'Bubbles',      species: 'Guppy',          color: '#57f5b6', conf: 0.91, active: 5114, status: 'alive' },
-  { id: 5,  name: 'Sushi',        species: 'Neon Tetra',     color: '#4aa8ff', conf: 0.89, active: 2740, status: 'alive' },
-  { id: 9,  name: 'Gilly',        species: 'Molly',          color: '#ffc857', conf: 0.86, active: 1980, status: 'alive' },
-  { id: 18, name: 'Marigold',     species: 'Cardinal Tetra', color: '#ff9ecb', conf: 0.82, active: 3320, status: 'alive' },
-  { id: 21, name: 'Sir Swims',    species: 'Zebra Danio',    color: '#b388ff', conf: 0.79, active: 1240, status: 'idle' },
-  { id: 2,  name: 'Coral',        species: 'Corydoras',      color: '#7CFFCB', conf: 0.74, active: 640,  status: 'idle' }
-];
-var HOURS = Array.from({ length: 24 }, function (_, i) { return i; });
-function circadian(seed) {
-  seed = seed || 0;
-  return HOURS.map(function (hr) {
-    var day = Math.exp(-Math.pow((hr - 13) / 5, 2)) * 70;
-    var feed = Math.exp(-Math.pow((hr - 8) / 0.8, 2)) * 55 + Math.exp(-Math.pow((hr - 18) / 0.8, 2)) * 60;
-    return clamp(day + feed + 10 + Math.sin(hr + seed) * 6, 4, 100);
+/* ── real-data fetchers (cached + shared across views) ── */
+var Data = {
+  infHistory: null, infHistoryAt: 0,
+  trainVersions: null, trainVersionDetail: {},
+};
+function fetchJSON(url) { return fetch(url).then(function (r) { return r.json(); }); }
+function getInferenceHistory() {
+  return fetchJSON('/inference/history').then(function (d) {
+    Data.infHistory = d; Data.infHistoryAt = Date.now(); return d;
   });
 }
-var ANALYTICS = {
-  countOverTime: seriesNoise(48, 7.4, 1.1, 3).map(function (v) { return clamp(Math.round(v), 4, 9); }),
-  activity: seriesNoise(48, 58, 22, 8).map(function (v) { return clamp(v, 8, 100); }),
-  confidence: seriesNoise(48, 0.88, 0.05, 11).map(function (v) { return clamp(v, 0.6, 0.99); }),
-  circadian: circadian(2),
-  heatmap: Array.from({ length: 8 }, function (_, r) {
-    return Array.from({ length: 12 }, function (_, c) {
-      var d = Math.hypot(c - 6, r - 3.5);
-      return clamp(Math.exp(-d * d / 9) * 100 + rand(-12, 18), 0, 100);
-    });
-  })
-};
-var INSIGHTS = [
-  { id: 1, sev: 'alert', icon: 'alert', title: 'Reduced activity — Sir Swims',
-    body: 'Track #21 has moved 61% less than its 7-day baseline over the last 3 hours. Could indicate stress or early illness. Recommend a closer look.',
-    time: '14m ago', conf: 0.88, tag: 'Behavior' },
-  { id: 2, sev: 'warn', icon: 'temp', title: 'GPU thermals trending up',
-    body: 'Jetson GPU has held 71–74°C for 25 min. Still nominal, but consider checking enclosure airflow before the afternoon light cycle.',
-    time: '38m ago', conf: 0.79, tag: 'System' },
-  { id: 3, sev: 'good', icon: 'spark', title: 'Feeding response looks healthy',
-    body: 'All 6 active fish converged to the upper-left feeding zone within 9s of the 08:00 feed window. Strong, synchronized response.',
-    time: '6h ago', conf: 0.95, tag: 'Behavior' },
-  { id: 4, sev: 'info', icon: 'eye', title: 'New individual detected',
-    body: 'Track #2 ("Coral", Corydoras) appeared for the first time at 11:42. Likely a bottom-dweller that surfaced into frame.',
-    time: '2h ago', conf: 0.74, tag: 'Detection' },
-  { id: 5, sev: 'good', icon: 'model', title: 'Model v4 improved recall',
-    body: 'Since switching to best.engine_v4, small-fish recall is up ~12% and ID switches dropped from 8/hr to 3/hr.',
-    time: '1d ago', conf: 0.91, tag: 'Model' }
-];
-var SUGGESTED_Q = [
-  'How active was the tank today?',
-  'Is any fish behaving unusually?',
-  'When were the fish most active?',
-  'Summarize the last 24 hours'
-];
-var ASK_ANSWERS = {
-  'how active was the tank today?': "Today's mean activity index is 64/100 — about 8% above the weekly average. Peak activity hit 94 around the 18:00 feed window. Bubbles (#12) logged the most movement (5,114px), while Coral (#2) stayed mostly in the lower-left substrate zone.",
-  'is any fish behaving unusually?': "One flag: Sir Swims (#21) is 61% below its movement baseline over the last 3 hours and is holding near the surface-right corner. Everyone else is within normal range. I'd keep an eye on #21 through the next feed cycle.",
-  'when were the fish most active?': "Two clear peaks, both feeding-driven: 08:00 (morning feed, index ~88) and 18:00 (evening feed, index ~94). Midday holds a gentle plateau around 60. Activity bottoms out 02:00–05:00 during the dark cycle.",
-  'summarize the last 24 hours': "6–8 fish tracked continuously at 22.4 FPS avg. Two healthy feeding responses, no ID losses for >30min. One behavioral flag (#21 low activity). System nominal: GPU peaked 74°C, model best.engine_v4. Overall tank health score: 92/100 — Thriving."
-};
+function parseLogTs(ts) {
+  // "YYYYMMDD_HHMMSS" → Date
+  if (!ts || ts.length < 15) return null;
+  var y = +ts.slice(0, 4), mo = +ts.slice(4, 6) - 1, d = +ts.slice(6, 8);
+  var hh = +ts.slice(9, 11), mi = +ts.slice(11, 13), s = +ts.slice(13, 15);
+  var dt = new Date(y, mo, d, hh, mi, s);
+  return isNaN(dt.getTime()) ? null : dt;
+}
 
 /* ── global app state ── */
 var App = {
@@ -1954,12 +2052,17 @@ var App = {
   observers: [],       // per-view ResizeObservers
   viewLive: null,      // current view's live-update callback
   conn: true,
-  live: {
-    fps: 0, active: 0, total: 0, frame: 0,
-    cpu: 56, gpu: 70, gpuUtil: 80, ram: 5.4,
-    realTemps: false, model: '—', resolution: '1080p', fish: {}
-  }
+  live: { fps: 0, active: 0, total: 0, frame: 0, model: '—', resolution: '1080p', fish: {}, temps: {} },
+  tele: { cpu_pct: null, gpu_util_pct: null, gpu_freq_mhz: null, ram_used_mb: null,
+          ram_total_mb: null, ram_pct: null, swap_used_mb: null, swap_total_mb: null,
+          uptime_sec: null, temps_c: {} }
 };
+/* "N/A" helpers for telemetry that may be unavailable off-Jetson */
+function na(v, fmt) { return (v == null || v < 0) ? 'N/A' : (fmt ? fmt(v) : v); }
+function teleTemp(slot) {
+  var t = App.tele.temps_c || {}, l = App.live.temps || {};
+  return t[slot] != null ? t[slot] : (l[slot] != null ? l[slot] : null);
+}
 function every(ms, fn) { var id = setInterval(fn, ms); App.timers.push(id); return id; }
 function observe(el, cb) {
   var ro = new ResizeObserver(function (es) { cb((es[0].contentRect.width) || 600); });
@@ -2175,12 +2278,15 @@ function buildSidebar() {
   var gpuBar = bar(0, 'var(--teal)'), ramBar = bar(0, 'var(--cyan)');
   var connEl = h('span', null, 'Connecting…');
   App.updateSidebar = function () {
-    var L = App.live;
-    gpuV.textContent = L.gpuUtil + '% · ' + Math.round(L.gpu) + '°C';
-    gpuBar.i.style.width = clamp(L.gpuUtil, 0, 100) + '%';
-    ramV.textContent = L.ram.toFixed(1) + '/8GB';
-    ramBar.i.style.width = clamp(L.ram / 8 * 100, 0, 100) + '%';
-    fpsV.textContent = L.fps.toFixed(1);
+    var T = App.tele, gt = teleTemp('GPU');
+    var util = T.gpu_util_pct, ram = T.ram_used_mb, ramTot = T.ram_total_mb;
+    gpuV.textContent = na(util, function (v) { return v + '%'; }) + (gt != null ? ' · ' + Math.round(gt) + '°C' : '');
+    gpuBar.i.style.width = clamp(util != null && util >= 0 ? util : 0, 0, 100) + '%';
+    if (ram != null && ramTot) {
+      ramV.textContent = (ram / 1024).toFixed(1) + '/' + (ramTot / 1024).toFixed(1) + 'GB';
+      ramBar.i.style.width = clamp(ram / ramTot * 100, 0, 100) + '%';
+    } else { ramV.textContent = 'N/A'; ramBar.i.style.width = '0%'; }
+    fpsV.textContent = App.live.fps.toFixed(1);
     connEl.textContent = App.conn ? 'Connected · live' : 'Reconnecting…';
   };
   var nav = NAV.map(function (g) {
@@ -2268,7 +2374,7 @@ function go(page) {
    Global live polling (drives sidebar + live view + system)
    ============================================================ */
 function startLivePolling() {
-  function poll() {
+  function pollStats() {
     fetch('/stats').then(function (r) { return r.json(); }).then(function (d) {
       App.conn = true;
       var L = App.live;
@@ -2277,13 +2383,9 @@ function startLivePolling() {
       L.total = d.total_ids != null ? d.total_ids : 0;
       L.frame = d.frame != null ? d.frame : 0;
       L.fish = d.fish || {};
+      L.temps = d.temps_c || {};
       if (d.resolution) L.resolution = d.resolution;
       if (d.model) L.model = d.model;
-      var temps = d.temps_c || {};
-      var hasT = false;
-      if (temps.CPU != null) { L.cpu = temps.CPU; hasT = true; }
-      if (temps.GPU != null) { L.gpu = temps.GPU; hasT = true; }
-      L.realTemps = hasT;
       if (App.updateSidebar) App.updateSidebar();
       if (App.viewLive) App.viewLive();
     }).catch(function () {
@@ -2291,19 +2393,15 @@ function startLivePolling() {
       if (App.updateSidebar) App.updateSidebar();
     });
   }
-  // simulate util/ram (no backend) + temp fallback when off-Jetson
-  function walk() {
-    var L = App.live;
-    L.gpuUtil = Math.round(clamp(L.gpuUtil + rand(-4, 4), 62, 96));
-    L.ram = clamp(L.ram + rand(-0.18, 0.18), 4.8, 6.4);
-    if (!L.realTemps) {
-      L.gpu = clamp(L.gpu + rand(-1.6, 1.6), 64, 78);
-      L.cpu = clamp(L.cpu + rand(-1.4, 1.4), 50, 66);
-    }
-    if (App.updateSidebar) App.updateSidebar();
+  function pollTelemetry() {
+    fetch('/telemetry').then(function (r) { return r.json(); }).then(function (d) {
+      App.tele = d || App.tele;
+      if (App.updateSidebar) App.updateSidebar();
+      if (App.viewTele) App.viewTele();
+    }).catch(function () {});
   }
-  setInterval(poll, 1000); poll();
-  setInterval(walk, 1500);
+  setInterval(pollStats, 1000); pollStats();
+  setInterval(pollTelemetry, 2000); pollTelemetry();
 }
 
 /* ============================================================
@@ -2380,7 +2478,7 @@ function LiveView() {
   var kFps = MiniKpi({ label: 'FPS', value: '0.0', color: 'var(--teal)', sparkWrap: fpsSpark });
   var kAct = MiniKpi({ label: 'Active', value: '0', color: 'var(--cyan)', sparkWrap: actSpark });
   var kTot = MiniKpi({ label: 'Tracked IDs', value: '0', color: 'var(--aqua)' });
-  var kGpu = MiniKpi({ label: 'GPU', value: '0', unit: '°C', color: 'var(--warn)' });
+  var kGpu = MiniKpi({ label: 'GPU', value: 'N/A', color: 'var(--warn)' });
 
   var fishList = h('div', { class: 'fish-list' });
   var liveChip = chip('', 'on'); liveChip.appendChild(liveDot());
@@ -2410,7 +2508,9 @@ function LiveView() {
 
   App.viewLive = function () {
     var L = App.live;
-    kFps.setValue(L.fps.toFixed(1)); kAct.setValue(L.active); kTot.setValue(L.total); kGpu.setValue(Math.round(L.gpu));
+    var gt = teleTemp('GPU'), gu = App.tele.gpu_util_pct;
+    kFps.setValue(L.fps.toFixed(1)); kAct.setValue(L.active); kTot.setValue(L.total);
+    kGpu.setValue(gt != null ? Math.round(gt) + '°C' : (gu != null && gu >= 0 ? Math.round(gu) + '%' : 'N/A'));
     modelTag.textContent = L.model || 'model';
     fpsRoll = fpsRoll.slice(1).concat(L.fps || 0);
     actRoll = actRoll.slice(1).concat(L.active || 0);
@@ -2442,8 +2542,8 @@ function LiveView() {
 }
 
 function FeedControls() {
-  // real toggle states (server defaults: trails OFF, enhance ON, hats OFF)
-  var state = { trails: false, enhance: true, hats: false };
+  // real toggle states (server defaults: trails OFF, enhance ON)
+  var state = { trails: false, enhance: true };
   function toggleRow(key, label, endpoint, respKey) {
     var tog = h('div', { class: 'toggle' + (state[key] ? ' on' : '') }, h('i', null));
     var lbl = h('span', { style: { color: state[key] ? 'var(--text)' : 'var(--dim)' } }, label);
@@ -2474,8 +2574,7 @@ function FeedControls() {
     eyebrow('Detection Controls', { marginBottom: '12px' }),
     h('div', { style: { display: 'flex', flexDirection: 'column', gap: '4px' } },
       toggleRow('trails', 'Motion trails', '/trails', 'trails'),
-      toggleRow('enhance', 'Image enhance', '/enhance', 'enhance'),
-      toggleRow('hats', 'Party hats 🎉', '/hat', 'hat')),
+      toggleRow('enhance', 'Image enhance', '/enhance', 'enhance')),
     h('div', { style: { height: '1px', background: 'var(--border)', margin: '13px 0' } }),
     eyebrow('Confidence', { marginBottom: '8px' }),
     h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px' } }, confSlider, confVal),
@@ -2555,7 +2654,7 @@ function openFullscreen() {
 }
 
 /* ============================================================
-   ANALYTICS VIEW (simulated)
+   ANALYTICS VIEW (real — /inference/history + /train/history)
    ============================================================ */
 function KpiCard(opts) {
   return h('div', { class: 'card kpi' },
@@ -2574,73 +2673,90 @@ function card(title, sub, body, padStyle) {
     h('div', { style: padStyle || { padding: '14px 14px 10px' } }, body));
 }
 function AnalyticsView() {
-  var range = '24h';
-  var countChart = AreaChart({ vals: ANALYTICS.countOverTime, color: 'var(--teal)', height: 210, min: 0, max: 10, live: true });
-  var actChart = AreaChart({ vals: ANALYTICS.activity, color: 'var(--cyan)', height: 210, min: 0, max: 100, fmtY: function (v) { return Math.round(v); }, live: true });
-  // live ticking of the two area charts
-  every(1500, function () {
-    ANALYTICS.countOverTime = ANALYTICS.countOverTime.slice(1).concat(clamp(Math.round(ANALYTICS.countOverTime[ANALYTICS.countOverTime.length - 1] + rand(-1, 1)), 4, 9));
-    ANALYTICS.activity = ANALYTICS.activity.slice(1).concat(clamp(ANALYTICS.activity[ANALYTICS.activity.length - 1] + rand(-8, 8), 8, 100));
-    countChart.update(ANALYTICS.countOverTime); actChart.update(ANALYTICS.activity);
-  });
-  var hourLabels = HOURS.map(pad2);
-  var seg = h('div', { class: 'seg' }, ['6h', '24h', '7d', '30d'].map(function (r) {
-    return h('button', { class: 'seg-btn' + (r === range ? ' on' : ''), onclick: function (e) {
-      range = r; seg.querySelectorAll('.seg-btn').forEach(function (b) { b.classList.remove('on'); }); e.target.classList.add('on');
-    } }, r);
-  }));
-
+  var sub = h('div', { class: 'mono', style: { color: 'var(--dim)', fontSize: '12px', marginTop: '2px' } }, 'Aggregated from inference logs · refreshing every 5s');
+  var kpiWrap = h('div', { class: 'grid cols-4' });
+  var activeChart = AreaChart({ vals: [0, 0], color: 'var(--teal)', height: 210, min: 0, live: true });
+  var uniqueChart = AreaChart({ vals: [0, 0], color: 'var(--cyan)', height: 210, min: 0, live: true });
+  var byHourWrap = h('div', null);
+  var tableWrap = h('div', null);
   var liveChip = chip('live', 'on'); liveChip.insertBefore(liveDot(), liveChip.firstChild);
-  var countCardEl = h('div', { class: 'card' },
-    h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Fish Count Over Time'), h('span', { class: 'ch-spacer' }), liveChip),
-    h('div', { style: { padding: '14px 14px 10px' } }, countChart.node));
+
+  function empty(msg) { return h('div', { class: 'triage-empty' }, msg); }
+
+  function render(d) {
+    var samples = (d && d.samples) || [], top = (d && d.top_fish) || [], latest = (d && d.latest) || samples[samples.length - 1] || {};
+    // KPIs
+    clear(kpiWrap);
+    if (!samples.length) {
+      kpiWrap.appendChild(h('div', { class: 'card pad', style: { gridColumn: '1 / -1' } }, empty('No inference history yet — logs accumulate as the tracker runs (one snapshot per log interval).')));
+    } else {
+      var active = samples.map(function (s) { return s.active_fish || 0; });
+      var uniq = samples.map(function (s) { return s.unique_fish || 0; });
+      var avgActive = active.reduce(function (a, b) { return a + b; }, 0) / active.length;
+      var peakActive = Math.max.apply(null, active);
+      kpiWrap.appendChild(KpiCard({ label: 'Avg Active Fish', value: avgActive.toFixed(1), color: 'var(--teal)', vals: active.slice(-16) }));
+      kpiWrap.appendChild(KpiCard({ label: 'Peak Active', value: String(peakActive), color: 'var(--cyan)', vals: active.slice(-16) }));
+      kpiWrap.appendChild(KpiCard({ label: 'Unique Tracks', value: (latest.unique_fish || 0).toLocaleString(), color: 'var(--aqua)', vals: uniq.slice(-16) }));
+      kpiWrap.appendChild(KpiCard({ label: 'Frames Logged', value: (latest.total_frames || 0).toLocaleString(), color: 'var(--deep)' }));
+      // line charts
+      activeChart.update(active.length > 1 ? active : active.concat(active));
+      uniqueChart.update(uniq.length > 1 ? uniq : uniq.concat(uniq));
+    }
+    // activity by hour-of-day (real, from sample timestamps)
+    clear(byHourWrap);
+    if (samples.length) {
+      var sums = new Array(24).fill(0), cnts = new Array(24).fill(0);
+      samples.forEach(function (s) {
+        var dt = parseLogTs(s.ts); if (!dt) return;
+        var hh = dt.getHours(); sums[hh] += (s.active_fish || 0); cnts[hh] += 1;
+      });
+      var byHour = sums.map(function (v, i) { return cnts[i] ? v / cnts[i] : 0; });
+      byHourWrap.appendChild(BarChart({ vals: byHour, labels: Array.from({ length: 24 }, function (_, i) { return pad2(i); }), color: 'var(--deep)', height: 200 }).node);
+    } else { byHourWrap.appendChild(empty('Collecting…')); }
+    // per-fish table from top_fish
+    clear(tableWrap);
+    tableWrap.appendChild(PerFishTable(top));
+  }
+
+  getInferenceHistory().then(render).catch(function () { render(null); });
+  every(5000, function () { getInferenceHistory().then(render).catch(function () {}); });
 
   return h('div', { class: 'view', style: { display: 'flex', flexDirection: 'column', gap: '16px' } },
     h('div', { class: 'row-between' },
-      h('div', null,
-        h('div', { class: 'section-title' }, 'Tank Analytics'),
-        h('div', { class: 'mono', style: { color: 'var(--dim)', fontSize: '12px', marginTop: '2px' } }, 'Last 24 hours · auto-refreshing · simulated history')),
-      seg),
-    h('div', { class: 'grid cols-4' },
-      KpiCard({ label: 'Avg Fish Count', value: '7.2', delta: '+0.4', dir: 'up', color: 'var(--teal)', vals: ANALYTICS.countOverTime.slice(-16) }),
-      KpiCard({ label: 'Activity Index', value: '64', unit: '/100', delta: '+8%', dir: 'up', color: 'var(--cyan)', vals: ANALYTICS.activity.slice(-16) }),
-      KpiCard({ label: 'Mean Confidence', value: '88', unit: '%', delta: '+2%', dir: 'up', color: 'var(--aqua)', vals: ANALYTICS.confidence.slice(-16).map(function (v) { return v * 100; }) }),
-      KpiCard({ label: 'ID Switches / hr', value: '3.1', delta: '-5', dir: 'down', color: 'var(--good)', vals: seriesNoise(16, 4, 1.5, 4) })),
+      h('div', null, h('div', { class: 'section-title' }, 'Tank Analytics'), sub)),
+    kpiWrap,
     h('div', { class: 'grid cols-2' },
-      countCardEl,
-      card('Activity Level', 'distance swum / interval', actChart.node)),
-    h('div', { class: 'grid cols-2' },
-      card('Circadian Rhythm', 'activity by hour · feeds ▮',
-        BarChart({ vals: ANALYTICS.circadian, labels: hourLabels, color: 'var(--deep)', height: 200, highlight: [8, 18] }).node,
-        { padding: '16px 14px 6px' }),
-      card('Spatial Heatmap', 'where fish dwell',
-        h('div', null, Heatmap({ grid: ANALYTICS.heatmap }),
-          h('div', { class: 'heat-legend' },
-            h('span', { class: 'mono' }, 'low'), h('div', { class: 'heat-bar' }), h('span', { class: 'mono' }, 'high'),
-            h('span', { class: 'mono', style: { marginLeft: 'auto', color: 'var(--dim)' } }, 'upper-center = feeding zone'))),
-        { padding: '16px' })),
-    PerFishTable());
+      h('div', { class: 'card' },
+        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Active Fish Over Time'), h('span', { class: 'ch-spacer' }), liveChip),
+        h('div', { style: { padding: '14px 14px 10px' } }, activeChart.node)),
+      card('Unique Tracks (cumulative)', 'distinct track IDs seen', uniqueChart.node)),
+    card('Activity by Hour of Day', 'mean active fish per hour · from logged snapshots', byHourWrap, { padding: '16px 14px 6px' }),
+    tableWrap);
 }
-function PerFishTable() {
+function PerFishTable(top) {
+  top = top || [];
+  var maxFrames = top.reduce(function (m, f) { return Math.max(m, f.frame_count || 0); }, 1);
   return h('div', { class: 'card' },
-    h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Per-Fish Breakdown'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, FISH.length + ' individuals tracked')),
+    h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Top Tracked Fish'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, top.length + ' tracks (latest snapshot)')),
     h('div', { class: 'ptable' },
       h('div', { class: 'pt-head' },
-        h('span', null, 'Individual'), h('span', null, 'Species'), h('span', null, 'Confidence'),
-        h('span', null, 'Activity (px)'), h('span', null, 'Status'), h('span', null, '7-day trend')),
-      FISH.map(function (f, i) {
+        h('span', null, 'Track'), h('span', null, 'Frames'), h('span', null, 'Distance (px)'),
+        h('span', null, 'Duration'), h('span', null, 'px / frame'), h('span', null, 'Activity')),
+      top.length ? top.map(function (f) {
+        var col = idColor(f.id), dur = f.duration_sec || 0;
+        var pxf = f.frame_count ? (f.distance_px / f.frame_count) : 0;
         return h('div', { class: 'pt-row' },
-          h('span', { class: 'pt-name' }, h('span', { class: 'fish-swatch', style: { background: f.color, boxShadow: '0 0 6px ' + f.color } }), f.name + ' ', h('em', { class: 'mono' }, '#' + f.id)),
-          h('span', { class: 'mono dimc' }, f.species),
-          h('span', { class: 'mono' }, confBar(f.conf * 100, f.color), Math.round(f.conf * 100) + '%'),
-          h('span', { class: 'mono' }, f.active.toLocaleString()),
-          h('span', null, chip(f.status === 'alive' ? 'active' : 'idle', f.status === 'alive' ? 'on' : '')),
-          h('span', null, Sparkline({ vals: seriesNoise(20, f.active / 60, f.active / 220, i + 1), color: f.color, w: 110, h: 26 })));
-      })));
+          h('span', { class: 'pt-name' }, h('span', { class: 'fish-swatch', style: { background: col, boxShadow: '0 0 6px ' + col } }), h('em', { class: 'mono' }, '#' + f.id)),
+          h('span', { class: 'mono' }, (f.frame_count || 0).toLocaleString()),
+          h('span', { class: 'mono' }, Math.round(f.distance_px || 0).toLocaleString()),
+          h('span', { class: 'mono' }, dur >= 60 ? (Math.floor(dur / 60) + 'm ' + Math.round(dur % 60) + 's') : (dur.toFixed(1) + 's')),
+          h('span', { class: 'mono dimc' }, pxf.toFixed(1)),
+          h('span', null, confBar((f.frame_count || 0) / maxFrames * 100, col, 110)));
+      }) : h('div', { class: 'pt-row' }, h('span', { class: 'mono dimc', style: { gridColumn: '1 / -1' } }, 'No tracks in the latest snapshot yet.'))));
 }
 
 /* ============================================================
-   AI INSIGHTS VIEW (simulated)
+   AI INSIGHTS VIEW (real — computed health, heuristic feed, data-backed Q&A)
    ============================================================ */
 var SEV_COLOR = { alert: 'var(--alert)', warn: 'var(--warn)', good: 'var(--good)', info: 'var(--cyan)' };
 function insightIconPaths(kind) {
@@ -2671,9 +2787,93 @@ function TypeOut(text) {
   return span;
 }
 
+/* derive aggregates from cached inference history */
+function histAgg() {
+  var d = Data.infHistory, s = (d && d.samples) || [], top = (d && d.top_fish) || [];
+  var active = s.map(function (x) { return x.active_fish || 0; });
+  return {
+    count: s.length, samples: s, top: top,
+    avgActive: active.length ? active.reduce(function (a, b) { return a + b; }, 0) / active.length : 0,
+    peakActive: active.length ? Math.max.apply(null, active) : 0,
+    latest: (d && d.latest) || s[s.length - 1] || {}
+  };
+}
+
+/* real, deterministic tank-health score from live metrics + history */
+function computeHealth() {
+  var L = App.live, gt = teleTemp('GPU'), agg = histAgg(), subs = [];
+  subs.push({ k: 'Detection', v: Math.round(clamp(L.fps / 20 * 100, 0, 100)), c: 'var(--cyan)' });
+  var peak = Math.max(agg.peakActive, L.active, 1);
+  subs.push({ k: 'Activity', v: Math.round(clamp(L.active / peak * 100, 0, 100)), c: 'var(--teal)' });
+  if (agg.top.length) {
+    var avgDur = agg.top.reduce(function (a, f) { return a + (f.duration_sec || 0); }, 0) / agg.top.length;
+    subs.push({ k: 'Tracking', v: Math.round(clamp(avgDur / 60 * 100, 0, 100)), c: 'var(--aqua)' });
+  }
+  var sysV = gt != null ? clamp(100 - Math.max(0, gt - 50) * 2.5, 0, 100) : (L.fps > 0 ? 100 : 40);
+  subs.push({ k: 'System', v: Math.round(sysV), c: 'var(--deep)' });
+  var score = Math.round(subs.reduce(function (a, s) { return a + s.v; }, 0) / subs.length);
+  var label = score >= 85 ? 'Thriving' : score >= 70 ? 'Healthy' : score >= 50 ? 'Fair' : 'Needs attention';
+  var color = score >= 70 ? 'var(--teal)' : score >= 50 ? 'var(--warn)' : 'var(--alert)';
+  return { score: score, label: label, color: color, subs: subs };
+}
+
+/* real, rule-based insight feed (no fabricated data) */
+function computeFeed(ctx) {
+  var L = App.live, gt = teleTemp('GPU'), agg = histAgg(), feed = [];
+  if (gt != null) {
+    if (gt >= 75) feed.push({ sev: 'alert', icon: 'temp', tag: 'System', title: 'GPU thermals high', body: 'GPU at ' + Math.round(gt) + '°C — approaching the 87°C throttle threshold. Check enclosure airflow.' });
+    else if (gt >= 68) feed.push({ sev: 'warn', icon: 'temp', tag: 'System', title: 'GPU running warm', body: 'GPU holding ' + Math.round(gt) + '°C. Still nominal but worth watching.' });
+    else feed.push({ sev: 'good', icon: 'temp', tag: 'System', title: 'Thermals nominal', body: 'GPU ' + Math.round(gt) + '°C, comfortably below throttle.' });
+  }
+  if (L.fps === 0) feed.push({ sev: 'alert', icon: 'alert', tag: 'Pipeline', title: 'No frames', body: 'Pipeline FPS is 0 — inference may be paused or the camera is offline.' });
+  else if (L.fps < 12) feed.push({ sev: 'warn', icon: 'spark', tag: 'Pipeline', title: 'Low pipeline FPS', body: 'Running at ' + L.fps.toFixed(1) + ' FPS, below the ~20 target. Consider 720p or disabling SAHI.' });
+  if (L.active === 0) feed.push({ sev: 'info', icon: 'eye', tag: 'Detection', title: 'No active detections', body: 'No fish seen in the last 2 seconds.' });
+  else feed.push({ sev: 'good', icon: 'eye', tag: 'Detection', title: 'Tracking ' + L.active + ' active fish', body: L.active + ' of ' + L.total.toLocaleString() + ' unique tracks active right now.' });
+  if (agg.count >= 4 && agg.avgActive > 0) {
+    var last = agg.samples[agg.samples.length - 1].active_fish || 0;
+    if (last > agg.avgActive * 1.5) feed.push({ sev: 'info', icon: 'spark', tag: 'Behavior', title: 'Activity spike', body: 'Latest snapshot shows ' + last + ' active vs a ' + agg.avgActive.toFixed(1) + ' average.' });
+    else if (last < agg.avgActive * 0.5) feed.push({ sev: 'warn', icon: 'spark', tag: 'Behavior', title: 'Activity drop', body: 'Latest snapshot shows ' + last + ' active vs a ' + agg.avgActive.toFixed(1) + ' average.' });
+  }
+  if (ctx.versions && ctx.versions.length) feed.push({ sev: 'good', icon: 'model', tag: 'Model', title: 'Model v' + Math.max.apply(null, ctx.versions) + ' trained', body: (ctx.versions.length) + ' trained version(s) available. Active engine: ' + (L.model || '—') + '.' });
+  if (ctx.labelQueued > 0) feed.push({ sev: 'info', icon: 'eye', tag: 'Labeling', title: ctx.labelQueued + ' candidates awaiting triage', body: 'Open Label & Train to review captured detections.' });
+  if (!feed.length) feed.push({ sev: 'good', icon: 'spark', tag: 'System', title: 'All systems nominal', body: 'No anomalies detected from current metrics.' });
+  return feed;
+}
+
+function computeSummary() {
+  var L = App.live, gt = teleTemp('GPU'), gu = App.tele.gpu_util_pct, agg = histAgg();
+  var parts = ['Tracking ' + L.active + ' active of ' + L.total.toLocaleString() + ' unique tracks at ' + L.fps.toFixed(1) + ' FPS.'];
+  if (gt != null) parts.push('GPU ' + Math.round(gt) + '°C' + (gu != null && gu >= 0 ? ' / ' + Math.round(gu) + '% util' : '') + '.');
+  if (agg.count) parts.push('Across ' + agg.count + ' logged snapshot(s), active fish averaged ' + agg.avgActive.toFixed(1) + ' (peak ' + agg.peakActive + ').');
+  if (agg.top.length) parts.push('Most-tracked: #' + agg.top[0].id + ' (' + (agg.top[0].frame_count || 0).toLocaleString() + ' frames).');
+  return parts.join(' ');
+}
+
 function AskTank() {
   var body = h('div', { class: 'ask-body' });
-  var log = [{ role: 'ai', text: "Hi! I'm watching your tank in real time. Ask me anything — activity, individual fish, feeding, or system health." }];
+  var log = [{ role: 'ai', text: 'I report live tracking metrics. Pick a question below for a data-backed read-out.' }];
+  function answer(key) {
+    var L = App.live, agg = histAgg();
+    if (key === 'active') {
+      var s = L.active + ' fish are active right now, of ' + L.total.toLocaleString() + ' unique tracks, at ' + L.fps.toFixed(1) + ' FPS.';
+      if (agg.count) s += ' Logged active-fish average is ' + agg.avgActive.toFixed(1) + ' (peak ' + agg.peakActive + ').';
+      return s;
+    }
+    if (key === 'mover') {
+      if (!agg.top.length) return 'No tracking history yet — movement stats appear once the tracker logs a snapshot.';
+      var m = agg.top.slice().sort(function (a, b) { return (b.distance_px || 0) - (a.distance_px || 0); })[0];
+      return 'Track #' + m.id + ' has moved the most: ' + Math.round(m.distance_px || 0).toLocaleString() + 'px over ' + (m.duration_sec || 0).toFixed(0) + 's (' + (m.frame_count || 0).toLocaleString() + ' frames).';
+    }
+    if (key === 'when') {
+      if (!agg.count) return 'No history yet — activity-by-hour needs at least one logged snapshot.';
+      var sums = {}, cnts = {};
+      agg.samples.forEach(function (x) { var dt = parseLogTs(x.ts); if (!dt) return; var hr = dt.getHours(); sums[hr] = (sums[hr] || 0) + (x.active_fish || 0); cnts[hr] = (cnts[hr] || 0) + 1; });
+      var bestH = null, bestV = -1;
+      Object.keys(sums).forEach(function (hr) { var v = sums[hr] / cnts[hr]; if (v > bestV) { bestV = v; bestH = hr; } });
+      return bestH == null ? 'Not enough timestamped data yet.' : 'Most active around ' + pad2(+bestH) + ':00 — mean ' + bestV.toFixed(1) + ' active fish in that hour.';
+    }
+    return computeSummary();
+  }
   function render() {
     clear(body);
     log.forEach(function (m, i) {
@@ -2684,66 +2884,89 @@ function AskTank() {
     });
     body.scrollTop = body.scrollHeight;
   }
-  function ask(text) {
-    var key = text.trim().toLowerCase();
-    var ans = ASK_ANSWERS[key] || "I analyzed the last 24h of tracking data. Activity and detection metrics are within normal range, with 6–8 fish tracked continuously. Try one of the suggested questions for a detailed read-out.";
-    log.push({ role: 'user', text: text }); log.push({ role: 'ai', text: ans });
+  function ask(label, key) {
+    var ans = key ? answer(key) : 'I answer from live tracking data — try a suggested question. Free-form natural-language Q&A needs an LLM (planned — see todo.md).';
+    log.push({ role: 'user', text: label }); log.push({ role: 'ai', text: ans });
     render(); input.value = '';
   }
+  var SUGG = [['How active is the tank now?', 'active'], ['Which fish moved the most?', 'mover'], ['When were fish most active?', 'when'], ['Summarize recent activity', 'summary']];
   var input = h('input', { placeholder: 'Ask about your fish…' });
   render();
   return h('div', { class: 'card ask-card' },
-    h('div', { class: 'card-h' }, aiOrb(), h('span', { class: 'ch-title' }, 'Ask Your Tank'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, 'grounded in live detections')),
+    h('div', { class: 'card-h' }, aiOrb(), h('span', { class: 'ch-title' }, 'Ask Your Tank'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, 'grounded in live tracking data')),
     body,
-    h('div', { class: 'ask-sugg' }, SUGGESTED_Q.map(function (s) { return h('button', { class: 'sugg', onclick: function () { ask(s); } }, s); })),
-    h('form', { class: 'ask-input', onsubmit: function (e) { e.preventDefault(); if (input.value.trim()) ask(input.value); } },
+    h('div', { class: 'ask-sugg' }, SUGG.map(function (q) { return h('button', { class: 'sugg', onclick: function () { ask(q[0], q[1]); } }, q[0]); })),
+    h('form', { class: 'ask-input', onsubmit: function (e) { e.preventDefault(); if (input.value.trim()) ask(input.value, null); } },
       input,
       h('button', { type: 'submit', class: 'btn btn-primary', style: { padding: '8px 14px' } },
         h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' }, h('path', { d: 'M22 2L11 13 M22 2l-7 20-4-9-9-4z' })))));
 }
 
 function InsightsView() {
-  var health = 92;
-  var sub = [
-    { k: 'Activity', v: 88, c: 'var(--teal)' }, { k: 'Detection', v: 95, c: 'var(--cyan)' },
-    { k: 'Behavior', v: 84, c: 'var(--aqua)' }, { k: 'System', v: 90, c: 'var(--deep)' }
-  ];
-  var healthCard = h('div', { class: 'card health-card' },
-    h('span', { class: 'bracket tl' }), h('span', { class: 'bracket br' }),
-    eyebrow('Tank Health', { marginBottom: '4px' }),
-    Ring({ value: health, size: 148, stroke: 12, color: 'var(--teal)', children: h('div', null,
-      h('div', { class: 'tabular', style: { fontSize: '40px', fontWeight: 700, lineHeight: 1, color: 'var(--teal)' } }, health),
-      eyebrow('Thriving', { marginTop: '2px' })) }),
-    h('div', { class: 'health-sub' }, sub.map(function (s) {
-      return h('div', { class: 'hs-row' },
+  var ctx = { versions: [], labelQueued: 0 };
+  var ringWrap = h('div', null), subWrap = h('div', { class: 'health-sub' });
+  var summaryBody = h('div', { class: 'summary-body' });
+  var feedList = h('div', { class: 'feed-list' });
+  var attnChip = chip('—', 'on');
+
+  function renderHealth() {
+    var hh = computeHealth();
+    clear(ringWrap);
+    ringWrap.appendChild(Ring({ value: hh.score, size: 148, stroke: 12, color: hh.color, children: h('div', null,
+      h('div', { class: 'tabular', style: { fontSize: '40px', fontWeight: 700, lineHeight: 1, color: hh.color } }, hh.score),
+      eyebrow(hh.label, { marginTop: '2px' })) }));
+    clear(subWrap);
+    hh.subs.forEach(function (s) {
+      subWrap.appendChild(h('div', { class: 'hs-row' },
         h('span', { class: 'mono dimc' }, s.k),
         h('div', { class: 'hs-bar' }, h('i', { style: { width: s.v + '%', background: s.c } })),
-        h('span', { class: 'mono', style: { color: s.c } }, s.v));
-    })));
-  var summaryCard = h('div', { class: 'card summary-card' },
-    h('div', { class: 'card-h' }, aiOrb(), h('span', { class: 'ch-title' }, 'Daily AI Summary'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, 'generated 06:00')),
-    h('div', { class: 'summary-body' },
-      h('p', null, h('b', { style: { color: 'var(--teal)' } }, 'Your tank had a calm, healthy day.'), ' ' + ASK_ANSWERS['summarize the last 24 hours']),
-      h('div', { class: 'summary-tags' },
-        chip('2 feeding responses', 'on'), chip('0 ID losses >30m'), chip('1 behavior flag', 'warn'), chip('92 health', 'on'))));
-  var feedList = h('div', { class: 'feed-list' }, INSIGHTS.map(function (it) {
-    return h('div', { class: 'insight ' + it.sev },
-      h('div', { class: 'ins-icon', style: { borderColor: SEV_COLOR[it.sev] } }, insightIcon(it.icon, SEV_COLOR[it.sev])),
-      h('div', { style: { minWidth: 0, flex: 1 } },
-        h('div', { class: 'ins-top' },
-          h('span', { class: 'ins-title' }, it.title), h('span', { class: 'ins-tag mono' }, it.tag), h('span', { class: 'ins-time mono' }, it.time)),
-        h('div', { class: 'ins-body' }, it.body),
-        h('div', { class: 'ins-conf' },
-          h('span', { class: 'mono dimc' }, 'AI confidence'),
-          confBar(it.conf * 100, SEV_COLOR[it.sev], 80),
-          h('span', { class: 'mono', style: { color: SEV_COLOR[it.sev] } }, Math.round(it.conf * 100) + '%'))));
-  }));
+        h('span', { class: 'mono', style: { color: s.c } }, s.v)));
+    });
+    clear(summaryBody);
+    summaryBody.appendChild(h('p', null, h('b', { style: { color: hh.color } }, 'Tank health ' + hh.score + '/100 — ' + hh.label + '.'), ' ' + computeSummary()));
+    summaryBody.appendChild(h('div', { class: 'summary-tags' },
+      chip(App.live.active + ' active', 'on'), chip(App.live.total.toLocaleString() + ' tracked'),
+      chip(App.live.fps.toFixed(1) + ' FPS'), chip(hh.score + ' health', hh.score >= 70 ? 'on' : 'warn')));
+  }
+  function renderFeed() {
+    var feed = computeFeed(ctx);
+    clear(feedList);
+    feed.forEach(function (it) {
+      feedList.appendChild(h('div', { class: 'insight ' + it.sev },
+        h('div', { class: 'ins-icon', style: { borderColor: SEV_COLOR[it.sev] } }, insightIcon(it.icon, SEV_COLOR[it.sev])),
+        h('div', { style: { minWidth: 0, flex: 1 } },
+          h('div', { class: 'ins-top' },
+            h('span', { class: 'ins-title' }, it.title), h('span', { class: 'ins-tag mono' }, it.tag), h('span', { class: 'ins-time mono' }, 'live')),
+          h('div', { class: 'ins-body' }, it.body))));
+    });
+    var attn = feed.filter(function (f) { return f.sev === 'alert' || f.sev === 'warn'; }).length;
+    attnChip.className = 'chip ' + (attn ? 'alert' : 'on'); attnChip.textContent = attn ? (attn + ' need attention') : 'all nominal';
+  }
+  function refresh() { renderHealth(); renderFeed(); }
+
+  // fetch context (model versions + label queue depth) + history, then render
+  Promise.all([
+    getInferenceHistory().catch(function () { return null; }),
+    fetchJSON('/train/history').then(function (d) { ctx.versions = d.versions || []; }).catch(function () {}),
+    fetchJSON('/label/state').then(function (d) { ctx.labelQueued = d.queued || 0; }).catch(function () {})
+  ]).then(refresh);
+  refresh();
+  App.viewLive = refresh;            // re-render when /stats ticks
+  every(5000, function () {
+    getInferenceHistory().catch(function () {});
+    fetchJSON('/label/state').then(function (d) { ctx.labelQueued = d.queued || 0; }).catch(function () {});
+  });
 
   return h('div', { class: 'view insights-grid' },
     h('div', { style: { display: 'flex', flexDirection: 'column', gap: '16px', minWidth: 0 } },
-      h('div', { class: 'grid cols-2', style: { gridTemplateColumns: '260px 1fr' } }, healthCard, summaryCard),
+      h('div', { class: 'grid cols-2', style: { gridTemplateColumns: '260px 1fr' } },
+        h('div', { class: 'card health-card' }, h('span', { class: 'bracket tl' }), h('span', { class: 'bracket br' }),
+          eyebrow('Tank Health', { marginBottom: '4px' }), ringWrap, subWrap),
+        h('div', { class: 'card summary-card' },
+          h('div', { class: 'card-h' }, aiOrb(), h('span', { class: 'ch-title' }, 'Live Summary'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, 'computed from metrics')),
+          summaryBody)),
       h('div', { class: 'card', style: { flex: 1 } },
-        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Insight Feed'), h('span', { class: 'ch-spacer' }), chip('1 needs attention', 'alert')),
+        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Insight Feed'), h('span', { class: 'ch-spacer' }), attnChip),
         feedList)),
     AskTank());
 }
@@ -2819,12 +3042,18 @@ function TrainingView() {
   var savedEl = h('div', { class: 'tabular', style: { fontSize: '34px', fontWeight: 700 } }, '0', h('span', { style: { fontSize: '15px', color: 'var(--dim)' } }, '/' + need));
   var progBar = h('i', { style: { width: '0%' } });
   var estEl = h('span', { class: 'tabular' }, '~16m');
+  var epochsSel = h('select', { class: 'sel', style: { width: '100%', marginTop: '6px' } }, h('option', null, '—'));
+  var epochsPopulated = false;
   var trainBtn = h('button', { class: 'btn btn-primary', disabled: true, style: { width: '100%', marginTop: '14px', justifyContent: 'center', opacity: 0.45 }, onclick: confirmTraining },
     h('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': '2' }, h('path', { d: 'M12 2a4 4 0 014 4v1a4 4 0 010 8 4 4 0 11-8 0 4 4 0 010-8V6a4 4 0 014-4z' })),
     'Need labels');
   function refreshLabels() {
     fetch('/train/labels').then(function (r) { return r.json(); }).then(function (d) {
       saved = d.count; need = d.min_required; estimate = d.estimate;
+      if (!epochsPopulated && d.epoch_choices && d.epoch_choices.length) {
+        epochsPopulated = true; clear(epochsSel);
+        d.epoch_choices.forEach(function (n) { epochsSel.appendChild(h('option', { value: n, selected: n === d.default_epochs }, n + ' epochs')); });
+      }
       clear(savedEl); savedEl.appendChild(document.createTextNode(saved));
       savedEl.appendChild(h('span', { style: { fontSize: '15px', color: 'var(--dim)' } }, '/' + need));
       savedEl.style.color = d.ready ? 'var(--teal)' : 'var(--text)';
@@ -2838,21 +3067,36 @@ function TrainingView() {
   }
   function confirmTraining() {
     if (!estimate) return;
-    var e = estimate;
+    var ep = +epochsSel.value || estimate.epochs || 5;
     var ok = window.confirm('Train a new model on your labeled data?\n\n' +
-      '• Estimated time: ~' + e.low_min + '–' + e.high_min + ' minutes (' + e.epochs + ' epochs)\n' +
+      '• ' + ep + ' epochs (est. ~' + estimate.low_min + '–' + estimate.high_min + ' minutes)\n' +
       '• Inference will pause while the GPU is in use\n' +
-      '• On success a new models/best.engine_v<N> appears in the model list\n\nContinue?');
+      '• On success a new models/best_v<N>.engine appears in the model list\n\nContinue?');
     if (!ok) return;
-    fetch('/train/start').then(function (r) { return r.json(); }).then(function (d) {
+    fetch('/train/start?epochs=' + ep).then(function (r) { return r.json(); }).then(function (d) {
       if (d.error) { alert('Could not start training: ' + d.error); return; }
       openTrainModal(); startTrainPolling();
     });
   }
 
-  // models list (real /models)
+  // models list (real /models) enriched with training metrics from /train/history
   var modelList = h('div', { class: 'model-list' });
   var modelCountEl = h('span', { class: 'ch-sub' }, '0');
+  var modelMeta = {};   // version → { map50, dataset_size }
+  function bestMap50(metrics) {
+    if (!metrics || !metrics.length) return null;
+    return metrics.reduce(function (m, e) { return Math.max(m, e.map50 || 0); }, 0);
+  }
+  function loadModelMeta() {
+    return fetchJSON('/train/history').then(function (d) {
+      var versions = d.versions || [];
+      return Promise.all(versions.map(function (v) {
+        return fetchJSON('/train/history?version=' + v).then(function (det) {
+          modelMeta[v] = { map50: bestMap50(det.metrics), dataset_size: det.dataset_size };
+        }).catch(function () {});
+      }));
+    }).catch(function () {});
+  }
   function loadModels() {
     fetch('/models').then(function (r) { return r.json(); }).then(function (d) {
       clear(modelList);
@@ -2861,18 +3105,23 @@ function TrainingView() {
       if (!models.length) { modelList.appendChild(h('div', { class: 'model-meta mono', style: { padding: '10px' } }, 'No model files found.')); return; }
       models.forEach(function (m) {
         var base = m.split('/').pop(), active = base === curBase;
+        var vm = base.match(/_v(\d+)\./), meta = vm ? modelMeta[+vm[1]] : null;
+        var stats = [];
+        if (meta && meta.map50 != null) stats.push(h('div', null, h('span', { class: 'kpi-label' }, 'mAP50'), h('span', { class: 'tabular', style: { color: 'var(--teal)' } }, (meta.map50 * 100).toFixed(1))));
+        if (meta && meta.dataset_size != null) stats.push(h('div', null, h('span', { class: 'kpi-label' }, 'imgs'), h('span', { class: 'tabular' }, meta.dataset_size)));
+        if (active && !stats.length) stats.push(h('div', null, h('span', { class: 'kpi-label' }, 'in use'), h('span', { class: 'tabular', style: { color: 'var(--teal)' } }, '●')));
         modelList.appendChild(h('div', { class: 'model-row' + (active ? ' active' : ''), style: { cursor: 'pointer' },
           onclick: function () { fetch('/model?v=' + encodeURIComponent(base)).then(loadModels); } },
           h('div', { style: { minWidth: 0 } },
             h('div', { class: 'model-name mono' }, base, active && chip('active', 'on')),
-            h('div', { class: 'model-meta mono' }, m)),
-          active && h('div', { class: 'model-stats' }, h('div', null, h('span', { class: 'kpi-label' }, 'in use'), h('span', { class: 'tabular', style: { color: 'var(--teal)' } }, '●')))));
+            h('div', { class: 'model-meta mono' }, vm ? ('trained v' + vm[1]) : 'imported')),
+          stats.length && h('div', { class: 'model-stats' }, stats)));
       });
     }).catch(function () {});
   }
 
   // ---- triage polling + shortcuts ----
-  pollQueue(); refreshLabels(); loadModels();
+  pollQueue(); refreshLabels(); loadModelMeta().then(loadModels);
   every(1000, pollQueue);
   every(3000, refreshLabels);
   var keyHandler = function (e) {
@@ -2903,6 +3152,7 @@ function TrainingView() {
         h('div', { class: 'grid cols-2', style: { gap: '10px', marginTop: '14px' } },
           h('div', { class: 'mini-stat' }, h('span', { class: 'kpi-label' }, 'In queue'), queueCountEl),
           h('div', { class: 'mini-stat' }, h('span', { class: 'kpi-label' }, 'Est. train'), estEl)),
+        h('div', { style: { marginTop: '12px' } }, eyebrow('Training epochs', { marginBottom: '4px' }), epochsSel),
         trainBtn,
         h('div', { class: 'mono', style: { fontSize: '10px', color: 'var(--faint)', marginTop: '8px', textAlign: 'center' } }, 'Tip: press y / n to triage fast')),
       h('div', { class: 'card' },
@@ -2921,7 +3171,8 @@ function openTrainModal() {
   var etaEl = h('div', { class: 'tabular tm-big' }, '—');
   var verEl = h('div', { class: 'tabular tm-big' }, '—');
   var statusChip = chip('GPU in use · inference paused', 'warn');
-  var logBox = h('div', { class: 'tm-log', style: { height: '180px' } }, 'waiting for training subprocess output…');
+  var logBox = h('div', { class: 'tm-log', style: { height: '150px' } }, 'waiting for training subprocess output…');
+  var lossWrap = h('div', null);   // real loss curve from status.loss_samples
   var titleEl = h('span', { class: 'ch-title' }, 'Training model');
   var cancelBtn = h('button', { class: 'btn btn-ghost', style: { color: 'var(--alert)', borderColor: 'rgba(255,111,111,.4)' }, onclick: cancelTraining }, 'Cancel');
   var closeBtn = h('button', { class: 'btn btn-primary', style: { display: 'none' }, onclick: closeTrainModal }, 'Close & resume');
@@ -2938,10 +3189,11 @@ function openTrainModal() {
           h('div', null, h('div', { class: 'kpi-label' }, 'ETA'), etaEl),
           h('div', null, h('div', { class: 'kpi-label' }, 'Version'), verEl)),
         h('div', { class: 'tm-bar' }, bar),
-        h('div', { style: { margin: '14px 0' } }, logBox),
+        lossWrap,
+        h('div', { style: { margin: '14px 0 0' } }, logBox),
         actions)));
   document.body.appendChild(modal);
-  App.trainModal = { modal: modal, stateLine: stateLine, bar: bar, epochEl: epochEl, elapsedEl: elapsedEl, etaEl: etaEl, verEl: verEl, statusChip: statusChip, logBox: logBox, titleEl: titleEl, cancelBtn: cancelBtn, closeBtn: closeBtn };
+  App.trainModal = { modal: modal, stateLine: stateLine, bar: bar, epochEl: epochEl, elapsedEl: elapsedEl, etaEl: etaEl, verEl: verEl, statusChip: statusChip, logBox: logBox, lossWrap: lossWrap, lossChart: null, titleEl: titleEl, cancelBtn: cancelBtn, closeBtn: closeBtn };
 }
 function startTrainPolling() {
   if (App.trainPoll) clearInterval(App.trainPoll);
@@ -2971,6 +3223,15 @@ function updateTrainModal(s) {
   m.elapsedEl.textContent = fmtSec(s.elapsed_sec);
   m.etaEl.textContent = fmtSec(s.eta_sec);
   m.verEl.textContent = s.version != null ? ('v' + s.version) : '—';
+  // real training loss curve from the subprocess status file
+  var loss = (s.loss_samples || []).map(function (x) { return x.total != null ? x.total : x.box_loss; }).filter(function (v) { return v != null; });
+  if (loss.length >= 2) {
+    if (!m.lossChart) {
+      m.lossChart = AreaChart({ vals: loss, color: 'var(--cyan)', height: 110, min: 0 });
+      clear(m.lossWrap);
+      m.lossWrap.appendChild(h('div', { style: { margin: '14px 0 0' } }, eyebrow('Training loss', { marginBottom: '4px' }), m.lossChart.node));
+    } else { m.lossChart.update(loss); }
+  }
   var running = s.running || s.state === 'training' || s.state === 'starting' || s.state === 'exporting';
   if (App.setFeedPaused) App.setFeedPaused(running);
   if (s.state === 'done') {
@@ -3004,58 +3265,76 @@ function closeTrainModal() {
    DEVICE HEALTH VIEW
    ============================================================ */
 function SystemView() {
-  var uptime = 6 * 3600 + 41 * 60;
-  var gpuHist = Array.from({ length: 48 }, function () { return App.live.gpu; });
-  var cpuHist = Array.from({ length: 48 }, function () { return App.live.cpu; });
   function tempColor(t) { return t >= 75 ? 'var(--alert)' : t >= 68 ? 'var(--warn)' : 'var(--good)'; }
+  var gpuHist = [], cpuHist = [];
 
   var gaugeWrap = h('div', { class: 'grid cols-4' });
-  var gpuChart = AreaChart({ vals: gpuHist, color: 'var(--warn)', height: 170, min: 40, max: 90, fmtY: function (v) { return v + '°'; }, live: true });
-  var cpuChart = AreaChart({ vals: cpuHist, color: 'var(--deep)', height: 170, min: 40, max: 90, fmtY: function (v) { return v + '°'; }, live: true });
-  var infBody = h('div', null), memBody = h('div', null);
-  var uptimeEl = h('span', { class: 'tabular', style: { color: 'var(--teal)' } }, fmtUptime(uptime));
+  var gpuTempWrap = h('div', { style: { padding: '14px 14px 10px' } });
+  var cpuTempWrap = h('div', { style: { padding: '14px 14px 10px' } });
+  var gpuChart = AreaChart({ vals: [0, 0], color: 'var(--warn)', height: 170, min: 40, max: 90, fmtY: function (v) { return v + '°'; }, live: true });
+  var cpuChart = AreaChart({ vals: [0, 0], color: 'var(--deep)', height: 170, min: 40, max: 90, fmtY: function (v) { return v + '°'; }, live: true });
+  var infBody = h('div', null), memBody = h('div', null), capBody = h('div', null);
+  var uptimeEl = h('span', { class: 'tabular', style: { color: 'var(--teal)' } }, 'N/A');
+  var freqEl = h('span', { class: 'tabular' }, 'N/A');
   var engineEl = h('span', { class: 'tabular' }, App.live.model || '—');
-  var tempNote = h('span', { class: 'ch-sub' }, App.live.realTemps ? 'last 48s · throttle @ 87°C' : 'simulated (no telemetry)');
 
-  function renderGauges() {
-    clear(gaugeWrap);
-    var L = App.live;
-    [gauge(L.cpu, 'CPU Temp', '°C', tempColor(L.cpu)),
-     gauge(L.gpu, 'GPU Temp', '°C', tempColor(L.gpu)),
-     gauge(L.gpuUtil, 'GPU Util', '%', 'var(--teal)'),
-     gauge(Math.round(L.ram / 8 * 100), 'RAM', '%', 'var(--cyan)')].forEach(function (g) {
-      gaugeWrap.appendChild(h('div', { class: 'card gauge-card' }, g));
-    });
+  function gaugeCard(v, label, unit, color) {
+    if (v == null || v < 0) {
+      return h('div', { class: 'card gauge-card' }, h('div', { style: { textAlign: 'center' } },
+        h('div', { class: 'tabular', style: { fontSize: '22px', color: 'var(--dim)' } }, 'N/A'),
+        h('div', { class: 'eyebrow', style: { marginTop: '6px' } }, label)));
+    }
+    return h('div', { class: 'card gauge-card' }, Gauge({ value: Math.round(v), max: 100, label: label, unit: unit, color: color }));
   }
-  function gauge(v, label, unit, color) { return Gauge({ value: Math.round(v), max: 100, label: label, unit: unit, color: color }); }
   function kvRows(parent, rows) {
     clear(parent);
     rows.forEach(function (r) {
       parent.appendChild(h('div', { class: 'kv-row' }, h('span', { class: 'mono dimc' }, r[0]), h('span', { class: 'tabular', style: { color: r[2] || 'var(--text)' } }, r[1])));
     });
   }
-  function renderPanels() {
-    var L = App.live;
+  function naMsg() { return h('div', { class: 'mono dimc', style: { padding: '24px 8px', textAlign: 'center', fontSize: '12px' } }, 'No thermal telemetry on this device.'); }
+
+  function render() {
+    var L = App.live, T = App.tele, ct = teleTemp('CPU'), gt = teleTemp('GPU');
+    // gauges
+    clear(gaugeWrap);
+    gaugeWrap.appendChild(gaugeCard(ct, 'CPU Temp', '°C', ct != null ? tempColor(ct) : 'var(--good)'));
+    gaugeWrap.appendChild(gaugeCard(gt, 'GPU Temp', '°C', gt != null ? tempColor(gt) : 'var(--good)'));
+    gaugeWrap.appendChild(gaugeCard(T.gpu_util_pct, 'GPU Util', '%', 'var(--teal)'));
+    gaugeWrap.appendChild(gaugeCard(T.ram_pct, 'RAM', '%', 'var(--cyan)'));
+    // temp charts
+    clear(gpuTempWrap); clear(cpuTempWrap);
+    if (gpuHist.length >= 2) gpuTempWrap.appendChild(gpuChart.node); else gpuTempWrap.appendChild(naMsg());
+    if (cpuHist.length >= 2) cpuTempWrap.appendChild(cpuChart.node); else cpuTempWrap.appendChild(naMsg());
+    // panels
     kvRows(infBody, [
       ['Pipeline FPS', L.fps.toFixed(1), 'var(--teal)'],
-      ['Latency / frame', (L.fps ? (1000 / L.fps).toFixed(1) : '—') + 'ms', null],
-      ['Tracked IDs', String(L.total), null],
+      ['Latency / frame', (L.fps ? (1000 / L.fps).toFixed(1) + 'ms' : 'N/A'), null],
+      ['Tracked IDs', L.total.toLocaleString(), null],
       ['Detections / s', String(Math.round(L.fps * L.active)), null]]);
     kvRows(memBody, [
-      ['RAM used', L.ram.toFixed(1) + ' / 8 GB', null],
-      ['Swap', '0.2 / 4 GB', null],
-      ['GPU shared', '2.1 GB', null],
-      ['Model VRAM', '0.9 GB', null]]);
+      ['RAM used', T.ram_used_mb != null ? (T.ram_used_mb / 1024).toFixed(1) + ' / ' + (T.ram_total_mb / 1024).toFixed(1) + ' GB' : 'N/A', null],
+      ['RAM %', na(T.ram_pct, function (v) { return v + '%'; }), null],
+      ['Swap', T.swap_total_mb ? (T.swap_used_mb / 1024).toFixed(1) + ' / ' + (T.swap_total_mb / 1024).toFixed(1) + ' GB' : 'N/A', null],
+      ['Model VRAM', 'N/A', 'var(--dim)']]);
+    kvRows(capBody, [
+      ['Resolution', L.resolution || 'N/A', null],
+      ['Source', 'MJPEG /stream', null],
+      ['SAHI tiling', '—', 'var(--dim)'],
+      ['Exposure', 'N/A', 'var(--dim)']]);
+    uptimeEl.textContent = na(T.uptime_sec, fmtUptime);
+    freqEl.textContent = na(T.gpu_freq_mhz, function (v) { return Math.round(v) + ' MHz'; });
     engineEl.textContent = L.model || '—';
   }
 
-  App.viewLive = function () {
-    renderGauges(); renderPanels();
-    gpuHist = gpuHist.slice(1).concat(App.live.gpu); cpuHist = cpuHist.slice(1).concat(App.live.cpu);
-    gpuChart.update(gpuHist); cpuChart.update(cpuHist);
+  App.viewTele = function () {
+    var gt = teleTemp('GPU'), ct = teleTemp('CPU');
+    if (gt != null) { gpuHist.push(gt); if (gpuHist.length > 48) gpuHist.shift(); if (gpuHist.length >= 2) gpuChart.update(gpuHist); }
+    if (ct != null) { cpuHist.push(ct); if (cpuHist.length > 48) cpuHist.shift(); if (cpuHist.length >= 2) cpuChart.update(cpuHist); }
+    render();
   };
-  every(1000, function () { uptime += 1; uptimeEl.textContent = fmtUptime(uptime); });
-  renderGauges(); renderPanels();
+  App.viewLive = render;
+  render();
 
   return h('div', { class: 'view', style: { display: 'flex', flexDirection: 'column', gap: '16px' } },
     h('div', { class: 'card pad device-banner' },
@@ -3064,75 +3343,89 @@ function SystemView() {
         h('rect', { x: '4', y: '4', width: '16', height: '16', rx: '2' }), h('rect', { x: '8', y: '8', width: '8', height: '8', rx: '1' }),
         h('path', { d: 'M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3' }))),
       h('div', { style: { flex: 1, minWidth: 0 } },
-        h('div', { style: { fontSize: '17px', fontWeight: 600 } }, 'Jetson Orin Nano 8GB'),
-        h('div', { class: 'mono', style: { color: 'var(--dim)', fontSize: '12px', marginTop: '3px' } }, 'JetPack 6.1 · 15W / MAXN · CUDA 12.2 · TensorRT 10.3')),
+        h('div', { style: { fontSize: '17px', fontWeight: 600 } }, 'Jetson Orin Nano'),
+        h('div', { class: 'mono', style: { color: 'var(--dim)', fontSize: '12px', marginTop: '3px' } }, 'Edge inference device · live telemetry')),
       h('div', { class: 'db-stats' },
         h('div', null, h('span', { class: 'kpi-label' }, 'Uptime'), uptimeEl),
-        h('div', null, h('span', { class: 'kpi-label' }, 'Power mode'), h('span', { class: 'tabular' }, 'MAXN')),
+        h('div', null, h('span', { class: 'kpi-label' }, 'GPU freq'), freqEl),
         h('div', null, h('span', { class: 'kpi-label' }, 'Engine'), engineEl))),
     gaugeWrap,
     h('div', { class: 'grid cols-2' },
       h('div', { class: 'card' },
-        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'GPU Temperature'), h('span', { class: 'ch-spacer' }), tempNote),
-        h('div', { style: { padding: '14px 14px 10px' } }, gpuChart.node)),
+        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'GPU Temperature'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, 'live · throttle @ 87°C')),
+        gpuTempWrap),
       h('div', { class: 'card' },
-        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'CPU Temperature'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, '6-core Arm Cortex-A78AE')),
-        h('div', { style: { padding: '14px 14px 10px' } }, cpuChart.node))),
+        h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'CPU Temperature'), h('span', { class: 'ch-spacer' }), h('span', { class: 'ch-sub' }, 'live')),
+        cpuTempWrap)),
     h('div', { class: 'grid cols-3' },
       h('div', { class: 'card pad' }, eyebrow('Inference', { marginBottom: '12px' }), infBody),
       h('div', { class: 'card pad' }, eyebrow('Memory', { marginBottom: '12px' }), memBody),
-      h('div', { class: 'card pad' }, eyebrow('Capture', { marginBottom: '12px' }),
-        (function () { var b = h('div', null); kvRows(b, [['Camera', 'Logitech C920'], ['Driver', 'V4L2 /dev/video0'], ['Resolution', App.live.resolution], ['Exposure', 'auto']]); return b; })())));
+      h('div', { class: 'card pad' }, eyebrow('Capture', { marginBottom: '12px' }), capBody)));
 }
 
 /* ============================================================
    SETTINGS VIEW (toggles wired where a backend exists)
    ============================================================ */
 function SettingsView() {
-  var s = { enhance: true, trails: false, sahi: false, record: true, public: false, hats: false, quality: 75, exposure: 'auto', interval: 60 };
+  // server defaults: enhance ON, trails OFF
+  var state = { enhance: true, trails: false };
   function settingsRow(label, sub, control) {
     return h('div', { class: 'set-row' },
       h('div', null, h('div', { class: 'set-label' }, label), sub && h('div', { class: 'set-sub mono' }, sub)),
       h('div', { class: 'set-control' }, control));
   }
-  // toggle wired to a real endpoint (endpoint optional → local only)
   function toggle(key, endpoint, respKey) {
-    var tog = h('div', { class: 'toggle' + (s[key] ? ' on' : '') }, h('i', null));
+    var tog = h('div', { class: 'toggle' + (state[key] ? ' on' : '') }, h('i', null));
     tog.onclick = function () {
-      if (endpoint) {
-        fetch(endpoint).then(function (r) { return r.json(); }).then(function (d) { s[key] = !!d[respKey]; tog.classList.toggle('on', s[key]); });
-      } else { s[key] = !s[key]; tog.classList.toggle('on', s[key]); }
+      fetch(endpoint).then(function (r) { return r.json(); }).then(function (d) { state[key] = !!d[respKey]; tog.classList.toggle('on', state[key]); });
     };
     return tog;
   }
-  var qVal = h('span', { class: 'tabular', style: { color: 'var(--teal)', width: '26px' } }, s.quality);
-  var iVal = h('span', { class: 'tabular', style: { color: 'var(--teal)', width: '36px' } }, s.interval + 's');
+  // confidence (no GET endpoint; starts at backend default 0.35)
+  var confVal = h('span', { class: 'tabular', style: { color: 'var(--teal)', width: '36px' } }, '35%');
+  var confDeb = null;
+  var confCtl = h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', width: '200px' } },
+    h('input', { class: 'rng', type: 'range', min: '5', max: '95', step: '5', value: '35', oninput: function (e) {
+      var p = +e.target.value; confVal.textContent = p + '%'; clearTimeout(confDeb);
+      confDeb = setTimeout(function () { fetch('/conf?v=' + (p / 100).toFixed(2)); }, 120);
+    } }), confVal);
+  // resolution
+  var resCtl = h('select', { class: 'sel', style: { width: '160px' }, value: App.live.resolution, onchange: function (e) { fetch('/resolution?v=' + encodeURIComponent(e.target.value)); } },
+    ['480p', '720p', '1080p'].map(function (r) { return h('option', { value: r, selected: r === App.live.resolution }, r); }));
+  // model
+  var modelCtl = h('select', { class: 'sel', style: { width: '220px' }, onchange: function (e) { fetch('/model?v=' + encodeURIComponent(e.target.value)); } }, h('option', null, 'loading…'));
+  loadModelOptions(modelCtl);
+  // editable label threshold (real: /train/min-labels)
+  var minVal = h('span', { class: 'tabular', style: { color: 'var(--teal)', width: '36px' } }, '—');
+  var minDeb = null;
+  var minInput = h('input', { class: 'rng', type: 'range', min: '1', max: '200', step: '1', value: '5', oninput: function (e) {
+    var v = +e.target.value; minVal.textContent = v; clearTimeout(minDeb);
+    minDeb = setTimeout(function () { fetch('/train/min-labels?v=' + v); }, 200);
+  } });
+  fetchJSON('/train/min-labels').then(function (d) { if (d.min_required != null) { minInput.value = d.min_required; minVal.textContent = d.min_required; } }).catch(function () {});
+  var minCtl = h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', width: '200px' } }, minInput, minVal);
 
   return h('div', { class: 'view', style: { display: 'flex', flexDirection: 'column', gap: '16px', maxWidth: '760px' } },
     h('div', { class: 'card' },
-      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Pipeline')),
+      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Detection Pipeline')),
       h('div', { style: { padding: '4px 16px 8px' } },
         settingsRow('Image enhancement', 'CLAHE + white-balance on each frame', toggle('enhance', '/enhance', 'enhance')),
         settingsRow('Motion trails', 'render fish paths on the feed', toggle('trails', '/trails', 'trails')),
-        settingsRow('SAHI sliced inference', 'better small-fish recall · lowers FPS (display only)', toggle('sahi')),
-        settingsRow('Stream quality', 'JPEG quality · lower = less bandwidth (display only)',
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', width: '180px' } },
-            h('input', { class: 'rng', type: 'range', min: '40', max: '95', value: s.quality, oninput: function (e) { s.quality = +e.target.value; qVal.textContent = s.quality; } }), qVal)))),
+        settingsRow('Confidence threshold', 'minimum detection confidence', confCtl),
+        settingsRow('Capture resolution', 'higher = more detail, lower FPS', resCtl))),
     h('div', { class: 'card' },
-      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Camera')),
+      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Model')),
       h('div', { style: { padding: '4px 16px 8px' } },
-        settingsRow('Exposure', null,
-          h('select', { class: 'sel', style: { width: '160px' }, onchange: function (e) { s.exposure = e.target.value; } },
-            h('option', { value: 'auto' }, 'Auto'), h('option', { value: '-6' }, 'Manual −6 (dim)'), h('option', { value: '-4' }, 'Manual −4'), h('option', { value: '-2' }, 'Manual −2'))),
-        settingsRow('Record to disk', 'recording_YYYYMMDD.mp4 (display only)', toggle('record')))),
+        settingsRow('Active model', 'engine / weights used for inference', modelCtl))),
     h('div', { class: 'card' },
-      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Logging & Sharing')),
+      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Active Learning')),
       h('div', { style: { padding: '4px 16px 8px' } },
-        settingsRow('Stats log interval', 'JSON snapshot to fish_logs/ (display only)',
-          h('div', { style: { display: 'flex', alignItems: 'center', gap: '10px', width: '180px' } },
-            h('input', { class: 'rng', type: 'range', min: '15', max: '120', step: '15', value: s.interval, oninput: function (e) { s.interval = +e.target.value; iVal.textContent = s.interval + 's'; } }), iVal)),
-        settingsRow('Public Cloudflare tunnel', 'expose dashboard via trycloudflare.com (display only)', toggle('public')),
-        settingsRow('Party hats 🎉', 'purely for science', toggle('hats', '/hat', 'hat')))));
+        settingsRow('Labels required to retrain', 'threshold before the Train button unlocks', minCtl))),
+    h('div', { class: 'card' },
+      h('div', { class: 'card-h' }, h('span', { class: 'ch-title' }, 'Not yet wired')),
+      h('div', { style: { padding: '12px 16px', color: 'var(--dim)', fontSize: '12.5px', lineHeight: 1.6 } },
+        'SAHI runtime toggle, stream JPEG quality, camera exposure, record-to-disk, public Cloudflare tunnel, and stats-log interval are configured at launch only — runtime controls are tracked in ',
+        h('span', { class: 'mono', style: { color: 'var(--text-2)' } }, 'todo.md'), '.')));
 }
 
 /* ============================================================
